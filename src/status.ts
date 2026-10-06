@@ -9,6 +9,11 @@ export interface QuotaSnapshot {
 	model?: string;
 }
 
+export interface ContextSnapshot {
+	used: number;
+	size: number;
+}
+
 export interface UsageTotals {
 	turns: number;
 	input: number;
@@ -28,6 +33,11 @@ export class RuntimeMetrics {
 		cacheWrite: 0,
 	};
 	latestQuota: QuotaSnapshot | undefined;
+	latestContext: ContextSnapshot | undefined;
+
+	recordContext(used: number, size: number): void {
+		this.latestContext = { used, size };
+	}
 
 	record(response: PromptResponse, usage: Usage): void {
 		this.totals.turns += 1;
@@ -39,10 +49,11 @@ export class RuntimeMetrics {
 		this.latestQuota = quotaFromPrompt(response) ?? this.latestQuota;
 	}
 
-	snapshot(): { totals: UsageTotals; latestQuota?: QuotaSnapshot } {
+	snapshot(): { totals: UsageTotals; latestQuota?: QuotaSnapshot; latestContext?: ContextSnapshot } {
 		return {
 			totals: { ...this.totals },
 			...(this.latestQuota ? { latestQuota: { ...this.latestQuota } } : {}),
+			...(this.latestContext ? { latestContext: { ...this.latestContext } } : {}),
 		};
 	}
 }

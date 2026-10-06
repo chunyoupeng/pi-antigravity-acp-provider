@@ -10,9 +10,13 @@ A first-class [Pi](https://github.com/earendil-works/pi) provider for **Google A
 - Uses ACP protocol v1 and the official TypeScript SDK.
 - Collapses Antigravity's effort-qualified IDs into one entry per model; Pi's Shift+Tab reasoning control selects low/medium/high dynamically.
 - Supports Pi streaming, cancellation, usage/quota metadata, lifecycle cleanup, and persisted ACP session restoration across Pi restarts.
-- Routes compatible Pi tools through an authenticated loopback MCP bridge; doctor/status names omitted tools and their reasons.
+- Reports Antigravity's `usage_update` context fill as Pi usage, so Pi's context meter and auto-compaction work even though the server returns no token counts.
+- Routes compatible Pi tools from transcript system messages through an authenticated loopback MCP bridge, using Pi's standard tool-call/result lifecycle; doctor/status names omitted tools and their reasons.
+- By default Pi owns file and shell work: Antigravity's built-in `run_command`, `view_file`, `create_file`, `edit_file`, `list_directory`, `search_directory`, and `find_file` are disabled per session (`_meta.agy.disabledTools`), so the model uses Pi's tools and Pi's hooks and rendering apply. Antigravity's permission prompt for those bridged calls is approved once automatically. Web search, URL fetch, image generation, questions, and subagents stay native.
+- Displays Antigravity-native tools with Pi's built-in shell/file renderers, status bullets, output previews, and colored diffs. Updates for the same invocation share one live row; expanding shows full output and ACP details. Display-only entries retain every raw update for JSON/RPC clients (`entry_appended`) and session restore. Native actions are not executed again by Pi.
+- Preserves Pi project instructions (including `AGENTS.md` and named prompt sections) separately from truncated conversation history.
 - Supports persisted `default`, `auto-edit`, and `yolo` Antigravity permission modes. The requested default is `yolo`; switching to a prompting mode retains the single-use, fail-closed Pi permission broker.
-- Advertises no ACP filesystem or terminal client capabilities.
+- With `tools native`, keeps Antigravity's built-ins but advertises ACP `fs`, so its file reads and writes go through the provider, confined to the workspace, `GEMINI_HOME`, and the temp directory. ACP terminal is never advertised; the server does not use it.
 - Provides setup, auth-health, logout/account-switching, qualification, quota, and runtime-update commands.
 - Automatically checks for newer managed ACP runtimes once per day, with `automatic`, `notify`, and `manual` update modes.
 - Uses an Ed25519-signed runtime catalog with exact Google artifact URLs, archive hashes and sizes, strict two-file extraction, pre-activation ACP identity/version validation, immutable releases, rollback retention, musl rejection, macOS quarantine cleanup, and Windows process-tree handling.
@@ -34,6 +38,15 @@ cd pi-antigravity-acp-provider
 npm install
 pi --no-extensions -e ./extensions/index.ts
 ```
+
+To replace an existing npm installation with a persistent local development package:
+
+```bash
+pi remove npm:pi-antigravity-acp-provider
+pi install "$PWD"
+```
+
+Pi loads the local directory without copying it. Restart Pi or run `/reload` after switching. Full ACP notifications are also forwarded to Pi's `provider_stream_event` hook before conversion; native tool records never enter the model transcript.
 
 In Pi:
 
@@ -67,7 +80,7 @@ Set `PI_ANTIGRAVITY_ACP_OAUTH_MODE=manual` to force this flow, or `PI_ANTIGRAVIT
 
 For API-key authentication, choose **Enter an API key** and then **Antigravity Gemini API key** in `/login`, or set `GEMINI_API_KEY` before starting Pi.
 
-Antigravity owns OAuth tokens under `~/.gemini/antigravity-acp/`; Pi stores only a non-secret configured marker. Existing `agy` CLI credentials and Gemini CLI credentials should not be assumed to authenticate this separate ACP server.
+Antigravity owns OAuth tokens under `~/.gemini/antigravity-acp/` (on macOS, in the Keychain under service `gemini`); Pi stores only a non-secret configured marker. Existing `agy` CLI credentials and Gemini CLI credentials should not be assumed to authenticate this separate ACP server.
 
 ## Commands
 
@@ -86,13 +99,18 @@ Antigravity owns OAuth tokens under `~/.gemini/antigravity-acp/`; Pi stores only
 /antigravity-acp permissions default
 /antigravity-acp permissions auto-edit
 /antigravity-acp permissions yolo
+/antigravity-acp tools [pi|native]
+/antigravity-acp sessions
+/antigravity-acp plan <task>
 ```
 
 Permission and runtime-update modes are saved in `$PI_CODING_AGENT_DIR/antigravity-acp-provider/config.json` (where `PI_CODING_AGENT_DIR` defaults to `~/.pi/agent`). Runtime updates default to `automatic`; only provider-managed installations are replaced. ACP session bindings are saved beside the config in `sessions.json`.
 
 On first use of a custom profile without a config, existing permission/update settings are copied from the default agent directory (or the legacy Gemini-provider config). Existing custom configs are never overwritten, and saved sessions are not copied. **Custom Pi profiles do not isolate Antigravity accounts or managed runtimes:** Antigravity's OAuth credentials and runtime installation remain in their shared locations.
 
-`logout`/`account` clears local Antigravity credentials and saved ACP sessions. Run Pi's `/logout` afterward to remove the Pi credential marker, then `/login` for the new account. `update` checks the official registry and installs its newest release only after matching it to the provider's signed runtime catalog. See [`docs/RUNTIME-UPDATES.md`](docs/RUNTIME-UPDATES.md).
+`tools` switches who runs file and shell operations; it applies from the next prompt. `sessions` lists Antigravity sessions for the current directory and attaches one to the current Pi session; the next prompt resumes it. `plan` sends Antigravity's built-in `/plan`.
+
+`logout`/`account` signs out through the server's ACP `logout` method, which also clears OAuth tokens kept in the macOS Keychain (service `gemini`), then clears local state and saved ACP sessions. Run Pi's `/logout` afterward to remove the Pi credential marker, then `/login` for the new account. `update` checks the official registry and installs its newest release only after matching it to the provider's signed runtime catalog. See [`docs/RUNTIME-UPDATES.md`](docs/RUNTIME-UPDATES.md).
 
 ## Development
 
@@ -119,7 +137,7 @@ System instructions are kept outside truncated conversation history. Instruction
 
 ## Security boundary
 
-This launches a full coding agent with the user's OS privileges. **The default `yolo` mode permits Antigravity-native commands and edits without confirmation.** Use `/antigravity-acp permissions default` for confirmation prompts. Disabling ACP filesystem/terminal **client callbacks is not a sandbox** for Antigravity-native tools. Pi hooks govern tools routed through the `pi_` MCP namespace; Antigravity-native tools remain governed by Antigravity policy and ACP permission requests. New/restored sessions must advertise and confirm the requested permission mode. Unsupported or failed mode changes close affected sessions; an executing turn is stopped before changing its policy. Unexpected mode-change notifications also invalidate the session. Doctor/status distinguishes requested policy from each live binding's confirmed mode. This protocol enforcement is not a sandbox.
+This launches a full coding agent with the user's OS privileges. **The default `yolo` mode permits Antigravity-native commands and edits without confirmation.** Use `/antigravity-acp permissions default` for confirmation prompts. Pi hooks govern tools routed through the `pi_` MCP namespace; with the default `tools pi` these replace Antigravity's file and shell built-ins. The remaining native tools (web search, URL fetch, image generation, subagents) and everything under `tools native` stay governed by Antigravity policy and ACP permission requests. ACP fs confinement in `tools native` covers only file reads and writes; native shell commands are not sandboxed by Pi. New/restored sessions must advertise and confirm the requested permission mode. Unsupported or failed mode changes close affected sessions; an executing turn is stopped before changing its policy. Unexpected mode-change notifications also invalidate the session. Doctor/status distinguishes requested policy from each live binding's confirmed mode. This protocol enforcement is not a sandbox.
 
 ## Compatibility
 

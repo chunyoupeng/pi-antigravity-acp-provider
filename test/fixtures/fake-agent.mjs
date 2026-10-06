@@ -15,6 +15,20 @@ let permissionPromptId;
 let hangingPromptId;
 let bridgePromptId;
 let mcpServer;
+let clientCapabilities;
+const sessionMeta = {};
+const selectionMethods = [];
+const agentRequests = new Map();
+let agentRequestId = 0;
+const requestClient = (method, params) => {
+	const id = `agent-${++agentRequestId}`;
+	send({ jsonrpc: "2.0", id, method, params });
+	return new Promise((resolve) => agentRequests.set(id, resolve));
+};
+const reply = (sessionId, id, text) => {
+	send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } } });
+	send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+};
 
 for await (const line of rl) {
 	if (!line.trim()) continue;
@@ -37,7 +51,10 @@ for await (const line of rl) {
 	const { id, method, params } = message;
 	if (process.env.FAKE_AGENT_LOG_FILE && method) fs.appendFileSync(process.env.FAKE_AGENT_LOG_FILE,
 		JSON.stringify({ method, ...(method === "session/prompt" ? { prompt: params.prompt, mode } : {}), ...(method === "session/set_mode" ? { modeId: params.modeId } : {}) }) + "\n");
-	if (id === "permission-1" && method === undefined) {
+	if (method === undefined && agentRequests.has(id)) {
+		agentRequests.get(id)(message);
+		agentRequests.delete(id);
+	} else if (id === "permission-1" && method === undefined) {
 		if (permissionPromptId === undefined) continue;
 		const decision = message.result?.outcome?.outcome ?? "cancelled";
 		send({
@@ -51,6 +68,7 @@ for await (const line of rl) {
 		send({ jsonrpc: "2.0", id: permissionPromptId, result: { stopReason: "end_turn" } });
 		permissionPromptId = undefined;
 	} else if (method === "initialize") {
+		clientCapabilities = params.clientCapabilities;
 		if (scenario === "initialize-timeout") continue;
 		if (scenario === "malformed-output") {
 			process.stdout.write("not-json\n");
@@ -71,9 +89,10 @@ for await (const line of rl) {
 				],
 				agentCapabilities: {
 					loadSession: true,
-					promptCapabilities: { image: true, embeddedContext: true },
+					promptCapabilities: { image: scenario !== "text-only", embeddedContext: scenario !== "text-only" },
 					mcpCapabilities: { http: scenario !== "no-mcp" },
-					sessionCapabilities: { resume: {} },
+					sessionCapabilities: { resume: {}, list: {} },
+					auth: { logout: {} },
 				},
 			},
 		});
@@ -126,6 +145,7 @@ for await (const line of rl) {
 			continue;
 		}
 		mcpServer = params.mcpServers?.find((server) => server.type === "http");
+		sessionMeta.new = params._meta;
 		send({
 			jsonrpc: "2.0",
 			id,
@@ -142,6 +162,7 @@ for await (const line of rl) {
 			},
 		});
 	} else if (method === "session/resume" || method === "session/load") {
+		sessionMeta[method === "session/resume" ? "resume" : "load"] = params._meta;
 		send({
 			jsonrpc: "2.0",
 			id,
@@ -151,6 +172,7 @@ for await (const line of rl) {
 			},
 		});
 	} else if (method === "session/set_config_option") {
+		selectionMethods.push(`set_config_option:${params.configId}=${params.value}`);
 		if (params.configId === "model-selector") model = params.value;
 		else if (params.configId === "permission-selector") {
 			if (scenario !== "config-options-ignored-mode") mode = params.value;
@@ -164,6 +186,11 @@ for await (const line of rl) {
 		send({ jsonrpc: "2.0", id, error: { code: -32601, message: "Use config options" } });
 	} else if (method === "session/set_model") {
 		model = params.modelId;
+		selectionMethods.push(`set_model:${model}`);
+		send({ jsonrpc: "2.0", id, result: {} });
+	} else if (method === "session/list") {
+		send({ jsonrpc: "2.0", id, result: { sessions: [{ sessionId: "listed-session", cwd: params.cwd ?? "/", title: "Session listed-s" }] } });
+	} else if (method === "logout") {
 		send({ jsonrpc: "2.0", id, result: {} });
 	} else if (method === "session/set_mode") {
 		if (scenario === "set-mode-fails" && params.modeId === "auto_edit") {
@@ -198,6 +225,41 @@ for await (const line of rl) {
 			}, Number(process.env.FAKE_PROGRESS_STEP_MS ?? 30));
 			continue;
 		}
+		if (scenario === "native-tools") {
+			for (const update of [
+				{ sessionUpdate: "tool_call", toolCallId: "native-1", title: "Run command", kind: "execute", status: "in_progress", rawInput: { command: "echo hello" }, locations: [{ path: "src/a.ts", line: 2 }], _meta: { extra: "kept" } },
+				{ sessionUpdate: "tool_call_update", toolCallId: "native-1", status: "completed", rawOutput: { exitCode: 0, stdout: "hello" }, content: [{ type: "content", content: { type: "text", text: "output".repeat(1000) } }, { type: "diff", path: "src/a.ts", oldText: "old", newText: "new" }] },
+			]) send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId, update } });
+		}
+		if (text.includes("inspect meta")) {
+			reply(params.sessionId, id, JSON.stringify({ sessionId: params.sessionId, meta: sessionMeta, clientCapabilities, selectionMethods }));
+			continue;
+		}
+		if (text.includes("report usage")) {
+			send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId, update: { sessionUpdate: "usage_update", used: 1234, size: 100000 } } });
+			reply(params.sessionId, id, "counted");
+			continue;
+		}
+		if (text.includes("change model")) {
+			model = "gemini-other";
+			send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId, update: { sessionUpdate: "config_option_update", configOptions: sessionConfigOptions() } } });
+			reply(params.sessionId, id, "replaced");
+			continue;
+		}
+		const fsMatch = /^fs (read|write) (\S+)$/u.exec(text.split("\n").at(-1) ?? "");
+		if (fsMatch) {
+			const [, operation, file] = fsMatch;
+			const request = operation === "read"
+				? requestClient("fs/read_text_file", { sessionId: params.sessionId, path: file, line: 2, limit: 1 })
+				: requestClient("fs/write_text_file", { sessionId: params.sessionId, path: file, content: "written by agent\n" });
+			void request.then((response) => reply(params.sessionId, id, JSON.stringify(response.result ?? { error: response.error.message })));
+			continue;
+		}
+		if (text.includes("inspect context")) {
+			send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: JSON.stringify(params.prompt) } } } });
+			send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+			continue;
+		}
 		if (text.includes("bridge") && mcpServer) {
 			bridgePromptId = id;
 			const invocation = text.includes("parallel")
@@ -228,6 +290,24 @@ for await (const line of rl) {
 		}
 		if (text.includes("hang")) {
 			hangingPromptId = id;
+			continue;
+		}
+		if (text.includes("pi tool permission")) {
+			permissionPromptId = id;
+			send({
+				jsonrpc: "2.0",
+				id: "permission-1",
+				method: "session/request_permission",
+				params: {
+					sessionId: params.sessionId,
+					toolCall: { toolCallId: "mcp-1", title: "pi-bridge_pi_echo", kind: "other", rawInput: { text: "x" } },
+					options: [
+						{ optionId: "allow_always", name: "Allow Always", kind: "allow_always" },
+						{ optionId: "allow", name: "Allow", kind: "allow_once" },
+						{ optionId: "deny", name: "Deny", kind: "reject_once" },
+					],
+				},
+			});
 			continue;
 		}
 		if (text.includes("permission")) {
@@ -288,6 +368,7 @@ function sessionConfigOptions() {
 		{ id: "model-selector", name: "Model", category: "model", type: "select", currentValue: model,
 			options: [{ group: "google", name: "Google", options: [
 				{ value: "auto", name: "Auto" }, { value: "gemini-test", name: "Gemini Test" },
+				...(model === "gemini-other" ? [{ value: "gemini-other", name: "Gemini Other" }] : []),
 			] }] },
 		{ id: "permission-selector", name: "Permissions", category: "mode", type: "select", currentValue: mode,
 			options: ["default", "auto_edit", "yolo"].map((value) => ({ value, name: value })) },

@@ -28,6 +28,18 @@ export function usageFromPrompt(response: PromptResponse): Usage {
 	return usage;
 }
 
+/** Antigravity 1.3 reports token counts only as `usage_update` (tokens now in
+ * the context window). Pi derives context fill and compaction from
+ * `totalTokens`, so use it when the prompt response carried no counts. */
+export function withContextUsage(usage: Usage, contextTokens: number | undefined): Usage {
+	if (usage.totalTokens > 0 || contextTokens === undefined) return usage;
+	return contextUsage(contextTokens);
+}
+
+export function contextUsage(contextTokens: number): Usage {
+	return { ...emptyUsage(), input: contextTokens, totalTokens: contextTokens };
+}
+
 function token(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }

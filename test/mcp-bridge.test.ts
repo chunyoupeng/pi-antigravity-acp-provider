@@ -48,4 +48,14 @@ describe("PiMcpBridge", () => {
 			await bridge.close();
 		}
 	});
+
+	it("recognizes Antigravity activity rows for its own bridged calls", () => {
+		const bridge = new PiMcpBridge({ tools, onCall: vi.fn() });
+		expect(bridge.reports("Running pi_echo", undefined)).toBe(true);
+		expect(bridge.reports("Running pi-bridge_pi_echo", undefined)).toBe(true);
+		expect(bridge.reports("pi-bridge_pi_echo", undefined)).toBe(true);
+		expect(bridge.reports(undefined, { mcp: { server: "pi-bridge", tool: "pi_echo" } })).toBe(true);
+		expect(bridge.reports("Running pi_other", undefined)).toBe(false);
+		expect(bridge.reports("Running run_command", undefined)).toBe(false);
+	});
 });

@@ -4,6 +4,8 @@ import {
 	type AssistantMessageEventStream,
 	createAssistantMessageEventStream,
 	type Model,
+	type JsonObject,
+	type SimpleStreamOptions,
 	type StopReason,
 	type ToolCall,
 } from "@earendil-works/pi-ai";
@@ -23,7 +25,7 @@ export class PiEventWriter {
 		return this.terminal;
 	}
 
-	constructor(model: Model<Api>) {
+	constructor(private readonly model: Model<Api>, private readonly options: SimpleStreamOptions = {}) {
 		this.stream = createAssistantMessageEventStream();
 		this.message = {
 			role: "assistant",
@@ -53,6 +55,10 @@ export class PiEventWriter {
 		if (!block || block.type !== "thinking") throw new Error("Pi thinking block invariant failed");
 		block.thinking += delta;
 		this.stream.push({ type: "thinking_delta", contentIndex: index, delta, partial: this.message });
+	}
+
+	async providerEvent(data: unknown): Promise<void> {
+		await this.options.onProviderStreamEvent?.(data, this.model);
 	}
 
 	toolCall(id: string, name: string, args: Record<string, unknown>): void {

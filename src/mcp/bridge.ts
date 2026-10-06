@@ -1,5 +1,5 @@
 import type { McpServer as AcpMcpServer } from "@agentclientprotocol/sdk";
-import type { Tool } from "@earendil-works/pi-ai";
+import type { JsonObject, Tool } from "@earendil-works/pi-ai";
 import {
 	CallToolRequestSchema,
 	ListToolsRequestSchema,
@@ -17,6 +17,7 @@ import { PACKAGE_VERSION, PERMISSION_TOOL_NAME } from "../constants.js";
 const BODY_LIMIT = 1024 * 1024;
 const SCHEMA_LIMIT = 64 * 1024;
 const MAX_TOOLS = 64;
+const BRIDGE_NAME = "pi-bridge";
 
 interface BridgeTool {
 	mcpName: string;
@@ -29,7 +30,7 @@ interface BridgeTool {
 export interface PiToolInvocation {
 	id: string;
 	name: string;
-	arguments: Record<string, unknown>;
+	arguments: JsonObject;
 }
 
 export interface PiMcpBridgeOptions {
@@ -71,6 +72,16 @@ export class PiMcpBridge {
 		return this.tools.length === 0;
 	}
 
+	/** Whether an ACP tool activity or permission request is about one of this
+	 * bridge's calls. Pi shows and governs those as its own tool calls. */
+	reports(title: string | null | undefined, meta: unknown): boolean {
+		const mcp = meta && typeof meta === "object" ? (meta as { mcp?: { server?: unknown; tool?: unknown } }).mcp : undefined;
+		if (mcp?.server === BRIDGE_NAME) return true;
+		// Activity rows read "Running pi_read"; permission requests "pi-bridge_pi_read".
+		const name = /^(?:Running )?(?:pi-bridge_)?(\S+)$/u.exec(title ?? "")?.[1];
+		return name !== undefined && this.tools.some((tool) => tool.mcpName === name);
+	}
+
 	async start(): Promise<AcpMcpServer | undefined> {
 		if (this.empty) return undefined;
 		if (this.server && this.url) return this.descriptor();
@@ -103,7 +114,7 @@ export class PiMcpBridge {
 		if (!this.url) throw new AntigravityAcpError("spawn", "MCP bridge is not listening");
 		return {
 			type: "http",
-			name: "pi-bridge",
+			name: BRIDGE_NAME,
 			url: this.url,
 			headers: [{ name: "Authorization", value: `Bearer ${this.token}` }],
 		};
@@ -141,7 +152,7 @@ export class PiMcpBridge {
 			} catch {
 				return toolError("The original Pi tool schema could not validate these arguments");
 			}
-			return this.options.onCall({ id: crypto.randomUUID(), name: tool.piName, arguments: args });
+			return this.options.onCall({ id: crypto.randomUUID(), name: tool.piName, arguments: args as JsonObject });
 		});
 		const transport = new StreamableHTTPServerTransport(
 			{ sessionIdGenerator: undefined } as unknown as ConstructorParameters<

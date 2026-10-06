@@ -14,10 +14,12 @@ import {
 import {
 	isPermissionMode,
 	isRuntimeUpdateMode,
+	isToolOwner,
 	loadConfig,
 	permissionModeLabel,
 	savePermissionMode,
 	saveRuntimeUpdateMode,
+	saveToolOwner,
 	type PermissionMode,
 } from "../src/config.js";
 import {
@@ -33,9 +35,13 @@ import {
 	type PermissionToolResult,
 } from "../src/runtime.js";
 import { runSetupWizard } from "../src/wizard.js";
+import { registerToolActivity } from "./tool-activity.js";
 
 export default function antigravityAcpExtension(pi: ExtensionAPI): void {
-	const runtime = new AntigravityRuntime(undefined, loadConfig().permissions);
+	const config = loadConfig();
+	const runtime = new AntigravityRuntime(
+		undefined, config.permissions, undefined, registerToolActivity(pi), config.tools,
+	);
 	const { provider } = createAntigravityProvider(runtime);
 	pi.registerProvider(provider);
 
@@ -113,11 +119,62 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			if (command === "logout" || command === "account" || command === "switch-account") {
-				await runtime.logout();
+				const { server } = await runtime.logout();
 				ctx.ui.notify(
-					"Local Antigravity credentials and saved ACP sessions were cleared. Run /logout for the old Pi marker, then /login to choose the next account.",
+					`${server ? "Antigravity signed out and cleared its stored credentials" : "Local Antigravity credentials were cleared"}; saved ACP sessions were forgotten. Run /logout for the old Pi marker, then /login to choose the next account.`,
 					"info",
 				);
+				return;
+			}
+			if (command === "tools" || command.startsWith("tools ")) {
+				const requested = command.slice("tools".length).trim();
+				if (!requested) {
+					ctx.ui.notify(`Antigravity tool owner: ${loadConfig().tools}`, "info");
+					return;
+				}
+				if (!isToolOwner(requested)) {
+					ctx.ui.notify("Usage: /antigravity-acp tools [pi|native]", "warning");
+					return;
+				}
+				runtime.setToolOwner(requested);
+				saveToolOwner(requested);
+				ctx.ui.notify(
+					requested === "pi"
+						? "Antigravity uses Pi's tools for files and the shell (from the next prompt)."
+						: "Antigravity uses its built-in tools; file reads and writes still go through Pi (from the next prompt).",
+					"info",
+				);
+				return;
+			}
+			if (command === "sessions") {
+				const sessions = await runtime.listSessions(ctx.cwd);
+				if (sessions.length === 0) {
+					ctx.ui.notify(`No Antigravity sessions for ${ctx.cwd}`, "info");
+					return;
+				}
+				const labels = sessions.map((session) =>
+					`${session.sessionId}${session.updatedAt ? `  ${session.updatedAt}` : ""}${session.title && !session.title.includes(session.sessionId.slice(0, 8)) ? `  ${session.title}` : ""}`,
+				);
+				const selected = await ctx.ui.select("Attach an Antigravity session to this Pi session", labels);
+				const session = selected === undefined ? undefined : sessions[labels.indexOf(selected)];
+				if (!session) return;
+				await runtime.attachSession(ctx.sessionManager.getSessionId(), session.sessionId, ctx.cwd);
+				ctx.ui.notify(`The next prompt resumes Antigravity session ${session.sessionId}.`, "info");
+				return;
+			}
+			if (command === "plan" || command.startsWith("plan ")) {
+				const task = command.slice("plan".length).trim();
+				if (!task) {
+					ctx.ui.notify("Usage: /antigravity-acp plan <task>", "warning");
+					return;
+				}
+				if (!ctx.isIdle()) {
+					ctx.ui.notify("Wait for the current turn to finish first.", "warning");
+					return;
+				}
+				// Antigravity's built-in /plan: it writes an implementation plan and
+				// asks for approval before it executes.
+				pi.sendUserMessage(`/plan ${task}`, { expandPromptTemplates: false });
 				return;
 			}
 			if (command === "quota") {
@@ -162,7 +219,7 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 			const verbose = command === "doctor --verbose";
 			if (command !== "doctor" && command !== "status" && !verbose) {
 				ctx.ui.notify(
-					"Usage: /antigravity-acp [setup|doctor|status|quota|update|updates|logout|account|qualify|permissions]",
+					"Usage: /antigravity-acp [setup|doctor|status|quota|update|updates|logout|account|qualify|permissions|tools|sessions|plan]",
 					"warning",
 				);
 				return;
@@ -182,12 +239,13 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 					`Antigravity ACP provider ${PACKAGE_VERSION}`,
 					`Runtime: installed=${setup.installedVersion ?? "external/unknown"} approved=${update?.approvedVersion ?? setup.approvedVersion} registry=${update?.latestVersion ?? "unavailable"} updates=${setup.updateMode}; ACP SDK ${ACP_SDK_VERSION}, protocol ${ACP_PROTOCOL_VERSION}`,
 					`Antigravity server: ${entry}`,
-					`Authentication: ${auth.status}${auth.authType ? ` (${auth.authType})` : ""}`,
+					`Authentication: ${auth.status}${auth.authType ? ` (${auth.authType})` : ""}${auth.credentialStore ? ` [${auth.credentialStore}]` : ""}`,
 					`Requested permission mode: ${permissionModeLabel(snapshot.permissionMode)}`,
+					`Tool owner: ${snapshot.toolOwner}`,
 					`Active bindings: ${snapshot.bindings}`,
 					formatMetrics(snapshot.metrics),
 					...snapshot.processes.flatMap((item) => [
-						`• pid=${item.pid ?? "?"} generation=${item.generation} model=${item.modelId} confirmedMode=${item.confirmedPermissionMode} alive=${item.alive} restored=${item.restored} agent=${item.agentVersion ?? "?"} mcpHttp=${item.mcpHttp} permission=${item.waitingForPermission} tools=${item.waitingForTools} ignoredStdoutNoise=${item.ignoredStdoutNoiseLines}`,
+						`• pid=${item.pid ?? "?"} generation=${item.generation} model=${item.modelId} confirmedMode=${item.confirmedPermissionMode} alive=${item.alive} restored=${item.restored} agent=${item.agentVersion ?? "?"} mcpHttp=${item.mcpHttp} piTools=${item.piOwnsTools} context=${item.contextTokens ?? "?"} permission=${item.waitingForPermission} tools=${item.waitingForTools} ignoredStdoutNoise=${item.ignoredStdoutNoiseLines}`,
 						`  omitted Pi tools: ${item.omittedTools.length ? item.omittedTools.map((tool) => `${tool.name} (${tool.reason})`).join("; ") : "none"}`,
 						...(verbose && item.stderrTail ? [`  stderr (redacted): ${item.stderrTail}`] : []),
 					]),
@@ -239,6 +297,7 @@ function formatMetrics(metrics: {
 		cacheWrite: number;
 	};
 	latestQuota?: { remaining?: number; limit?: number; resetAt?: string; tier?: string; model?: string };
+	latestContext?: { used: number; size: number };
 }): string {
 	const totalTokens =
 		metrics.totals.input +
@@ -247,10 +306,14 @@ function formatMetrics(metrics: {
 		metrics.totals.cacheRead +
 		metrics.totals.cacheWrite;
 	const quota = metrics.latestQuota;
+	const context = metrics.latestContext;
 	return [
 		`Usage this process: turns=${metrics.totals.turns} tokens=${totalTokens} input=${metrics.totals.input} output=${metrics.totals.output} reasoning=${metrics.totals.reasoning} cacheRead=${metrics.totals.cacheRead}`,
 		quota
 			? `Latest quota: remaining=${quota.remaining ?? "unknown"}/${quota.limit ?? "unknown"} reset=${quota.resetAt ?? "unknown"} tier=${quota.tier ?? "unknown"} model=${quota.model ?? "unknown"}`
 			: "Latest quota: not supplied by the Antigravity server",
+		context
+			? `Latest context: ${context.used}/${context.size} tokens (${((context.used / context.size) * 100).toFixed(1)}%)`
+			: "Latest context: no usage_update received yet",
 	].join("\n");
 }

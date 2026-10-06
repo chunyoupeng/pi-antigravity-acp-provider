@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -52,12 +53,62 @@ export interface AntigravityAuthHealth {
 	authType?: string;
 	tokenFile: boolean;
 	settingsFile: boolean;
+	/** Where the OAuth token was found. macOS servers prefer the Keychain. */
+	credentialStore?: "file" | "keychain";
+}
+
+// The ACP server stores one generic password per OAuth flavor under this
+// service on macOS, and only falls back to acp_token.json elsewhere.
+const KEYCHAIN_SERVICE = "gemini";
+const SECURITY_CLI = "/usr/bin/security";
+
+function keychainAccount(authType: string | undefined): string | undefined {
+	if (authType === "oauth-personal") return "antigravity-acp";
+	if (authType === "oauth-business") return "antigravity-acp-business";
+	return undefined;
+}
+
+function keychainEnabled(): boolean {
+	const forced = process.env.AGY_ACP_FORCE_FILE_STORAGE?.trim().toLowerCase();
+	return process.platform === "darwin" && forced !== "1" && forced !== "true";
+}
+
+/** Checks entry presence only; `find-generic-password` without -w/-g never
+ * reads the secret, so it cannot trigger a Keychain access prompt. */
+export function hasKeychainCredential(authType: string | undefined): boolean {
+	const account = keychainAccount(authType);
+	if (!account || !keychainEnabled()) return false;
+	try {
+		execFileSync(SECURITY_CLI, ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account], {
+			stdio: "ignore",
+			timeout: 3_000,
+		});
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Fallback when the server's `logout` RPC is unavailable. */
+export function clearKeychainCredentials(): void {
+	if (!keychainEnabled()) return;
+	for (const account of ["antigravity-acp", "antigravity-acp-business"]) {
+		try {
+			execFileSync(SECURITY_CLI, ["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account], {
+				stdio: "ignore",
+				timeout: 3_000,
+			});
+		} catch {
+			// Absent entries are already logged out.
+		}
+	}
 }
 
 /** Structural local health only. A network probe is required to call an OAuth
  * token valid; secret values are never returned or logged. */
 export function inspectAntigravityAuth(
 	directory = path.join(os.homedir(), ".gemini", "antigravity-acp"),
+	keychain: (authType: string | undefined) => boolean = hasKeychainCredential,
 ): AntigravityAuthHealth {
 	const tokenPath = path.join(directory, "acp_token.json");
 	const settingsPath = path.join(directory, "settings.json");
@@ -79,12 +130,21 @@ export function inspectAntigravityAuth(
 		try {
 			const token = JSON.parse(fs.readFileSync(tokenPath, "utf8")) as { refresh_token?: unknown };
 			if (typeof token.refresh_token === "string" && token.refresh_token.length > 0) {
-				return { status: "oauth-refreshable", authType: authType ?? "oauth-personal", tokenFile, settingsFile };
+				return {
+					status: "oauth-refreshable",
+					authType: authType ?? "oauth-personal",
+					tokenFile,
+					settingsFile,
+					credentialStore: "file",
+				};
 			}
 			return { status: "corrupt", ...(authType ? { authType } : {}), tokenFile, settingsFile };
 		} catch {
 			return { status: "corrupt", ...(authType ? { authType } : {}), tokenFile, settingsFile };
 		}
+	}
+	if (authType && keychain(authType)) {
+		return { status: "oauth-refreshable", authType, tokenFile, settingsFile, credentialStore: "keychain" };
 	}
 	if (authType) return { status: "configured-not-authenticated", authType, tokenFile, settingsFile };
 	return { status: "missing", tokenFile, settingsFile };
@@ -95,8 +155,8 @@ export function hasAntigravityAuth(): boolean {
 	return status === "api-key-env" || status === "oauth-refreshable";
 }
 
-/** Local logout. Google currently advertises logout as an agent command rather
- * than an ACP SDK RPC, so this removes the local refresh token and auth choice. */
+/** Local logout: removes the file token and auth choice. The runtime prefers the
+ * server's ACP `logout` RPC, which also clears Keychain-stored tokens. */
 export function clearAntigravityCredentials(
 	directory = path.join(os.homedir(), ".gemini", "antigravity-acp"),
 ): void {

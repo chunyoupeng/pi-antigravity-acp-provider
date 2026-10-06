@@ -4,12 +4,17 @@ import {
 	RequestError,
 	type AuthenticateRequest,
 	type InitializeResponse,
+	type ListSessionsResponse,
 	type McpServer,
 	type PromptRequest,
 	type PromptResponse,
+	type ReadTextFileRequest,
+	type ReadTextFileResponse,
 	type RequestPermissionRequest,
 	type RequestPermissionResponse,
 	type SessionNotification,
+	type WriteTextFileRequest,
+	type WriteTextFileResponse,
 } from "@agentclientprotocol/sdk";
 
 import { PACKAGE_VERSION } from "../constants.js";
@@ -29,10 +34,16 @@ const DEFAULT_OPERATION_TIMEOUT_MS = 120_000;
 export interface AntigravityConnectionHandlers {
 	onUpdate?: (notification: SessionNotification) => void | Promise<void>;
 	onPermission?: (request: RequestPermissionRequest) => Promise<RequestPermissionResponse>;
+	onReadTextFile?: (request: ReadTextFileRequest) => Promise<ReadTextFileResponse>;
+	onWriteTextFile?: (request: WriteTextFileRequest) => Promise<WriteTextFileResponse>;
 }
+
+export type SessionMeta = Record<string, unknown>;
 
 export interface AntigravityConnectionOptions extends AntigravityProcessOptions {
 	handlers?: AntigravityConnectionHandlers;
+	/** Advertise ACP fs so Antigravity's file tools call back into the provider. */
+	clientFs?: boolean;
 	initializeTimeoutMs?: number;
 	operationTimeoutMs?: number;
 	/** No inbound progress while the model is idle (default 10 minutes). */
@@ -113,6 +124,14 @@ export class AntigravityAcpConnection {
 					}
 					await this.handlers.onUpdate?.(notification);
 				},
+				readTextFile: async (request) => {
+					if (!this.handlers.onReadTextFile) throw RequestError.methodNotFound("fs/read_text_file");
+					return this.handlers.onReadTextFile(request);
+				},
+				writeTextFile: async (request) => {
+					if (!this.handlers.onWriteTextFile) throw RequestError.methodNotFound("fs/write_text_file");
+					return this.handlers.onWriteTextFile(request);
+				},
 			}),
 			stream,
 		);
@@ -120,7 +139,7 @@ export class AntigravityAcpConnection {
 			this.connection.initialize({
 				protocolVersion: PROTOCOL_VERSION,
 				clientCapabilities: {
-					fs: { readTextFile: false, writeTextFile: false },
+					fs: { readTextFile: options.clientFs === true, writeTextFile: options.clientFs === true },
 					terminal: false,
 				},
 				clientInfo: {
@@ -168,11 +187,12 @@ export class AntigravityAcpConnection {
 		cwd: string,
 		signal?: AbortSignal,
 		mcpServers: McpServer[] = [],
+		meta?: SessionMeta,
 	): Promise<AcpNewSessionResponse> {
 		await this.initialize();
 		const response = await this.withAbort(
 			this.withDeadline(
-				this.connection.newSession({ cwd, mcpServers }),
+				this.connection.newSession({ cwd, mcpServers, ...(meta ? { _meta: meta } : {}) }),
 				this.operationTimeoutMs,
 				"session/new",
 			),
@@ -191,11 +211,12 @@ export class AntigravityAcpConnection {
 		cwd: string,
 		mcpServers: McpServer[] = [],
 		signal?: AbortSignal,
+		meta?: SessionMeta,
 	): Promise<SessionState> {
 		await this.initialize();
 		const response = await this.withAbort(
 			this.withDeadline(
-				this.connection.loadSession({ sessionId, cwd, mcpServers }),
+				this.connection.loadSession({ sessionId, cwd, mcpServers, ...(meta ? { _meta: meta } : {}) }),
 				this.operationTimeoutMs,
 				"session/load",
 			),
@@ -209,11 +230,12 @@ export class AntigravityAcpConnection {
 		cwd: string,
 		mcpServers: McpServer[] = [],
 		signal?: AbortSignal,
+		meta?: SessionMeta,
 	): Promise<SessionState> {
 		await this.initialize();
 		const response = await this.withAbort(
 			this.withDeadline(
-				this.connection.resumeSession({ sessionId, cwd, mcpServers }),
+				this.connection.resumeSession({ sessionId, cwd, mcpServers, ...(meta ? { _meta: meta } : {}) }),
 				this.operationTimeoutMs,
 				"session/resume",
 			),
@@ -259,6 +281,26 @@ export class AntigravityAcpConnection {
 	/** A parked Pi tool gets the bounded work-inactivity window, not an absolute deadline. */
 	holdPromptWatchdog(sessionId: string): () => void {
 		return this.watchdogs.get(sessionId)?.hold() ?? (() => undefined);
+	}
+
+	async listSessions(cwd: string | undefined, signal?: AbortSignal): Promise<ListSessionsResponse> {
+		await this.initialize();
+		return this.withAbort(
+			this.withDeadline(
+				this.connection.listSessions(cwd === undefined ? {} : { cwd }),
+				this.operationTimeoutMs,
+				"session/list",
+			),
+			signal,
+		);
+	}
+
+	async logout(signal?: AbortSignal): Promise<void> {
+		await this.initialize();
+		await this.withAbort(
+			this.withDeadline(this.connection.logout({}), this.operationTimeoutMs, "logout"),
+			signal,
+		);
 	}
 
 	async prompt(request: PromptRequest, signal?: AbortSignal): Promise<PromptResponse> {

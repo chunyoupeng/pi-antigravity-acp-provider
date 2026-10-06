@@ -1,4 +1,5 @@
 import { normalizeContext, type Context, type Model } from "@earendil-works/pi-ai";
+import type { AcpToolActivity } from "../src/acp/events.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -43,6 +44,66 @@ describe("AntigravityRuntime", () => {
 			expect((await runtime.snapshot()).processes[0]?.modelId).toBe("gemini-test");
 			await runtime.setPermissionMode("default");
 			expect((await runtime.snapshot()).permissionMode).toBe("default");
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("forwards full native tool activities and ordered raw events without executable calls or thinking", async () => {
+		const activities: AcpToolActivity[] = [];
+		const raw: string[] = [];
+		const runtime = new AntigravityRuntime(
+			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent, "native-tools"] }),
+			"yolo", undefined, (activity) => activities.push(activity),
+		);
+		try {
+			const writer = runtime.stream(model, normalizeContext({ systemPrompt: "Project rules", messages: [{ role: "user", content: "hello", timestamp: 1 }] }), {
+				sessionId: "native-session", apiKey: "test-key",
+				async onProviderStreamEvent(data, receivedModel) {
+					expect(receivedModel).toBe(model);
+					await new Promise((resolve) => setTimeout(resolve, 15));
+					raw.push((data as { update: { sessionUpdate: string } }).update.sessionUpdate);
+				},
+			});
+			for await (const _event of writer.stream) void _event;
+			expect(raw).toEqual(["tool_call", "tool_call_update", "agent_thought_chunk", "agent_message_chunk"]);
+			expect(activities).toHaveLength(2);
+			expect(activities[0]).toMatchObject({ piSessionId: "native-session", toolCall: { status: "in_progress", rawInput: { command: "echo hello" } } });
+			expect(activities[1]?.toolCall).toMatchObject({ title: "Run command", status: "completed", rawInput: { command: "echo hello" }, rawOutput: { exitCode: 0, stdout: "hello" }, locations: [{ path: "src/a.ts", line: 2 }] });
+			expect(JSON.stringify(activities[1])).toContain("output".repeat(1000));
+			expect(writer.message.content).toEqual([{ type: "thinking", thinking: "Checking" }, { type: "text", text: "Hello" }]);
+			expect(writer.message.stopReason).toBe("stop");
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("retains normalized project instructions when ACP only accepts plain text", async () => {
+		const runtime = new AntigravityRuntime(
+			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent, "text-only"] }),
+		);
+		try {
+			const writer = runtime.stream(model, {
+				messages: [{ role: "system", content: "AGENTS.md rules", sections: { project: "Keep changes small" }, timestamp: 0 }, { role: "user", content: "inspect context", timestamp: 1 }],
+			}, { apiKey: "test-key" });
+			for await (const _event of writer.stream) void _event;
+			const content = writer.message.content[0];
+			if (content?.type !== "text") throw new Error("missing echoed prompt");
+			expect(JSON.parse(content.text)).toEqual([{ type: "text", text: "# Pi session instructions\n\nAGENTS.md rules\n\nKeep changes small" }, { type: "text", text: "inspect context" }]);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("rejects image input when ACP does not advertise support", async () => {
+		const runtime = new AntigravityRuntime(
+			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent, "text-only"] }),
+		);
+		try {
+			const writer = runtime.stream(model, { messages: [{ role: "user", content: [{ type: "image", data: "AQ==", mimeType: "image/png" }], timestamp: 1 }] }, { apiKey: "test-key" });
+			const events = [];
+			for await (const event of writer.stream) events.push(event);
+			expect(events.at(-1)).toMatchObject({ type: "error", error: { errorMessage: expect.stringContaining("did not advertise image input") } });
 		} finally {
 			await runtime.close();
 		}
@@ -351,10 +412,11 @@ describe("AntigravityRuntime", () => {
 			const tools = [
 				{ name: "echo", description: "Echo text", parameters: Type.Object({ text: Type.String() }) },
 			];
-			const firstContext: Context = {
+			const firstContext = normalizeContext({
 				messages: [{ role: "user", content: "use bridge", timestamp: 1 }],
 				tools,
-			};
+			});
+			expect("tools" in firstContext).toBe(false);
 			const firstWriter = runtime.stream(model, firstContext, { apiKey: "test-key" });
 			const firstEvents = [];
 			for await (const event of firstWriter.stream) firstEvents.push(event);
