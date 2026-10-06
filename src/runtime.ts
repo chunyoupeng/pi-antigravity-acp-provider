@@ -63,8 +63,8 @@ const TOOL_BATCH_MS = 100;
 
 /** Antigravity built-ins disabled when Pi owns tool execution. The model then
  * reaches files and the shell only through Pi's bridged tools, so Pi's tool
- * set, hooks and rendering apply. Web search, URL fetch, image generation,
- * questions and subagents have no Pi equivalent and stay native. */
+ * set, hooks and rendering apply. Web search, URL fetch and subagents have no
+ * Pi equivalent and stay native. */
 export const PI_OWNED_NATIVE_TOOLS = [
 	"run_command",
 	"view_file",
@@ -74,6 +74,10 @@ export const PI_OWNED_NATIVE_TOOLS = [
 	"search_directory",
 	"find_file",
 ] as const;
+
+/** Antigravity built-ins disabled in every tool mode. Each one costs prompt
+ * tokens on every turn (schedule alone about 2k) and has no use behind Pi. */
+export const UNUSED_NATIVE_TOOLS = ["schedule", "ask_question", "generate_image"] as const;
 
 type AntigravityModel = Model<"antigravity-acp">;
 
@@ -816,11 +820,17 @@ export class AntigravityRuntime {
 			}
 			const mcpServers = mcpServer ? [mcpServer] : [];
 			// Pi's tools can only stand in for the built-ins when they reach
-			// Antigravity over MCP. The filter is always sent, so an empty list
+			// Antigravity over MCP. The filter is always sent, so the native list
 			// also clears a filter persisted by an earlier Pi-owned binding.
 			const piOwnsTools =
 				toolOwner === "pi" && initialize.agentCapabilities?.mcpCapabilities?.http === true;
-			const meta: SessionMeta = { agy: { disabledTools: piOwnsTools ? [...PI_OWNED_NATIVE_TOOLS] : [] } };
+			const meta: SessionMeta = {
+				agy: {
+					disabledTools: piOwnsTools
+						? [...PI_OWNED_NATIVE_TOOLS, ...UNUSED_NATIVE_TOOLS]
+						: [...UNUSED_NATIVE_TOOLS],
+				},
+			};
 			const piSessionId = key.startsWith("sid:") ? key.slice(4) : undefined;
 			const saved = piSessionId ? this.sessionStore?.get(piSessionId) : undefined;
 			let session: AcpNewSessionResponse | undefined;

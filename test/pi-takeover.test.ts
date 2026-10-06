@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { AntigravityAcpConnection } from "../src/acp/connection.js";
 import { AcpSessionStore } from "../src/acp/session-store.js";
 import type { ToolOwner } from "../src/config.js";
-import { AntigravityRuntime, PI_OWNED_NATIVE_TOOLS } from "../src/runtime.js";
+import { AntigravityRuntime, PI_OWNED_NATIVE_TOOLS, UNUSED_NATIVE_TOOLS } from "../src/runtime.js";
 
 const fakeAgent = fileURLToPath(new URL("./fixtures/fake-agent.mjs", import.meta.url));
 const model: Model<"antigravity-acp"> = {
@@ -56,7 +56,7 @@ describe("Pi takeover of Antigravity capabilities", () => {
 		const runtime = runtimeFor("default");
 		try {
 			const echoed = JSON.parse((await ask(runtime, "inspect meta")).text);
-			expect(echoed.meta.new).toEqual({ agy: { disabledTools: [...PI_OWNED_NATIVE_TOOLS] } });
+			expect(echoed.meta.new).toEqual({ agy: { disabledTools: [...PI_OWNED_NATIVE_TOOLS, ...UNUSED_NATIVE_TOOLS] } });
 			expect(echoed.clientCapabilities.fs).toEqual({ readTextFile: false, writeTextFile: false });
 		} finally {
 			await runtime.close();
@@ -67,7 +67,7 @@ describe("Pi takeover of Antigravity capabilities", () => {
 		const runtime = runtimeFor("default", "native");
 		try {
 			const echoed = JSON.parse((await ask(runtime, "inspect meta")).text);
-			expect(echoed.meta.new).toEqual({ agy: { disabledTools: [] } });
+			expect(echoed.meta.new).toEqual({ agy: { disabledTools: [...UNUSED_NATIVE_TOOLS] } });
 			expect(echoed.clientCapabilities.fs).toEqual({ readTextFile: true, writeTextFile: true });
 		} finally {
 			await runtime.close();
@@ -132,7 +132,7 @@ describe("Pi takeover of Antigravity capabilities", () => {
 			await runtime.attachSession("pi-session", "listed-session");
 			const echoed = JSON.parse((await ask(runtime, "inspect meta", "pi-session")).text);
 			expect(echoed.sessionId).toBe("listed-session");
-			expect(echoed.meta.resume).toEqual({ agy: { disabledTools: [...PI_OWNED_NATIVE_TOOLS] } });
+			expect(echoed.meta.resume).toEqual({ agy: { disabledTools: [...PI_OWNED_NATIVE_TOOLS, ...UNUSED_NATIVE_TOOLS] } });
 		} finally {
 			await runtime.close();
 		}
