@@ -231,6 +231,11 @@ for await (const line of rl) {
 				{ sessionUpdate: "tool_call_update", toolCallId: "native-1", status: "completed", rawOutput: { exitCode: 0, stdout: "hello" }, content: [{ type: "content", content: { type: "text", text: "output".repeat(1000) } }, { type: "diff", path: "src/a.ts", oldText: "old", newText: "new" }] },
 			]) send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId, update } });
 		}
+		const images = params.prompt.filter((block) => block.type === "image");
+		if (images.length > 0) {
+			reply(params.sessionId, id, ` saw ${images.map((block) => block.mimeType).join(",")} after: ${text}`);
+			continue;
+		}
 		if (text.includes("inspect meta")) {
 			reply(params.sessionId, id, JSON.stringify({ sessionId: params.sessionId, meta: sessionMeta, clientCapabilities, selectionMethods }));
 			continue;
@@ -258,6 +263,10 @@ for await (const line of rl) {
 		if (text.includes("inspect context")) {
 			send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: JSON.stringify(params.prompt) } } } });
 			send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+			continue;
+		}
+		if (text.includes("list bridge tools") && mcpServer) {
+			void listMcpTools(mcpServer).then((tools) => reply(params.sessionId, id, JSON.stringify(tools)));
 			continue;
 		}
 		if (text.includes("bridge") && mcpServer) {
@@ -373,6 +382,19 @@ function sessionConfigOptions() {
 		{ id: "permission-selector", name: "Permissions", category: "mode", type: "select", currentValue: mode,
 			options: ["default", "auto_edit", "yolo"].map((value) => ({ value, name: value })) },
 	];
+}
+
+async function listMcpTools(server) {
+	const headers = Object.fromEntries(server.headers.map((header) => [header.name, header.value]));
+	const client = new Client({ name: "fake-gemini", version: "1" }, { capabilities: {} });
+	const transport = new StreamableHTTPClientTransport(new URL(server.url), { requestInit: { headers } });
+	try {
+		await client.connect(transport);
+		const { tools } = await client.listTools();
+		return tools.map((tool) => ({ name: tool.name, description: tool.description }));
+	} finally {
+		await client.close();
+	}
 }
 
 async function invokeMcpTool(server, text) {

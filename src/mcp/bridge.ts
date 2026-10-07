@@ -35,6 +35,8 @@ export interface PiToolInvocation {
 
 export interface PiMcpBridgeOptions {
 	tools: readonly Tool[];
+	/** Descriptions that replace a Pi tool's own, keyed by Pi tool name. */
+	descriptions?: Readonly<Record<string, string>>;
 	onCall: (invocation: PiToolInvocation) => Promise<CallToolResult>;
 }
 
@@ -64,7 +66,7 @@ export class PiMcpBridge {
 	private url: string | undefined;
 
 	constructor(private readonly options: PiMcpBridgeOptions) {
-		this.tools = projectTools(options.tools, this.omissions);
+		this.tools = projectTools(options.tools, this.omissions, options.descriptions);
 		this.fingerprint = piToolFingerprint(options.tools);
 	}
 
@@ -169,7 +171,11 @@ export class PiMcpBridge {
 	}
 }
 
-function projectTools(tools: readonly Tool[], omissions: ToolOmission[]): BridgeTool[] {
+function projectTools(
+	tools: readonly Tool[],
+	omissions: ToolOmission[],
+	descriptions: Readonly<Record<string, string>> = {},
+): BridgeTool[] {
 	const output: BridgeTool[] = [];
 	const names = new Set<string>();
 	for (const tool of tools) {
@@ -196,7 +202,7 @@ function projectTools(tools: readonly Tool[], omissions: ToolOmission[]): Bridge
 		output.push({
 			mcpName,
 			piName: tool.name,
-			description: tool.description,
+			description: descriptions[tool.name] ?? tool.description,
 			inputSchema,
 			originalSchema: tool.parameters,
 		});

@@ -455,6 +455,60 @@ describe("AntigravityRuntime", () => {
 		}
 	});
 
+	it("sends images from a Pi tool result as a follow-up prompt instead of over MCP", async () => {
+		const runtime = new AntigravityRuntime(
+			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent] }),
+		);
+		try {
+			const tools = [
+				{ name: "echo", description: "Echo text", parameters: Type.Object({ text: Type.String() }) },
+			];
+			const firstContext: Context = {
+				tools,
+				messages: [{ role: "user", content: "use bridge", timestamp: 1 }],
+			};
+			const firstWriter = runtime.stream(model, firstContext, { apiKey: "test-key" });
+			const firstEvents = [];
+			for await (const event of firstWriter.stream) firstEvents.push(event);
+			const firstDone = firstEvents.at(-1);
+			if (firstDone?.type !== "done") throw new Error("missing bridged tool turn");
+			const call = firstDone.message.content.find((block) => block.type === "toolCall");
+			if (!call || call.type !== "toolCall") throw new Error("missing bridged tool call");
+
+			const secondWriter = runtime.stream(
+				model,
+				{
+					tools,
+					messages: [
+						...firstContext.messages,
+						firstDone.message,
+						{
+							role: "toolResult",
+							toolCallId: call.id,
+							toolName: call.name,
+							content: [
+								{ type: "text", text: "Read image file [image/png]" },
+								{ type: "image", data: "aW1n", mimeType: "image/png" },
+							],
+							isError: false,
+							timestamp: 2,
+						},
+					],
+				},
+				{ apiKey: "test-key" },
+			);
+			const secondEvents = [];
+			for await (const event of secondWriter.stream) secondEvents.push(event);
+			const text = secondWriter.message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+			// The MCP result carries the text and a note; the image arrives in the next prompt.
+			expect(text).toContain("Read image file [image/png]\n[1 image(s) from this result cannot be shown in a tool result.");
+			expect(text).toContain("saw image/png after: Image(s) returned by your echo tool call:\nContinue the task using these images.");
+			expect(secondEvents.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+		} finally {
+			await runtime.close();
+		}
+	});
+
 	it.each(["parallel", "parallel reversed"])("batches %s MCP calls into one Pi tool turn", async (scenario) => {
 		const runtime = new AntigravityRuntime(
 			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent] }),

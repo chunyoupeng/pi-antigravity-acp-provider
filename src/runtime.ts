@@ -13,6 +13,7 @@ import {
 	getCurrentTools,
 	normalizeContext,
 	type Context,
+	type ImageContent,
 	type Model,
 	type SimpleStreamOptions,
 	type ToolResultMessage,
@@ -62,18 +63,32 @@ const PERMISSION_TIMEOUT_MS = 120_000;
 const TOOL_BATCH_MS = 100;
 
 /** Antigravity built-ins disabled when Pi owns tool execution. The model then
- * reaches files and the shell only through Pi's bridged tools, so Pi's tool
- * set, hooks and rendering apply. Web search, URL fetch and subagents have no
- * Pi equivalent and stay native. */
+ * runs commands and changes files only through Pi's bridged tools, so Pi's
+ * tool set, hooks and rendering apply. `start_subagent` also removes
+ * invoke_subagent, define_subagent, manage_subagents and send_message, so
+ * subagents cannot read or run outside Pi. Web search and URL fetch have no Pi
+ * equivalent and stay native. `view_file` also stays native: Antigravity
+ * offloads MCP results over about 4 KB, and every MCP image, to a file the
+ * model sees only as a path, while native results stay inline. */
 export const PI_OWNED_NATIVE_TOOLS = [
 	"run_command",
-	"view_file",
 	"create_file",
 	"edit_file",
 	"list_directory",
 	"search_directory",
 	"find_file",
+	"start_subagent",
 ] as const;
+
+/** Pi tool descriptions replaced when Pi owns tools. Both `view_file` and
+ * Pi's read reach the model, and an MCP text result over about 4 KB reaches
+ * it only as an offloaded path. `view_file` returns an image as raw bytes, so
+ * Pi's read, with its deferred image prompt, is kept for images only. */
+export const PI_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = {
+	read:
+		"Read an image file (png, jpg, gif, webp) so you can see it. " +
+		"Use only for images. For text files use view_file, which returns the whole file inline.",
+};
 
 /** Antigravity built-ins disabled in every tool mode. Each one costs prompt
  * tokens on every turn (schedule alone about 2k) and has no use behind Pi. */
@@ -94,6 +109,12 @@ interface PendingPiTool {
 	resolve: (result: CallToolResult) => void;
 }
 
+/** Images from a Pi tool result, held back from MCP and sent as a prompt. */
+interface DeferredImages {
+	toolName: string;
+	images: ImageContent[];
+}
+
 interface Binding {
 	key: string;
 	cwd: string;
@@ -112,6 +133,7 @@ interface Binding {
 	writer: PiEventWriter | undefined;
 	permission: PendingPermission | undefined;
 	pendingTools: Map<string, PendingPiTool>;
+	deferredImages: DeferredImages[];
 	toolBatchTimer: ReturnType<typeof setTimeout> | undefined;
 	bridge: PiMcpBridge | undefined;
 	toolFingerprint: string;
@@ -580,9 +602,19 @@ export class AntigravityRuntime {
 				this.noteContinuationInstructions(binding, context);
 				binding.pendingContextCount = context.messages.length;
 				binding.pendingContextFingerprint = messagesFingerprint(context.messages);
+				// Antigravity shows an MCP image to the model only as an offloaded
+				// file path, so images go out as a prompt once the turn ends.
+				const deferImages = binding.initialize.agentCapabilities?.promptCapabilities?.image === true;
 				for (const { pending, message } of results) {
 					binding.pendingTools.delete(pending.invocation.id);
-					pending.resolve(toMcpToolResult(message as ToolResultMessage));
+					const result = message as ToolResultMessage;
+					const images = result.content.filter((block): block is ImageContent => block.type === "image");
+					if (deferImages && images.length > 0) {
+						binding.deferredImages.push({ toolName: pending.invocation.name, images });
+						pending.resolve(deferredImageResult(result, images.length));
+					} else {
+						pending.resolve(toMcpToolResult(result));
+					}
 				}
 				await this.awaitContinuation(binding, options.signal);
 				return;
@@ -659,11 +691,20 @@ export class AntigravityRuntime {
 				if (options.signal.aborted) onTurnAbort();
 			}
 			binding.toolTracker.clear();
+			binding.deferredImages = [];
 			binding.updateQueue = Promise.resolve();
-			const response = await binding.connection.prompt(
+			let response = await binding.connection.prompt(
 				{ sessionId: binding.session.sessionId, prompt: parts.prompt },
 				options.signal,
 			);
+			while (response.stopReason === "end_turn" && binding.deferredImages.length > 0 && !binding.abortRequested) {
+				await binding.updateQueue;
+				this.metrics.record(response, usageFromPrompt(response));
+				response = await binding.connection.prompt(
+					{ sessionId: binding.session.sessionId, prompt: deferredImagePrompt(binding.deferredImages.splice(0)) },
+					options.signal,
+				);
+			}
 			if (onTurnAbort) options.signal?.removeEventListener("abort", onTurnAbort);
 			// ACP dispatches notifications independently of the prompt response.
 			// Drain ordered async observers before closing the Pi content stream.
@@ -697,6 +738,7 @@ export class AntigravityRuntime {
 			if (onTurnAbort) options.signal?.removeEventListener("abort", onTurnAbort);
 			completeTurn?.();
 			binding.turnCompletion = undefined;
+			binding.deferredImages = [];
 			binding.abortRequested = false;
 			binding.writer = undefined;
 			release();
@@ -814,6 +856,7 @@ export class AntigravityRuntime {
 			if (tools.length > 0 && initialize.agentCapabilities?.mcpCapabilities?.http === true) {
 				bridge = new PiMcpBridge({
 					tools,
+					...(toolOwner === "pi" ? { descriptions: PI_TOOL_DESCRIPTIONS } : {}),
 					onCall: (invocation) => this.requestPiTool(binding, invocation),
 				});
 				mcpServer = await bridge.start();
@@ -888,6 +931,7 @@ export class AntigravityRuntime {
 				writer,
 				permission: undefined,
 				pendingTools: new Map(),
+				deferredImages: [],
 				toolBatchTimer: undefined,
 				bridge,
 				toolFingerprint: piToolFingerprint(tools),
@@ -1271,6 +1315,29 @@ function toMcpToolResult(message: ToolResultMessage): CallToolResult {
 		),
 		isError: message.isError,
 	};
+}
+
+function deferredImageResult(message: ToolResultMessage, imageCount: number): CallToolResult {
+	const content = message.content.flatMap((block) =>
+		block.type === "text" ? [{ type: "text" as const, text: block.text }] : [],
+	);
+	content.push({
+		type: "text",
+		text:
+			`[${imageCount} image(s) from this result cannot be shown in a tool result. ` +
+			"They will arrive as the next user message. End your turn now, without text or further tool calls, to receive them.]",
+	});
+	return { content, isError: message.isError };
+}
+
+function deferredImagePrompt(entries: DeferredImages[]): ContentBlock[] {
+	const prompt: ContentBlock[] = [];
+	for (const { toolName, images } of entries) {
+		prompt.push({ type: "text", text: `Image(s) returned by your ${toolName} tool call:` });
+		for (const image of images) prompt.push({ type: "image", data: image.data, mimeType: image.mimeType });
+	}
+	prompt.push({ type: "text", text: "Continue the task using these images." });
+	return prompt;
 }
 
 function cancelPermission(binding: Binding): void {

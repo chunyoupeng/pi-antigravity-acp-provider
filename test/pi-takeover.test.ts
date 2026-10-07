@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { AntigravityAcpConnection } from "../src/acp/connection.js";
 import { AcpSessionStore } from "../src/acp/session-store.js";
 import type { ToolOwner } from "../src/config.js";
-import { AntigravityRuntime, PI_OWNED_NATIVE_TOOLS, UNUSED_NATIVE_TOOLS } from "../src/runtime.js";
+import { AntigravityRuntime, PI_OWNED_NATIVE_TOOLS, PI_TOOL_DESCRIPTIONS, UNUSED_NATIVE_TOOLS } from "../src/runtime.js";
 
 const fakeAgent = fileURLToPath(new URL("./fixtures/fake-agent.mjs", import.meta.url));
 const model: Model<"antigravity-acp"> = {
@@ -154,6 +154,31 @@ describe("Pi takeover of Antigravity capabilities", () => {
 			expect(writer.message.content).toEqual([{ type: "text", text: "Decision: selected" }]);
 		} finally {
 			await runtime.close();
+		}
+	});
+
+	it("steers Pi's read to images only when Pi owns tools", async () => {
+		const tools = [
+			{ name: "read", description: "Read a file", parameters: Type.Object({ path: Type.String() }) },
+			{ name: "echo", description: "Echo text", parameters: Type.Object({ text: Type.String() }) },
+		];
+		for (const [owner, read] of [["pi", PI_TOOL_DESCRIPTIONS.read], ["native", "Read a file"]] as const) {
+			const runtime = runtimeFor("default", owner);
+			try {
+				const writer = runtime.stream(
+					model,
+					normalizeContext({ messages: [{ role: "user", content: "list bridge tools", timestamp: 1 }], tools }),
+					{ apiKey: "test-key" },
+				);
+				for await (const _event of writer.stream) void _event;
+				const block = writer.message.content.find((item) => item.type === "text");
+				expect(JSON.parse(block?.type === "text" ? block.text : "")).toEqual([
+					{ name: "pi_read", description: read },
+					{ name: "pi_echo", description: "Echo text" },
+				]);
+			} finally {
+				await runtime.close();
+			}
 		}
 	});
 
