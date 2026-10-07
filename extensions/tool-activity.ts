@@ -12,11 +12,16 @@ import { type Component, Image, Text, stripTerminalSequences, truncateToWidth, v
 import { structuredPatch } from "diff";
 
 import type { AcpToolActivity } from "../src/acp/events.js";
+import { matchNativeReadResult, readNativeReadResults, type NativeReadResult } from "../src/acp/native-read-results.js";
 
 export const TOOL_ACTIVITY_ENTRY = "antigravity-acp-tool-activity";
 export interface ToolActivityEntry extends AcpToolActivity {
 	/** One display row per invocation; ACP IDs can be reused in later turns. */
 	rowId: string;
+	/** Receipt time of the first notification, not of a later bulk failure. */
+	observedAt?: number;
+	/** Separate display evidence; toolCall and update remain raw ACP data. */
+	readResult?: NativeReadResult;
 }
 
 interface ToolRow {
@@ -25,10 +30,63 @@ interface ToolRow {
 }
 
 /** Display-only session entries: never queued as model input or executable Pi calls. */
-export function registerToolActivity(pi: ExtensionAPI): (activity: AcpToolActivity) => void {
+export function registerToolActivity(
+	pi: ExtensionAPI,
+	loadReadResults: (sessionId: string) => Promise<NativeReadResult[]> = readNativeReadResults,
+): (activity: AcpToolActivity) => void {
 	const rows = new Map<string, ToolRow>();
 	const activeCalls = new Map<string, string>();
 	let cwd = process.cwd();
+	let generation = 0;
+	let active = false;
+	let disposed = false;
+	let running = false;
+	let dirty = false;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const stopTimer = () => {
+		clearTimeout(timer);
+		timer = undefined;
+	};
+	const pendingReads = () => [...rows.values()].filter((row) =>
+		row.latest.toolCall.kind === "read" && row.latest.toolCall.title === "Running view_file" && !row.latest.readResult);
+	const requestReconcile = () => {
+		if (disposed) return;
+		dirty = true;
+		if (!running) void reconcile();
+	};
+	const reconcile = async () => {
+		running = true;
+		dirty = false;
+		const currentGeneration = generation;
+		stopTimer();
+		try {
+			const pending = pendingReads();
+			for (const sessionId of new Set(pending.map((row) => row.latest.sessionId))) {
+				const results = await loadReadResults(sessionId);
+				if (disposed || currentGeneration !== generation) return;
+				const used = new Set([...rows.values()].filter((row) => row.latest.sessionId === sessionId)
+					.flatMap((row) => row.latest.readResult ? [row.latest.readResult.stepIndex] : []));
+				const available = results.filter((result) => !used.has(result.stepIndex));
+				const proposals = pendingReads().filter((row) => row.latest.sessionId === sessionId)
+					.map((row) => ({ row, result: matchNativeReadResult(available, row.latest.toolCall, row.latest.observedAt ?? NaN) }));
+				for (const { row, result } of proposals) {
+					// A result must match exactly one row as well as one invocation.
+					if (!result || proposals.filter((item) => item.result?.stepIndex === result.stepIndex).length !== 1) continue;
+					row.latest = { ...row.latest, readResult: result };
+					pi.appendEntry(TOOL_ACTIVITY_ENTRY, row.latest);
+				}
+			}
+		} catch {
+			// Recovery must never break tool execution or claim an unread file worked.
+		} finally {
+			running = false;
+			if (dirty && !disposed) requestReconcile();
+			else if (!disposed && currentGeneration === generation && active && pendingReads().length > 0) {
+				timer = setTimeout(requestReconcile, 300);
+				timer.unref();
+			}
+		}
+	};
 	// Only the presentation functions are used; execute() is never called.
 	const bashDefinition = createBashToolDefinition(cwd);
 	const readDefinition = createReadToolDefinition(cwd);
@@ -65,6 +123,10 @@ export function registerToolActivity(pi: ExtensionAPI): (activity: AcpToolActivi
 	};
 
 	const restore = (_event: unknown, ctx: ExtensionContext) => {
+		generation++;
+		active = false;
+		disposed = false;
+		stopTimer();
 		rows.clear();
 		activeCalls.clear();
 		cwd = ctx.cwd;
@@ -73,13 +135,33 @@ export function registerToolActivity(pi: ExtensionAPI): (activity: AcpToolActivi
 			const data = entry.data as ToolActivityEntry | undefined;
 			if (!data?.rowId) continue;
 			const row = rows.get(data.rowId);
-			if (row) row.latest = data;
-			else rows.set(data.rowId, { latest: data, owner: entry.id });
+			const restored: ToolActivityEntry = {
+				...data,
+				observedAt: row?.latest.observedAt ?? data.observedAt ?? Date.parse(entry.timestamp),
+				...(row?.latest.readResult ? { readResult: row.latest.readResult } : {}),
+			};
+			if (row) row.latest = restored;
+			else rows.set(data.rowId, { latest: restored, owner: entry.id });
 			activeCalls.set(callKey(data), data.rowId);
 		}
+		requestReconcile();
 	};
 	pi.on("session_start", restore);
 	pi.on("session_tree", restore);
+	pi.on("agent_start", () => {
+		active = true;
+		requestReconcile();
+	});
+	pi.on("agent_settled", () => {
+		active = false;
+		stopTimer();
+		requestReconcile();
+	});
+	pi.on("session_shutdown", () => {
+		disposed = true;
+		generation++;
+		stopTimer();
+	});
 
 	pi.registerEntryRenderer<ToolActivityEntry>(TOOL_ACTIVITY_ENTRY, (entry, { expanded }, theme) => {
 		const data = entry.data;
@@ -109,13 +191,18 @@ export function registerToolActivity(pi: ExtensionAPI): (activity: AcpToolActivi
 			rowId = crypto.randomUUID();
 			activeCalls.set(key, rowId);
 		}
-		const data: ToolActivityEntry = { ...activity, rowId };
 		const row = rows.get(rowId);
+		const data: ToolActivityEntry = {
+			...activity, rowId,
+			observedAt: row?.latest.observedAt ?? Date.now(),
+			...(row?.latest.readResult ? { readResult: row.latest.readResult } : {}),
+		};
 		if (row) row.latest = data;
 		else rows.set(rowId, { latest: data });
 		// Every update remains in the session and JSON/RPC stream. The TUI updates
 		// the first row in place and hides the later records for this invocation.
 		pi.appendEntry(TOOL_ACTIVITY_ENTRY, data);
+		requestReconcile();
 	};
 }
 
@@ -127,19 +214,26 @@ function callKey(activity: AcpToolActivity): string {
 }
 
 function renderToolRow(
-	activity: AcpToolActivity,
+	activity: ToolActivityEntry,
 	renderers: { bash: ToolRenderers; read: ToolRenderers; edit: ToolRenderers },
 	cwd: string,
 	expanded: boolean,
 	theme: Theme,
 	width: number,
 ): string[] {
-	const call = activity.toolCall;
+	const call = activity.readResult ? {
+		...activity.toolCall, status: activity.readResult.status, rawOutput: activity.readResult.output, content: [],
+	} : activity.toolCall;
 	const input = record(call.rawInput);
-	const path = input.path ?? input.file_path ?? input.filePath ?? call.locations?.[0]?.path ??
+	const path = input.path ?? input.file_path ?? input.filePath ?? input.AbsolutePath ?? input.absolute_path ?? call.locations?.[0]?.path ??
 		call.content?.find((item) => item.type === "diff")?.path;
+	// Some ACP builds report this generic failure after view_file already
+	// returned content to the model. Keep the raw record; do not infer success.
+	const unconfirmedRead = !activity.readResult && call.kind === "read" && call.title === "Running view_file" &&
+		call.status === "failed" && call.rawOutput === "Tool execution failed" &&
+		(call.content?.length ?? 0) === 0;
 	const isPartial = call.status !== "completed" && call.status !== "failed";
-	const isError = call.status === "failed";
+	const isError = call.status === "failed" && !unconfirmedRead;
 	let args: Record<string, unknown> = input;
 	let renderer: ToolRenderers | undefined;
 	if (call.kind === "execute") {
@@ -147,7 +241,13 @@ function renderToolRow(
 		args = { command: displayText(String(input.command ?? input.command_line ?? call.title ?? call.toolCallId)) };
 	} else if (call.kind === "read" && typeof path === "string") {
 		renderer = renderers.read;
-		args = { ...input, path: displayText(path) };
+		const start = input.StartLine ?? input.start_line;
+		const end = input.EndLine ?? input.end_line;
+		args = {
+			...input, path: displayText(path),
+			...(typeof start === "number" ? { offset: start } : {}),
+			...(typeof start === "number" && typeof end === "number" ? { limit: end - start + 1 } : {}),
+		};
 	} else if (call.kind === "edit" && typeof path === "string") {
 		renderer = renderers.edit;
 		// Never ask the edit renderer to preview against the local filesystem.
@@ -161,17 +261,18 @@ function renderToolRow(
 	};
 	const header = renderer?.renderCall?.(args, theme, context) ??
 		new Text(theme.fg("toolTitle", theme.bold(displayText(call.title ?? call.toolCallId))), 0, 0);
-	const statusColor = isError ? "error" : isPartial ? "border" : "success";
+	const statusColor = unconfirmedRead ? "warning" : isError ? "error" : isPartial ? "border" : "success";
 	const lines = gutter(header, 2, theme.fg(statusColor, "⏺"), width);
-	const output = toolOutput(activity);
+	const output = unconfirmedRead ? "ACP status is ambiguous; read result unconfirmed." : toolOutput({ ...activity, toolCall: call });
 	if (output) {
 		// Bash's result renderer supplies Pi's width-aware output preview and
 		// expansion hint. It also suits tools without a Pi-specific result shape.
 		const resultRenderer = call.kind === "read" ? renderers.read : renderers.bash;
-		const component = resultRenderer.renderResult?.(
-			{ content: [{ type: "text", text: output }], details: undefined },
-			{ expanded, isPartial }, theme, context,
-		);
+		const component = unconfirmedRead ? new Text(theme.fg("warning", output), 0, 0) :
+			resultRenderer.renderResult?.(
+				{ content: [{ type: "text", text: output }], details: undefined },
+				{ expanded, isPartial }, theme, context,
+			);
 		if (component) lines.push(...gutter(component, 5, `  ${theme.fg("dim", "⎿")}`, width));
 	}
 	for (const item of call.content ?? []) {

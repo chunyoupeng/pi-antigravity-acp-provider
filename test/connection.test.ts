@@ -1,3 +1,4 @@
+import type { ClientSideConnection } from "@agentclientprotocol/sdk";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
@@ -83,6 +84,74 @@ describe("AntigravityAcpConnection", () => {
 			expect(unhandled).toEqual([]);
 		} finally {
 			process.off("unhandledRejection", onUnhandled);
+			await connection.close();
+		}
+	});
+
+	it("cancels a hanging prompt and keeps the session usable", async () => {
+		const connection = new AntigravityAcpConnection({
+			cwd: path.dirname(fakeAgent),
+			command: process.execPath,
+			args: [fakeAgent],
+		});
+		try {
+			await connection.initialize();
+			const session = await connection.newSession(process.cwd());
+			const controller = new AbortController();
+			const pending = connection.prompt({
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text: "hang" }],
+			}, controller.signal);
+			const assertion = expect(pending).rejects.toThrow(/cancel|abort/iu);
+			controller.abort();
+			await assertion;
+			expect(connection.process.alive).toBe(true);
+			await expect(connection.prompt({
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text: "hello" }],
+			})).resolves.toMatchObject({ stopReason: "end_turn" });
+		} finally {
+			await connection.close();
+		}
+	});
+
+	it.each([false, true])("rejects a pending prompt on process exit (signal: %s)", async (withSignal) => {
+		const connection = new AntigravityAcpConnection({
+			cwd: path.dirname(fakeAgent),
+			command: process.execPath,
+			args: [fakeAgent],
+		});
+		try {
+			await connection.initialize();
+			const sdk = (connection as unknown as { connection: ClientSideConnection }).connection;
+			// The SDK response never arrives: the provider must observe process exit itself.
+			vi.spyOn(sdk, "prompt").mockReturnValue(new Promise(() => {}));
+			const pending = connection.prompt({
+				sessionId: "fake-session",
+				prompt: [{ type: "text", text: "hang" }],
+			}, withSignal ? new AbortController().signal : undefined);
+			const assertion = expect(pending).rejects.toThrow("Antigravity ACP process exited");
+			connection.process.child.kill("SIGKILL");
+			await assertion;
+		} finally {
+			await connection.close();
+		}
+	});
+
+	it.each([false, true])("rejects malformed output during a prompt (signal: %s)", async (withSignal) => {
+		const connection = new AntigravityAcpConnection({
+			cwd: path.dirname(fakeAgent),
+			command: process.execPath,
+			args: [fakeAgent, "malformed-prompt"],
+		});
+		try {
+			await connection.initialize();
+			const session = await connection.newSession(process.cwd());
+			await expect(connection.prompt({
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text: "hello" }],
+			}, withSignal ? new AbortController().signal : undefined)).rejects.toThrow("malformed JSON");
+		} finally {
 			await connection.close();
 		}
 	});

@@ -200,6 +200,10 @@ for await (const line of rl) {
 		mode = params.modeId;
 		send({ jsonrpc: "2.0", id, result: {} });
 	} else if (method === "session/prompt") {
+		if (scenario === "malformed-prompt") {
+			process.stdout.write("not-json\n");
+			continue;
+		}
 		const text = params.prompt.filter((block) => block.type === "text").map((block) => block.text).join("\n");
 		if (scenario === "mode-drift" || scenario === "config-options-mode-drift") {
 			mode = "yolo";
