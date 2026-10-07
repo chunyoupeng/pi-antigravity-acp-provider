@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 
 import { AntigravityAcpConnection } from "../src/acp/connection.js";
 import { AcpSessionStore } from "../src/acp/session-store.js";
+import { registerPiSession } from "../src/session-registry.js";
 import {
 	AntigravityRuntime,
 	PERMISSION_RESULT_KIND,
@@ -635,6 +636,131 @@ describe("AntigravityRuntime", () => {
 			expect(snapshot.processes[0]?.alive).toBe(true);
 		} finally {
 			await runtime.close();
+		}
+	});
+
+	it("uses process.cwd() when no session cwd resolver is installed", async () => {
+		let capturedCwd: string | undefined;
+		const runtime = new AntigravityRuntime(
+			(options) => {
+				capturedCwd = options.cwd;
+				return new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent] });
+			},
+			"yolo",
+		);
+		try {
+			const writer = runtime.stream(
+				model,
+				{ messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+				{ sessionId: "cwd-default-session", apiKey: "test-key" },
+			);
+			for await (const _event of writer.stream) void _event;
+			expect(capturedCwd).toBe(process.cwd());
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("uses the folder a session's extension instance registered", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cwd-own-"));
+		let capturedCwd: string | undefined;
+		const runtime = new AntigravityRuntime(
+			(options) => {
+				capturedCwd = options.cwd;
+				return new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent] });
+			},
+			"yolo",
+		);
+		const unregister = registerPiSession("cwd-own-session", { cwd: dir, toolActivity: () => {} });
+		try {
+			const writer = runtime.stream(
+				model,
+				{ messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+				{ sessionId: "cwd-own-session", apiKey: "test-key" },
+			);
+			for await (const _event of writer.stream) void _event;
+			expect(capturedCwd).toBe(dir);
+		} finally {
+			unregister();
+			await runtime.close();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("uses resolver when Symbol.for('pi.sessionCwdResolver') is installed and recreates binding on cwd change", async () => {
+		const dir1 = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cwd-1-"));
+		const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cwd-2-"));
+		const symbol = Symbol.for("pi.sessionCwdResolver");
+		const prev = (globalThis as Record<symbol, unknown>)[symbol];
+		const capturedCwds: string[] = [];
+		(globalThis as Record<symbol, unknown>)[symbol] = (sessionId: string) => {
+			if (sessionId === "s1") return dir1;
+			return undefined;
+		};
+		const runtime = new AntigravityRuntime(
+			(options) => {
+				capturedCwds.push(options.cwd);
+				return new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent] });
+			},
+			"yolo",
+		);
+		try {
+			const firstContext = { messages: [{ role: "user" as const, content: "turn 1", timestamp: 1 }] };
+			const writer1 = runtime.stream(
+				model,
+				firstContext,
+				{ sessionId: "s1", apiKey: "test-key" },
+			);
+			const firstEvents = [];
+			for await (const event of writer1.stream) firstEvents.push(event);
+			const done1 = firstEvents.find((e) => e.type === "done");
+			if (!done1 || done1.type !== "done") throw new Error("missing turn 1 done");
+			expect(capturedCwds[0]).toBe(dir1);
+
+			// Same sessionId and same resolved cwd reuses existing binding
+			const secondContext = {
+				messages: [
+					...firstContext.messages,
+					done1.message,
+					{ role: "user" as const, content: "turn 2", timestamp: 2 },
+				],
+			};
+			const writer2 = runtime.stream(
+				model,
+				secondContext,
+				{ sessionId: "s1", apiKey: "test-key" },
+			);
+			const secondEvents = [];
+			for await (const event of writer2.stream) secondEvents.push(event);
+			const done2 = secondEvents.find((e) => e.type === "done");
+			if (!done2 || done2.type !== "done") throw new Error("missing turn 2 done");
+			expect(capturedCwds.length).toBe(1);
+
+			// Resolver changes cwd for the session -> closes old binding and creates new one with new cwd
+			(globalThis as Record<symbol, unknown>)[symbol] = (sessionId: string) => {
+				if (sessionId === "s1") return dir2;
+				return undefined;
+			};
+			const thirdContext = {
+				messages: [
+					...secondContext.messages,
+					done2.message,
+					{ role: "user" as const, content: "turn 3", timestamp: 3 },
+				],
+			};
+			const writer3 = runtime.stream(
+				model,
+				thirdContext,
+				{ sessionId: "s1", apiKey: "test-key" },
+			);
+			for await (const _event of writer3.stream) void _event;
+			expect(capturedCwds.length).toBe(2);
+			expect(capturedCwds[1]).toBe(dir2);
+		} finally {
+			(globalThis as Record<symbol, unknown>)[symbol] = prev;
+			await runtime.close();
+			fs.rmSync(dir1, { recursive: true, force: true });
+			fs.rmSync(dir2, { recursive: true, force: true });
 		}
 	});
 });

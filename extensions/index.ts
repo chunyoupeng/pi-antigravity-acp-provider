@@ -34,14 +34,28 @@ import {
 	PERMISSION_TOOL_NAME,
 	type PermissionToolResult,
 } from "../src/runtime.js";
+import type { AcpToolActivity } from "../src/acp/events.js";
+import { lookupPiSession, registerPiSession } from "../src/session-registry.js";
 import { runSetupWizard } from "../src/wizard.js";
 import { registerToolActivity } from "./tool-activity.js";
 
 export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 	const config = loadConfig();
+	const toolActivity = registerToolActivity(pi);
+	// The instance whose provider runs a request may not own that session (see session-registry.ts), so activity goes
+	// to the owning instance. It is display-only and must never fail the model request.
+	const routeToolActivity = (activity: AcpToolActivity): void => {
+		const owner = activity.piSessionId ? lookupPiSession(activity.piSessionId) : undefined;
+		try {
+			(owner?.toolActivity ?? toolActivity)(activity);
+		} catch {
+			// The owning session is gone or its extension runtime is not bound yet.
+		}
+	};
 	const runtime = new AntigravityRuntime(
-		undefined, config.permissions, undefined, registerToolActivity(pi), config.tools,
+		undefined, config.permissions, undefined, routeToolActivity, config.tools,
 	);
+	let unregisterSession: (() => void) | undefined;
 	const { provider } = createAntigravityProvider(runtime);
 	pi.registerProvider(provider);
 
@@ -261,6 +275,9 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		// Hosts such as PI WEB serve several folders from one process, so process.cwd() is not the session's folder.
+		unregisterSession?.();
+		unregisterSession = registerPiSession(ctx.sessionManager.getSessionId(), { cwd: ctx.cwd, toolActivity });
 		if (loadConfig().runtimeUpdates !== "notify") return;
 		try {
 			const update = await checkAntigravityAcpUpdate();
@@ -283,6 +300,8 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async () => {
+		unregisterSession?.();
+		unregisterSession = undefined;
 		await runtime.close();
 	});
 }
