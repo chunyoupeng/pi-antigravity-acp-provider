@@ -37,6 +37,9 @@ describe("PiMcpBridge", () => {
 			const valid = await client.callTool({ name: "pi_echo", arguments: { text: "hello" } });
 			expect(valid.content).toEqual([{ type: "text", text: "hello" }]);
 			expect(onCall).toHaveBeenCalledOnce();
+			const validBare = await client.callTool({ name: "echo", arguments: { text: "world" } });
+			expect(validBare.content).toEqual([{ type: "text", text: "world" }]);
+			expect(onCall).toHaveBeenCalledTimes(2);
 			const unauthorized = await fetch(descriptor.url, {
 				method: "POST",
 				headers: { "content-type": "application/json" },

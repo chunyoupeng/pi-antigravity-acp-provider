@@ -1,7 +1,7 @@
 import { type Context, normalizeContext } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 
-import { buildPromptParts } from "../src/stream/context.js";
+import { adaptInstructionsForAntigravity, buildPromptParts } from "../src/stream/context.js";
 import { quotaFromPrompt } from "../src/status.js";
 import { usageFromPrompt } from "../src/stream/usage.js";
 
@@ -220,6 +220,26 @@ describe("prompt context", () => {
 			resource: { text: expect.stringContaining("externally inserted") },
 		});
 		expect(result.prompt[1]).toEqual({ type: "text", text: "current" });
+	});
+
+	it("adapts Pi session instructions to steer read to images and view_file to text files", () => {
+		const rawInstructions =
+			"<tools>\n- read: Read file contents\n- bash: Execute commands\n</tools>\n\n" +
+			"<docs>\nPi documentation to strip\n</docs>\n\n" +
+			"<rules>\n- Use bash for file operations\n- Use read to examine files instead of cat or sed.\n</rules>";
+		const context = normalizeContext({
+			systemPrompt: rawInstructions,
+			messages: [{ role: "user", content: "hello", timestamp: 1 }],
+		});
+		const result = buildPromptParts(context, true);
+		const text = (result.prompt[0] as { resource: { text: string } }).resource.text;
+		expect(text).not.toContain("<docs>");
+		expect(text).not.toContain("Pi documentation to strip");
+		expect(text).toContain("- pi_read: Read an image file (png, jpg, gif, webp) so you can see it. Use only for images. For text files use view_file.");
+		expect(text).toContain("- pi_bash: Execute commands");
+		expect(text).toContain("- Use pi_bash for file operations");
+		expect(text).toContain("- Use view_file to examine text files instead of cat or sed.");
+		expect(text).toContain("- Use pi_read to inspect images or screenshots (png, jpg, gif, webp).");
 	});
 });
 

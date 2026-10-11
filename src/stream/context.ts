@@ -78,11 +78,88 @@ export function buildPromptParts(
 	return { prompt, messageCount: context.messages.length };
 }
 
+/**
+ * Adapts Pi's system instructions for the Antigravity ACP environment.
+ * When Pi owns tools, read is dedicated to images/screenshots (deferred prompt)
+ * while Antigravity's native view_file handles text files inline.
+ * Bridged Pi tools are prefixed with `pi_` to match Antigravity MCP bridge names.
+ */
+export function adaptInstructionsForAntigravity(instructions: string): string {
+	if (!instructions) return instructions;
+	let adapted = instructions;
+
+	// Strip Pi documentation instructions to save prompt tokens
+	adapted = adapted.replace(/<docs>[\s\S]*?<\/docs>\s*/u, "");
+
+	if (adapted.includes("<tools>")) {
+		adapted = adapted.replace(/<tools>([\s\S]*?)<\/tools>/u, (_, toolsContent: string) => {
+			let content = toolsContent;
+			if (content.includes("- read: Read file contents")) {
+				content = content.replace(
+					"- read: Read file contents",
+					"- pi_read: Read an image file (png, jpg, gif, webp) so you can see it. Use only for images. For text files use view_file.",
+				);
+			} else if (content.includes("- read:")) {
+				content = content.replace(
+					/-\s+read:\s*(.*)/u,
+					"- pi_read: Read an image file (png, jpg, gif, webp) so you can see it. Use only for images. For text files use view_file.",
+				);
+			}
+			if (!content.includes("view_file")) {
+				content = `${content.trimEnd()}\n- view_file: View the contents of a file within the allowed directories (native Antigravity text file reader, inline and fast)\n`;
+			}
+			content = content.replace(/-\s+([a-zA-Z0-9_-]+):/gu, (match, name: string) => {
+				if (name.startsWith("pi_") || name === "view_file") return match;
+				return `- pi_${name}:`;
+			});
+			return `<tools>${content}</tools>`;
+		});
+	} else if (adapted.includes("- read: Read file contents")) {
+		adapted = adapted.replace(
+			"- read: Read file contents",
+			"- pi_read: Read an image file (png, jpg, gif, webp) so you can see it. Use only for images. For text files use view_file.",
+		);
+	}
+
+	if (adapted.includes("<rules>")) {
+		adapted = adapted.replace(/<rules>([\s\S]*?)<\/rules>/u, (_, rulesContent: string) => {
+			let content = rulesContent;
+			if (content.includes("- Use read to examine files instead of cat or sed.")) {
+				content = content.replace(
+					"- Use read to examine files instead of cat or sed.",
+					"- Use view_file to examine text files instead of cat or sed.\n- Use pi_read to inspect images or screenshots (png, jpg, gif, webp).",
+				);
+			} else if (!content.includes("Use pi_read to inspect images") && (adapted.includes("pi_read:") || adapted.includes("- read:"))) {
+				content = `${content.trimEnd()}\n- Use pi_read to inspect images or screenshots (png, jpg, gif, webp).\n`;
+			}
+			content = content.replace(/\bUse bash\b/gu, "Use pi_bash");
+			content = content.replace(/\bUse edit\b/gu, "Use pi_edit");
+			content = content.replace(/\bUse write\b/gu, "Use pi_write");
+			content = content.replace(/\bUse codemode\b/gu, "Use pi_codemode");
+			content = content.replace(/\bUse generate_image\b/gu, "Use pi_generate_image");
+			content = content.replace(/\bUse read to inspect images\b/gu, "Use pi_read to inspect images");
+			return `<rules>${content}</rules>`;
+		});
+	} else {
+		if (adapted.includes("- Use read to examine files instead of cat or sed.")) {
+			adapted = adapted.replace(
+				"- Use read to examine files instead of cat or sed.",
+				"- Use view_file to examine text files instead of cat or sed.\n- Use pi_read to inspect images or screenshots (png, jpg, gif, webp).",
+			);
+		}
+		adapted = adapted.replace(/\bUse bash\b/gu, "Use pi_bash");
+		adapted = adapted.replace(/\bUse edit\b/gu, "Use pi_edit");
+		adapted = adapted.replace(/\bUse write\b/gu, "Use pi_write");
+	}
+
+	return adapted;
+}
+
 function buildReconstruction(context: Context, historyEnd: number): string {
 	const sections: string[] = [];
 	const systemPrompt = currentSystemInstructions(context);
 	if (systemPrompt) {
-		sections.push(`# Pi session instructions\n\n${systemPrompt}`);
+		sections.push(`# Pi session instructions\n\n${adaptInstructionsForAntigravity(systemPrompt)}`);
 	}
 
 	const history = context.messages.slice(0, historyEnd).map(formatMessage).filter(Boolean);
@@ -102,7 +179,7 @@ function buildExternalDelta(context: Context, unseenStart: number, historyEnd: n
 		const instructions = currentSystemInstructions(context);
 		sections.push(
 			"# Updated Pi session instructions\n\nReplace the previous Pi session instructions with the following current instructions, including section updates and removals. These are instructions, not conversation data.\n\n" +
-				(instructions || "No Pi session instructions remain."),
+				(instructions ? adaptInstructionsForAntigravity(instructions) : "No Pi session instructions remain."),
 		);
 	}
 	const formatted = messages.map(formatMessage).filter(Boolean);

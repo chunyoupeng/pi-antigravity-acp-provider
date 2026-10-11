@@ -83,7 +83,7 @@ export class PiMcpBridge {
 		if (mcp?.server === BRIDGE_NAME) return true;
 		// Activity rows read "Running pi_read"; permission requests "pi-bridge_pi_read".
 		const name = /^(?:Running )?(?:pi-bridge_)?(\S+)$/u.exec(title ?? "")?.[1];
-		return name !== undefined && this.tools.some((tool) => tool.mcpName === name);
+		return name !== undefined && this.tools.some((tool) => tool.mcpName === name || tool.piName === name);
 	}
 
 	async start(): Promise<AcpMcpServer | undefined> {
@@ -150,7 +150,9 @@ export class PiMcpBridge {
 			})),
 		}));
 		protocol.setRequestHandler(CallToolRequestSchema, async (call) => {
-			const tool = this.tools.find((candidate) => candidate.mcpName === call.params.name);
+			const tool = this.tools.find(
+				(candidate) => candidate.mcpName === call.params.name || candidate.piName === call.params.name,
+			);
 			if (!tool) return toolError("Unknown or inactive Pi tool");
 			const args = call.params.arguments ?? {};
 			try {
