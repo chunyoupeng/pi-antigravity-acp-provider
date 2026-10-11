@@ -61,6 +61,10 @@ import { RuntimeMetrics } from "./status.js";
 
 const PERMISSION_TIMEOUT_MS = 120_000;
 const TOOL_BATCH_MS = 100;
+/** Antigravity abandons an MCP call after 3 minutes and the model reads that
+ * as a failure. A Pi tool still running before then is handed off instead:
+ * the model ends its turn and gets the result as the next prompt. */
+const TOOL_HANDOFF_MS = 150_000;
 
 /** Antigravity built-ins disabled when Pi owns tool execution. The model then
  * runs commands and changes files only through Pi's bridged tools, so Pi's
@@ -107,6 +111,14 @@ interface PendingPiTool {
 	invocation: PiToolInvocation;
 	/** Resolve the MCP request and release its bounded work-watchdog hold. */
 	resolve: (result: CallToolResult) => void;
+	/** Antigravity dropped the MCP request; Pi's result must go out as a prompt. */
+	abandoned: boolean;
+}
+
+/** A Pi tool result that arrived after Antigravity abandoned its MCP call. */
+interface LateResult {
+	toolName: string;
+	result: ToolResultMessage;
 }
 
 /** Images from a Pi tool result, held back from MCP and sent as a prompt. */
@@ -134,6 +146,7 @@ interface Binding {
 	permission: PendingPermission | undefined;
 	pendingTools: Map<string, PendingPiTool>;
 	deferredImages: DeferredImages[];
+	lateResults: LateResult[];
 	toolBatchTimer: ReturnType<typeof setTimeout> | undefined;
 	bridge: PiMcpBridge | undefined;
 	toolFingerprint: string;
@@ -219,6 +232,7 @@ export class AntigravityRuntime {
 		sessionStore?: AcpSessionStore,
 		private readonly onToolActivity?: (activity: AcpToolActivity) => void,
 		toolOwner: ToolOwner = "pi",
+		private readonly toolHandoffMs = TOOL_HANDOFF_MS,
 	) {
 		this.toolOwner = toolOwner;
 		this.connectionFactory = connectionFactory ?? ((options) => new AntigravityAcpConnection(options));
@@ -583,7 +597,7 @@ export class AntigravityRuntime {
 				} else {
 					pending.resolve({ outcome: { outcome: "cancelled" } });
 				}
-				await this.awaitContinuation(binding, options.signal);
+				await this.awaitContinuation(binding, writer, options.signal);
 				return;
 			}
 		}
@@ -609,14 +623,12 @@ export class AntigravityRuntime {
 					binding.pendingTools.delete(pending.invocation.id);
 					const result = message as ToolResultMessage;
 					const images = result.content.filter((block): block is ImageContent => block.type === "image");
-					if (deferImages && images.length > 0) {
-						binding.deferredImages.push({ toolName: pending.invocation.name, images });
-						pending.resolve(deferredImageResult(result, images.length));
-					} else {
-						pending.resolve(toMcpToolResult(result));
-					}
+					const deferred = deferImages && images.length > 0;
+					if (deferred) binding.deferredImages.push({ toolName: pending.invocation.name, images });
+					if (pending.abandoned) binding.lateResults.push({ toolName: pending.invocation.name, result });
+					else pending.resolve(deferred ? deferredImageResult(result, images.length) : toMcpToolResult(result));
 				}
-				await this.awaitContinuation(binding, options.signal);
+				await this.awaitContinuation(binding, writer, options.signal);
 				return;
 			}
 		}
@@ -692,23 +704,31 @@ export class AntigravityRuntime {
 			}
 			binding.toolTracker.clear();
 			binding.deferredImages = [];
+			binding.lateResults = [];
 			binding.updateQueue = Promise.resolve();
 			let response = await binding.connection.prompt(
 				{ sessionId: binding.session.sessionId, prompt: parts.prompt },
 				options.signal,
 			);
-			while (response.stopReason === "end_turn" && binding.deferredImages.length > 0 && !binding.abortRequested) {
+			for (;;) {
+				// ACP dispatches notifications independently of the prompt response.
+				// Drain ordered async observers before closing the Pi content stream.
+				// Nothing below awaits, so a continuation cannot queue work unseen.
 				await binding.updateQueue;
+				if (
+					response.stopReason !== "end_turn" || binding.abortRequested ||
+					(binding.deferredImages.length === 0 && binding.lateResults.length === 0)
+				) break;
 				this.metrics.record(response, usageFromPrompt(response));
 				response = await binding.connection.prompt(
-					{ sessionId: binding.session.sessionId, prompt: deferredImagePrompt(binding.deferredImages.splice(0)) },
+					{
+						sessionId: binding.session.sessionId,
+						prompt: followUpPrompt(binding.lateResults.splice(0), binding.deferredImages.splice(0)),
+					},
 					options.signal,
 				);
 			}
 			if (onTurnAbort) options.signal?.removeEventListener("abort", onTurnAbort);
-			// ACP dispatches notifications independently of the prompt response.
-			// Drain ordered async observers before closing the Pi content stream.
-			await binding.updateQueue;
 			const activeWriter = binding.writer ?? writer;
 			if (binding.abortRequested) throw abortError();
 			const reported = usageFromPrompt(response);
@@ -736,9 +756,13 @@ export class AntigravityRuntime {
 			throw error;
 		} finally {
 			if (onTurnAbort) options.signal?.removeEventListener("abort", onTurnAbort);
+			// Antigravity abandons an MCP call after 3 minutes and may end the turn.
+			// A result Pi returns later then goes out as a new prompt.
+			if (completeTurn) cancelPiTools(binding, "Antigravity turn ended before Pi returned the tool result");
 			completeTurn?.();
 			binding.turnCompletion = undefined;
 			binding.deferredImages = [];
+			binding.lateResults = [];
 			binding.abortRequested = false;
 			binding.writer = undefined;
 			release();
@@ -747,13 +771,8 @@ export class AntigravityRuntime {
 		}
 	}
 
-	private async awaitContinuation(binding: Binding, signal?: AbortSignal): Promise<void> {
+	private async awaitContinuation(binding: Binding, writer: PiEventWriter, signal?: AbortSignal): Promise<void> {
 		const completion = binding.turnCompletion;
-		if (!completion) return;
-		if (!signal) {
-			await completion;
-			return;
-		}
 		let killTimer: ReturnType<typeof setTimeout> | undefined;
 		const abort = () => {
 			if (binding.turnCompletion !== completion || binding.abortRequested) return;
@@ -763,13 +782,16 @@ export class AntigravityRuntime {
 				if (binding.turnCompletion === completion) void binding.connection.close();
 			}, 1_500);
 		};
-		if (signal.aborted) abort();
-		else signal.addEventListener("abort", abort, { once: true });
 		try {
+			if (!completion) return;
+			if (signal?.aborted) abort();
+			else signal?.addEventListener("abort", abort, { once: true });
 			await completion;
 		} finally {
-			signal.removeEventListener("abort", abort);
+			signal?.removeEventListener("abort", abort);
 			if (killTimer) clearTimeout(killTimer);
+			// The turn normally finishes this writer; Pi must never wait on it forever.
+			writer.fail(new AntigravityAcpError("protocol", "Antigravity turn ended without continuing from Pi's tool result"));
 		}
 	}
 
@@ -857,7 +879,7 @@ export class AntigravityRuntime {
 				bridge = new PiMcpBridge({
 					tools,
 					...(toolOwner === "pi" ? { descriptions: PI_TOOL_DESCRIPTIONS } : {}),
-					onCall: (invocation) => this.requestPiTool(binding, invocation),
+					onCall: (invocation, abandoned) => this.requestPiTool(binding, invocation, abandoned),
 				});
 				mcpServer = await bridge.start();
 			}
@@ -932,6 +954,7 @@ export class AntigravityRuntime {
 				permission: undefined,
 				pendingTools: new Map(),
 				deferredImages: [],
+				lateResults: [],
 				toolBatchTimer: undefined,
 				bridge,
 				toolFingerprint: piToolFingerprint(tools),
@@ -986,8 +1009,9 @@ export class AntigravityRuntime {
 	private requestPiTool(
 		binding: Binding | undefined,
 		invocation: PiToolInvocation,
+		abandoned: AbortSignal,
 	): Promise<CallToolResult> {
-		if (!binding?.writer || binding.writer.finished || binding.permission || binding.abortRequested) {
+		if (!binding?.writer || binding.writer.finished || binding.permission || binding.abortRequested || abandoned.aborted) {
 			return Promise.resolve({
 				content: [{ type: "text", text: "Pi cannot accept this tool call in the current turn" }],
 				isError: true,
@@ -998,7 +1022,23 @@ export class AntigravityRuntime {
 			try {
 				release = binding.connection.holdPromptWatchdog(binding.session.sessionId);
 				const held = release;
-				binding.pendingTools.set(invocation.id, { invocation, resolve: (result) => { held(); resolve(result); } });
+				const handoff = setTimeout(() => abandon(handoffResult()), this.toolHandoffMs);
+				handoff.unref();
+				const pending: PendingPiTool = {
+					invocation,
+					resolve: (result) => { clearTimeout(handoff); held(); resolve(result); },
+					abandoned: false,
+				};
+				// Pi still runs the tool; its result reaches Antigravity as a prompt.
+				const abandon = (result: CallToolResult) => {
+					if (pending.abandoned || binding.pendingTools.get(invocation.id) !== pending) return;
+					pending.abandoned = true;
+					pending.resolve(result);
+				};
+				binding.pendingTools.set(invocation.id, pending);
+				abandoned.addEventListener("abort", () => {
+					abandon({ content: [{ type: "text", text: "Antigravity abandoned this call" }], isError: true });
+				}, { once: true });
 				binding.writer?.toolCall(invocation.id, invocation.name, invocation.arguments);
 				if (binding.toolBatchTimer) clearTimeout(binding.toolBatchTimer);
 				binding.toolBatchTimer = setTimeout(() => {
@@ -1317,6 +1357,17 @@ function toMcpToolResult(message: ToolResultMessage): CallToolResult {
 	};
 }
 
+function handoffResult(): CallToolResult {
+	return {
+		content: [{
+			type: "text",
+			text:
+				"[This call is still running in Pi. Its result will arrive as the next user message. " +
+				"End your turn now, without text or further tool calls, to receive it.]",
+		}],
+	};
+}
+
 function deferredImageResult(message: ToolResultMessage, imageCount: number): CallToolResult {
 	const content = message.content.flatMap((block) =>
 		block.type === "text" ? [{ type: "text" as const, text: block.text }] : [],
@@ -1328,6 +1379,20 @@ function deferredImageResult(message: ToolResultMessage, imageCount: number): Ca
 			"They will arrive as the next user message. End your turn now, without text or further tool calls, to receive them.]",
 	});
 	return { content, isError: message.isError };
+}
+
+/** Late Pi tool results and held-back images, sent after the turn ends. */
+function followUpPrompt(lateResults: LateResult[], images: DeferredImages[]): ContentBlock[] {
+	const prompt: ContentBlock[] = lateResults.map(({ toolName, result }) => ({
+		type: "text",
+		text:
+			`Pi finished your ${toolName} tool call after its MCP request had already returned. ` +
+			`${result.isError ? "It failed with" : "Its result"}:\n` +
+			result.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n"),
+	}));
+	if (images.length > 0) return [...prompt, ...deferredImagePrompt(images)];
+	prompt.push({ type: "text", text: "Continue the task using this result." });
+	return prompt;
 }
 
 function deferredImagePrompt(entries: DeferredImages[]): ContentBlock[] {

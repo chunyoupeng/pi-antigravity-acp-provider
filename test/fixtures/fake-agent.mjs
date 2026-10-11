@@ -273,6 +273,23 @@ for await (const line of rl) {
 			void listMcpTools(mcpServer).then((tools) => reply(params.sessionId, id, JSON.stringify(tools)));
 			continue;
 		}
+		if (text.includes("Continue from the reconstructed Pi context")) {
+			const resources = params.prompt.filter((block) => block.type === "resource").map((block) => block.resource.text);
+			reply(params.sessionId, id, resources.join("\n"));
+			continue;
+		}
+		if (text.includes("after its MCP request had already returned")) {
+			reply(params.sessionId, id, text);
+			continue;
+		}
+		const timeout = /bridge timeout( running)?/u.exec(text);
+		if (timeout && mcpServer) {
+			// Antigravity drops a slow MCP request at its deadline and finishes the
+			// turn itself: before Pi returns the result, or ("running") after.
+			void invokeMcpTool(mcpServer, "slow", 200).catch(() => undefined);
+			setTimeout(() => reply(params.sessionId, id, "gave up waiting"), timeout[1] ? 1_000 : 300);
+			continue;
+		}
 		if (text.includes("bridge") && mcpServer) {
 			bridgePromptId = id;
 			const invocation = text.includes("parallel")
@@ -401,13 +418,17 @@ async function listMcpTools(server) {
 	}
 }
 
-async function invokeMcpTool(server, text) {
+async function invokeMcpTool(server, text, abandonAfterMs) {
 	const headers = Object.fromEntries(server.headers.map((header) => [header.name, header.value]));
 	const client = new Client({ name: "fake-gemini", version: "1" }, { capabilities: {} });
 	const transport = new StreamableHTTPClientTransport(new URL(server.url), { requestInit: { headers } });
 	try {
 		await client.connect(transport);
-		const result = await client.callTool({ name: "pi_echo", arguments: { text } });
+		const result = await client.callTool(
+			{ name: "pi_echo", arguments: { text } },
+			undefined,
+			abandonAfterMs === undefined ? undefined : { timeout: abandonAfterMs },
+		);
 		return result.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
 	} finally {
 		await client.close();

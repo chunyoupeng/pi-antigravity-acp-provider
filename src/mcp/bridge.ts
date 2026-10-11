@@ -37,7 +37,9 @@ export interface PiMcpBridgeOptions {
 	tools: readonly Tool[];
 	/** Descriptions that replace a Pi tool's own, keyed by Pi tool name. */
 	descriptions?: Readonly<Record<string, string>>;
-	onCall: (invocation: PiToolInvocation) => Promise<CallToolResult>;
+	/** `abandoned` aborts when the agent drops the HTTP request, e.g. after
+	 * Antigravity's 3-minute MCP deadline, before the result was sent. */
+	onCall: (invocation: PiToolInvocation, abandoned: AbortSignal) => Promise<CallToolResult>;
 }
 
 export interface ToolOmission {
@@ -132,6 +134,10 @@ export class PiMcpBridge {
 			return;
 		}
 		const body = await readJson(request);
+		const abandoned = new AbortController();
+		response.once("close", () => {
+			if (!response.writableFinished) abandoned.abort();
+		});
 		const protocol = new Server(
 			{ name: "pi-antigravity-acp-tools", version: PACKAGE_VERSION },
 			{ capabilities: { tools: {} } },
@@ -154,7 +160,10 @@ export class PiMcpBridge {
 			} catch {
 				return toolError("The original Pi tool schema could not validate these arguments");
 			}
-			return this.options.onCall({ id: crypto.randomUUID(), name: tool.piName, arguments: args as JsonObject });
+			return this.options.onCall(
+				{ id: crypto.randomUUID(), name: tool.piName, arguments: args as JsonObject },
+				abandoned.signal,
+			);
 		});
 		const transport = new StreamableHTTPServerTransport(
 			{ sessionIdGenerator: undefined } as unknown as ConstructorParameters<

@@ -556,6 +556,118 @@ describe("AntigravityRuntime", () => {
 		}
 	});
 
+	it.each([
+		// The ACP turn ends before Pi returns; the result opens a new prompt.
+		{ scenario: "bridge timeout", wait: 500, shown: ["late echo result"] },
+		// The ACP turn is still running; the result follows it in the same turn.
+		{ scenario: "bridge timeout running", wait: 400, shown: ["gave up waiting", "late echo result"] },
+	])("delivers a Pi tool result after Antigravity abandoned the MCP call: $scenario", async ({ scenario, wait, shown }) => {
+		const runtime = new AntigravityRuntime(
+			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent] }),
+		);
+		try {
+			const tools = [
+				{ name: "echo", description: "Echo text", parameters: Type.Object({ text: Type.String() }) },
+			];
+			const firstContext: Context = {
+				tools,
+				messages: [{ role: "user", content: `use ${scenario}`, timestamp: 1 }],
+			};
+			const first = runtime.stream(model, firstContext, { sessionId: "late-result", apiKey: "test-key" });
+			const firstEvents = [];
+			for await (const event of first.stream) firstEvents.push(event);
+			const firstDone = firstEvents.at(-1);
+			if (firstDone?.type !== "done") throw new Error("missing tool call turn");
+			const call = firstDone.message.content.find((block) => block.type === "toolCall");
+			if (!call || call.type !== "toolCall") throw new Error("missing tool call");
+			// The tool outlives Antigravity's MCP deadline (200 ms in the fake agent).
+			await new Promise((resolve) => setTimeout(resolve, wait));
+
+			const second = runtime.stream(
+				model,
+				{
+					tools,
+					messages: [
+						...firstContext.messages,
+						firstDone.message,
+						{
+							role: "toolResult",
+							toolCallId: call.id,
+							toolName: call.name,
+							content: [{ type: "text", text: "late echo result" }],
+							isError: false,
+							timestamp: 2,
+						},
+					],
+				},
+				{ sessionId: "late-result", apiKey: "test-key" },
+			);
+			const secondEvents = [];
+			for await (const event of second.stream) secondEvents.push(event);
+			expect(secondEvents.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+			const text = second.message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+			for (const part of shown) expect(text).toContain(part);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("hands a slow Pi tool off before Antigravity's MCP deadline", async () => {
+		const runtime = new AntigravityRuntime(
+			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent] }),
+			"yolo",
+			undefined,
+			undefined,
+			"pi",
+			200,
+		);
+		try {
+			const tools = [
+				{ name: "echo", description: "Echo text", parameters: Type.Object({ text: Type.String() }) },
+			];
+			const firstContext: Context = {
+				tools,
+				messages: [{ role: "user", content: "use bridge", timestamp: 1 }],
+			};
+			const first = runtime.stream(model, firstContext, { sessionId: "handoff", apiKey: "test-key" });
+			const firstEvents = [];
+			for await (const event of first.stream) firstEvents.push(event);
+			const firstDone = firstEvents.at(-1);
+			if (firstDone?.type !== "done") throw new Error("missing tool call turn");
+			const call = firstDone.message.content.find((block) => block.type === "toolCall");
+			if (!call || call.type !== "toolCall") throw new Error("missing tool call");
+			// Pi is still running the tool when the handoff ends the ACP turn.
+			await new Promise((resolve) => setTimeout(resolve, 400));
+
+			const second = runtime.stream(
+				model,
+				{
+					tools,
+					messages: [
+						...firstContext.messages,
+						firstDone.message,
+						{
+							role: "toolResult",
+							toolCallId: call.id,
+							toolName: call.name,
+							content: [{ type: "text", text: "slow echo result" }],
+							isError: false,
+							timestamp: 2,
+						},
+					],
+				},
+				{ sessionId: "handoff", apiKey: "test-key" },
+			);
+			for await (const _event of second.stream) void _event;
+			const text = second.message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+			// Delivered as a new prompt, not over the finished MCP request.
+			expect(text).toContain("## Tool result (echo)\nslow echo result");
+			expect(second.message.stopReason).toBe("stop");
+		} finally {
+			await runtime.close();
+		}
+	});
+
 	it("honors cancellation on an MCP continuation stream", async () => {
 		const runtime = new AntigravityRuntime(
 			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent] }),

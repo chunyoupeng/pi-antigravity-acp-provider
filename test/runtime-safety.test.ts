@@ -193,15 +193,15 @@ describe("abort cleanup", () => {
 
 	it("releases partially parked calls and rejects new calls after abort", async () => {
 		const { runtime } = setup();
-		const internals = runtime as unknown as { requestPiTool(binding: unknown, invocation: unknown): Promise<{ isError?: boolean }> };
+		const internals = runtime as unknown as { requestPiTool(binding: unknown, invocation: unknown, abandoned: AbortSignal): Promise<{ isError?: boolean }> };
 		const release = vi.fn();
 		const binding = { session: { sessionId: "unit" }, connection: { holdPromptWatchdog: () => release },
 			writer: { finished: false, toolCall: () => { throw new Error("writer failed"); } }, permission: undefined,
 			pendingTools: new Map(), abortRequested: false, toolBatchTimer: undefined };
-		expect(await internals.requestPiTool(binding, { id: "one", name: "echo", arguments: {} })).toMatchObject({ isError: true });
+		expect(await internals.requestPiTool(binding, { id: "one", name: "echo", arguments: {} }, new AbortController().signal)).toMatchObject({ isError: true });
 		expect(release).toHaveBeenCalledTimes(1); expect(binding.pendingTools.size).toBe(0);
 		binding.abortRequested = true;
-		expect(await internals.requestPiTool(binding, { id: "two", name: "echo", arguments: {} })).toMatchObject({ isError: true });
+		expect(await internals.requestPiTool(binding, { id: "two", name: "echo", arguments: {} }, new AbortController().signal)).toMatchObject({ isError: true });
 		expect(release).toHaveBeenCalledTimes(1);
 	});
 
@@ -231,12 +231,12 @@ describe("abort cleanup", () => {
 		let pending: Promise<void> | undefined;
 		try {
 			const { runtime } = setup();
-			const internals = runtime as unknown as { awaitContinuation(binding: unknown, signal?: AbortSignal): Promise<void> };
+			const internals = runtime as unknown as { awaitContinuation(binding: unknown, writer: unknown, signal?: AbortSignal): Promise<void> };
 			const binding = { session: { sessionId: "unit" }, abortRequested: false, pendingTools: new Map(),
 				turnCompletion: new Promise<void>((resolve) => { complete = resolve; }),
 				connection: { cancel: vi.fn(async () => undefined), close: vi.fn(async () => undefined) } };
 			const controller = new AbortController();
-			pending = internals.awaitContinuation(binding, controller.signal);
+			pending = internals.awaitContinuation(binding, { fail: vi.fn() }, controller.signal);
 			controller.abort(); expect(binding.connection.cancel).toHaveBeenCalledTimes(1);
 			binding.turnCompletion = new Promise<void>(() => undefined);
 			vi.advanceTimersByTime(1500);
@@ -246,14 +246,17 @@ describe("abort cleanup", () => {
 
 	it("does not abort an idle binding or a newer turn through an old continuation", async () => {
 		const { runtime } = setup();
-		const internals = runtime as unknown as { awaitContinuation(binding: unknown, signal?: AbortSignal): Promise<void> };
+		const internals = runtime as unknown as { awaitContinuation(binding: unknown, writer: unknown, signal?: AbortSignal): Promise<void> };
 		let complete!: () => void;
 		const binding = { turnCompletion: undefined as Promise<void> | undefined, abortRequested: false, session: { sessionId: "unit" }, connection: { cancel: vi.fn(async () => undefined), close: vi.fn(async () => undefined) } };
-		await internals.awaitContinuation(binding, AbortSignal.abort());
+		const idleWriter = { fail: vi.fn() };
+		await internals.awaitContinuation(binding, idleWriter, AbortSignal.abort());
 		expect(binding.abortRequested).toBe(false); expect(binding.connection.cancel).not.toHaveBeenCalled();
+		// No turn will finish this writer, so the continuation must end it.
+		expect(idleWriter.fail).toHaveBeenCalledTimes(1);
 		binding.turnCompletion = new Promise<void>((resolve) => { complete = resolve; });
 		const controller = new AbortController();
-		const pending = internals.awaitContinuation(binding, controller.signal);
+		const pending = internals.awaitContinuation(binding, { fail: vi.fn() }, controller.signal);
 		binding.turnCompletion = new Promise<void>(() => undefined); controller.abort(); complete(); await pending;
 		expect(binding.connection.cancel).not.toHaveBeenCalled(); expect(binding.connection.close).not.toHaveBeenCalled();
 	});
