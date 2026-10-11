@@ -45,7 +45,6 @@ export { MANAGED_AUTH_MARKER, PERMISSION_RESULT_KIND, PERMISSION_TOOL_NAME } fro
 import { AcpToolTracker, type AcpToolActivity, mapSessionUpdate, toolActivityDetails } from "./acp/events.js";
 import { ensureAntigravityAcpReady } from "./acp/setup.js";
 import { HeadlessOAuthRelay, shouldUseHeadlessOAuth } from "./acp/headless-oauth.js";
-import { lookupPiSession } from "./session-registry.js";
 import {
 	PiMcpBridge,
 	piToolFingerprint,
@@ -196,23 +195,6 @@ export interface RuntimeSnapshot {
 }
 
 export type AntigravityConnectionFactory = (options: AntigravityConnectionOptions) => AntigravityAcpConnection;
-
-export type SessionCwdResolver = (sessionId: string) => string | undefined;
-
-function resolveHostCwd(sessionId?: string): string {
-	if (sessionId) {
-		const known = lookupPiSession(sessionId)?.cwd;
-		if (known) return known;
-		const resolver = (globalThis as Record<symbol, unknown>)[
-			Symbol.for("pi.sessionCwdResolver")
-		] as SessionCwdResolver | undefined;
-		if (typeof resolver === "function") {
-			const resolved = resolver(sessionId);
-			if (resolved) return resolved;
-		}
-	}
-	return process.cwd();
-}
 
 export class AntigravityRuntime {
 	private readonly bindings = new Map<string, Promise<Binding>>();
@@ -566,15 +548,14 @@ export class AntigravityRuntime {
 			: (this.findContinuationKey(context) ?? `ephemeral:${crypto.randomUUID()}`);
 		const tools = getCurrentTools(normalizeContext(context).messages);
 		const acpModelId = resolveAcpModelId(model, options.reasoning);
-		const hostCwd = resolveHostCwd(options.sessionId);
-		let binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal, hostCwd);
+		let binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 		await this.modeChanges;
 		this.assertEpoch(epoch);
 		// Check before continuation early returns as well as before fresh prompts.
 		if (binding.mode !== this.permissionMode || this.confirmedMode(binding) !== this.permissionMode ||
 			binding.toolFingerprint !== piToolFingerprint(tools)) {
 			await this.invalidateBinding(binding);
-			binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal, hostCwd);
+			binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 		}
 
 		// A permission tool result resumes the still-running ACP prompt rather than
@@ -585,7 +566,7 @@ export class AntigravityRuntime {
 			if (!result) {
 				cancelPermission(binding);
 				await this.dropBinding(key, binding);
-				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal, hostCwd);
+				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 			} else {
 				attachWriter(binding, writer);
 				this.noteContinuationInstructions(binding, context);
@@ -615,7 +596,7 @@ export class AntigravityRuntime {
 			if (results.some((result) => result.message === undefined)) {
 				cancelPiTools(binding, "Pi continued without returning every requested tool result");
 				await this.dropBinding(key, binding);
-				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal, hostCwd);
+				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 			} else {
 				attachWriter(binding, writer);
 				this.noteContinuationInstructions(binding, context);
@@ -652,7 +633,7 @@ export class AntigravityRuntime {
 			await this.modeChanges;
 			this.assertEpoch(epoch);
 			// A queued caller may hold an obsolete binding after shutdown/mode changes.
-			binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal, hostCwd);
+			binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 			if (
 				binding.needsReconstruction || binding.mode !== this.permissionMode ||
 				this.confirmedMode(binding) !== this.permissionMode ||
@@ -662,13 +643,13 @@ export class AntigravityRuntime {
 					binding.historyFingerprint
 			) {
 				await this.dropBinding(key, binding, true);
-				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal, hostCwd);
+				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 			}
 			// A tool-owner switch keeps the ACP session; the next binding resumes it
 			// with the new tool filter.
 			if (binding.toolOwner !== this.toolOwner) {
 				await this.dropBinding(key, binding);
-				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal, hostCwd);
+				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 			}
 			if (binding.modelId !== acpModelId) {
 				await binding.connection.setModel(binding.session.sessionId, acpModelId, options.signal);
@@ -815,16 +796,11 @@ export class AntigravityRuntime {
 		writer: PiEventWriter,
 		tools: Context["tools"],
 		signal?: AbortSignal,
-		cwd: string = process.cwd(),
 	): Promise<Binding> {
 		this.assertActive();
-		const existingPromise = this.bindings.get(key);
-		if (existingPromise) {
-			const existing = await existingPromise;
-			if (existing.cwd === cwd) return existing;
-			await this.dropBinding(key, existing);
-		}
-		const created = this.createBinding(key, model, acpModelId, apiKey, writer, tools ?? [], signal, cwd).catch((error) => {
+		const existing = this.bindings.get(key);
+		if (existing) return existing;
+		const created = this.createBinding(key, model, acpModelId, apiKey, writer, tools ?? [], signal).catch((error) => {
 			if (this.bindings.get(key) === created) this.bindings.delete(key);
 			throw error;
 		});
@@ -840,8 +816,8 @@ export class AntigravityRuntime {
 		writer: PiEventWriter,
 		tools: NonNullable<Context["tools"]>,
 		signal?: AbortSignal,
-		cwd: string = process.cwd(),
 	): Promise<Binding> {
+		const cwd = process.cwd();
 		const toolOwner = this.toolOwner;
 		let binding: Binding | undefined;
 		let bridge: PiMcpBridge | undefined;
