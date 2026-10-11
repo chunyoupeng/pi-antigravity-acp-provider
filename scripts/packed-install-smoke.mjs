@@ -20,7 +20,7 @@ try {
 		["install", "--ignore-scripts", "--legacy-peer-deps", tarball],
 		{ cwd: temporary, stdio: "inherit" },
 	);
-	const installed = path.join(temporary, "node_modules", "pi-antigravity-acp-provider");
+	const installed = path.join(temporary, "node_modules", ...name.split("/"));
 	for (const required of ["extensions/index.ts", "src/acp/supervisor.mjs", "src/mcp/bridge.ts"]) {
 		if (!fs.existsSync(path.join(installed, required))) throw new Error(`Packed file is missing: ${required}`);
 	}

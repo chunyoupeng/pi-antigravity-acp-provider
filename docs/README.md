@@ -1,5 +1,7 @@
 # Documentation map
 
+> These documents are the upstream project's design and research record, kept for reference. Where they describe tool handling (native Antigravity tools shown as text), they describe upstream, not this fork; see the fork notes at the top of the [README](../README.md).
+
 The documents separate observed facts, decisions, and planned work so future upstream changes can be reevaluated without mistaking assumptions for protocol guarantees.
 
 > **Current architecture:** see [ANTIGRAVITY-MIGRATION.md](ANTIGRAVITY-MIGRATION.md). Documents centered on bundled `@google/gemini-cli` are historical and superseded because its individual Code Assist login path was retired.

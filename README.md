@@ -1,6 +1,16 @@
-# pi-antigravity-acp-provider
+# @chunyoupeng/pi-antigravity-acp-provider
 
-A first-class [Pi](https://github.com/earendil-works/pi) provider for **Google Antigravity** through its official ACP server.
+A [Pi](https://github.com/earendil-works/pi) provider for **Google Antigravity** through its official ACP server, in which Pi runs the tools.
+
+This is a fork of [zacbemis/pi-antigravity-acp-provider](https://github.com/zacbemis/pi-antigravity-acp-provider) and keeps its runtime installer, signed runtime catalog, authentication and turn recovery. It differs from upstream in these ways:
+
+- Antigravity's file and shell built-ins are disabled per session, so the model works through Pi's tools over the MCP bridge and Pi's permissions, hooks and tool cards apply. Upstream lets Antigravity run them natively and shows a text line per tool update.
+- Native tools that remain are rendered with Pi's shell/file renderers and real diffs, and survive session restore.
+- About 3k prompt tokens per turn are saved by disabling `schedule`, `ask_question` and `generate_image`, and subagent tools are disabled.
+- Images from Pi tools are sent as a follow-up prompt so the model actually sees them, and Pi tool calls still running near Antigravity's 3-minute MCP deadline are handed back and answered in the next prompt.
+- Idle Antigravity conversation history that no Pi session can resume is pruned.
+
+The provider ID, commands and config directory are the same as upstream, so remove the upstream package before installing this one.
 
 > **Important:** this package no longer uses `@google/gemini-cli`. The Gemini CLI individual Code Assist login path was retired and is not a supported authentication route. Antigravity/`agy` is the target runtime.
 
@@ -18,32 +28,34 @@ A first-class [Pi](https://github.com/earendil-works/pi) provider for **Google A
 - Preserves Pi project instructions (including `AGENTS.md` and named prompt sections) separately from truncated conversation history.
 - Supports persisted `default`, `auto-edit`, and `yolo` Antigravity permission modes. The requested default is `yolo`; switching to a prompting mode retains the single-use, fail-closed Pi permission broker.
 - With `tools native`, keeps Antigravity's built-ins but advertises ACP `fs`, so its file reads and writes go through the provider, confined to the workspace, `GEMINI_HOME`, and the temp directory. ACP terminal is never advertised; the server does not use it.
+- On the first session start of each Pi process, removes Antigravity conversations (`$GEMINI_HOME/antigravity-acp/conversations/<id>.*` and `brain/<id>/`) that no saved Pi session references and that have not changed for 7 days. Credentials, settings and non-session files are left alone.
 - Provides setup, auth-health, logout/account-switching, qualification, quota, and runtime-update commands.
 - Automatically checks for newer managed ACP runtimes once per day, with `automatic`, `notify`, and `manual` update modes.
 - Uses an Ed25519-signed runtime catalog with exact Google artifact URLs, archive hashes and sizes, strict two-file extraction, pre-activation ACP identity/version validation, immutable releases, rollback retention, musl rejection, macOS quarantine cleanup, and Windows process-tree handling.
 
 ## New-user setup
 
-Install from the official Pi package gallery/npm:
+Install from GitHub:
 
 ```bash
-pi install npm:pi-antigravity-acp-provider
+pi remove npm:pi-antigravity-acp-provider   # if the upstream package is installed
+pi install git:github.com/chunyoupeng/pi-antigravity-acp-provider
 pi
 ```
 
 To run from source instead:
 
 ```bash
-git clone https://github.com/zacbemis/pi-antigravity-acp-provider.git
+git clone https://github.com/chunyoupeng/pi-antigravity-acp-provider.git
 cd pi-antigravity-acp-provider
 npm install
 pi --no-extensions -e ./extensions/index.ts
 ```
 
-To replace an existing npm installation with a persistent local development package:
+To replace an existing installation with a persistent local development package:
 
 ```bash
-pi remove npm:pi-antigravity-acp-provider
+pi remove git:github.com/chunyoupeng/pi-antigravity-acp-provider
 pi install "$PWD"
 ```
 
@@ -152,4 +164,4 @@ Earlier repository documents analyzing `@google/gemini-cli@0.58.0` describe the 
 
 ## License
 
-MIT
+MIT. The original work is by Zac Bemis and the upstream contributors; see [LICENSE](LICENSE).
