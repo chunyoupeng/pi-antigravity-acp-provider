@@ -30,6 +30,15 @@ export class AcpSessionStore {
 			.find((record) => record.piSessionId === piSessionId);
 	}
 
+	/** ACP sessions a Pi session can still resume. */
+	acpSessionIds(): Set<string> {
+		return new Set(
+			this.read()
+				.filter((record) => Date.now() - record.lastActive <= MAX_AGE_MS)
+				.map((record) => record.acpSessionId),
+		);
+	}
+
 	save(record: SavedSessionRecord): void {
 		withStoreLock(this.file, () => {
 			const records = this.read().filter((candidate) => candidate.piSessionId !== record.piSessionId);

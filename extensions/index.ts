@@ -34,8 +34,13 @@ import {
 	PERMISSION_TOOL_NAME,
 	type PermissionToolResult,
 } from "../src/runtime.js";
+import { pruneAcpHistory } from "../src/acp/history-cleanup.js";
+import { AcpSessionStore } from "../src/acp/session-store.js";
 import { runSetupWizard } from "../src/wizard.js";
 import { registerToolActivity } from "./tool-activity.js";
+
+// Pi may start several sessions in one process; prune once.
+let historyPruned = false;
 
 export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 	const config = loadConfig();
@@ -261,6 +266,14 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		if (!historyPruned) {
+			historyPruned = true;
+			try {
+				pruneAcpHistory(new AcpSessionStore().acpSessionIds());
+			} catch {
+				// History cleanup is housekeeping and must not interrupt Pi startup.
+			}
+		}
 		if (loadConfig().runtimeUpdates !== "notify") return;
 		try {
 			const update = await checkAntigravityAcpUpdate();

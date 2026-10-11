@@ -1,8 +1,8 @@
-import os from "node:os";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 
 import type { AcpToolActivity } from "./events.js";
+import { resolveAcpProfileDir } from "./history-cleanup.js";
 
 export interface NativeReadResult {
 	stepIndex: number;
@@ -26,9 +26,7 @@ export async function readNativeReadResults(sessionId: string): Promise<NativeRe
 	try {
 		// Older Node versions can still run the provider without this optional repair.
 		const { DatabaseSync: Database } = await import("node:sqlite");
-		const home = process.env.GEMINI_HOME || path.join(os.homedir(), ".gemini");
-		const directory = home === "~" || home.startsWith("~/") ? path.join(os.homedir(), home.slice(1)) : home;
-		db = new Database(path.join(directory, "antigravity-acp", "conversations", `${sessionId}.db`), { readOnly: true });
+		db = new Database(path.join(resolveAcpProfileDir(), "conversations", `${sessionId}.db`), { readOnly: true });
 		const results: NativeReadResult[] = [];
 		let bytes = 0;
 		// The current managed server persists AGENCY_TOOL_CALL=103, DONE=3,
