@@ -37,6 +37,7 @@ import {
 import { pruneAcpHistory } from "../src/acp/history-cleanup.js";
 import { AcpSessionStore } from "../src/acp/session-store.js";
 import { runSetupWizard } from "../src/wizard.js";
+import { fetchUsage, formatUsage } from "../src/usage.js";
 import { registerToolActivity } from "./tool-activity.js";
 import { createSafeReadToolDefinition } from "./safe-read.js";
 
@@ -184,6 +185,17 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 				pi.sendUserMessage(`/plan ${task}`, { expandPromptTemplates: false });
 				return;
 			}
+			if (command === "usage") {
+				try {
+					ctx.ui.notify(formatUsage(await fetchUsage()), "info");
+				} catch (error) {
+					ctx.ui.notify(
+						`Could not read Antigravity usage: ${error instanceof Error ? error.message : String(error)}`,
+						"warning",
+					);
+				}
+				return;
+			}
 			if (command === "quota") {
 				const metrics = (await runtime.snapshot()).metrics;
 				ctx.ui.notify(formatMetrics(metrics), "info");
@@ -226,7 +238,7 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 			const verbose = command === "doctor --verbose";
 			if (command !== "doctor" && command !== "status" && !verbose) {
 				ctx.ui.notify(
-					"Usage: /antigravity-acp [setup|doctor|status|quota|update|updates|logout|account|qualify|permissions|tools|sessions|plan]",
+					"Usage: /antigravity-acp [setup|doctor|status|usage|quota|update|updates|logout|account|qualify|permissions|tools|sessions|plan]",
 					"warning",
 				);
 				return;

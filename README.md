@@ -103,6 +103,7 @@ Antigravity owns OAuth tokens under `~/.gemini/antigravity-acp/` (on macOS, in t
 /antigravity-acp doctor
 /antigravity-acp doctor --verbose
 /antigravity-acp status
+/antigravity-acp usage
 /antigravity-acp quota
 /antigravity-acp update
 /antigravity-acp updates [automatic|notify|manual]
