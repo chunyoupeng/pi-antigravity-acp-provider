@@ -238,13 +238,14 @@ describe("prompt context", () => {
 		const text = (result.prompt[0] as { resource: { text: string } }).resource.text;
 		expect(text).not.toContain("<docs>");
 		expect(text).not.toContain("Pi documentation to strip");
-		expect(text).toContain("- pi_read: Read images (png, jpg, gif, webp), Pi skill files (SKILL.md), and files referenced by Pi skills. For other text files use view_file.");
+		expect(text).toContain("- pi_read: Read images (png, jpg, gif, webp) and any file outside the current workspace. Arguments: path (string, required), offset (1-indexed start line, optional), limit (max lines, optional). For text files inside the workspace use view_file, which returns the whole file inline.");
 		expect(text).toContain("- pi_bash: Execute commands");
 		expect(text).toContain("- Use pi_bash for file operations");
-		expect(text).toContain("- Use view_file to examine other text files instead of cat or sed.");
-		expect(text).toContain("- Use pi_read to inspect images or screenshots (png, jpg, gif, webp) and read Pi skill files and their referenced files.");
+		expect(text).toContain("- Use view_file to examine text files inside the workspace instead of cat or sed, reading the whole file in one call; use pi_read for files outside the workspace.");
+		expect(text).toContain("- Use pi_read to inspect images or screenshots (png, jpg, gif, webp).");
 		expect(text).toContain("Use pi_read to load a skill's file when the task matches its description.");
-		expect(text).toContain("Do not use Antigravity's native skill loader or view_file for these files.");
+		expect(text).toContain("pi_read is fully defined in these instructions, including its arguments (path, offset, limit) and usage. Call it directly without reading its lazy-loaded schema file first.");
+		expect(text).toContain("Do not use Antigravity's native skill loader for these files.");
 		expect(text).toContain("<location>/home/test/.pi/agent/skills/libgen/SKILL.md</location>");
 		expect(text).toContain("When a skill file references a relative path, resolve it against the skill directory.");
 		expect(text).not.toContain("Use the read tool to load a skill's file");

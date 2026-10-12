@@ -80,8 +80,9 @@ export function buildPromptParts(
 
 /**
  * Adapts Pi's system instructions for the Antigravity ACP environment.
- * When Pi owns tools, read handles images/screenshots and Pi skill files,
- * while Antigravity's native view_file handles other text files inline.
+ * When Pi owns tools, read handles images/screenshots and every path outside
+ * the Antigravity workspace whitelist, while the native view_file reads text
+ * files inside the workspace inline in one call.
  * Bridged Pi tools are prefixed with `pi_` to match Antigravity MCP bridge names.
  */
 export function adaptInstructionsForAntigravity(instructions: string): string {
@@ -97,12 +98,12 @@ export function adaptInstructionsForAntigravity(instructions: string): string {
 			if (content.includes("- read: Read file contents")) {
 				content = content.replace(
 					"- read: Read file contents",
-					"- pi_read: Read images (png, jpg, gif, webp), Pi skill files (SKILL.md), and files referenced by Pi skills. For other text files use view_file.",
+					"- pi_read: Read images (png, jpg, gif, webp) and any file outside the current workspace. Arguments: path (string, required), offset (1-indexed start line, optional), limit (max lines, optional). For text files inside the workspace use view_file, which returns the whole file inline.",
 				);
 			} else if (content.includes("- read:")) {
 				content = content.replace(
 					/-\s+read:\s*(.*)/u,
-					"- pi_read: Read images (png, jpg, gif, webp), Pi skill files (SKILL.md), and files referenced by Pi skills. For other text files use view_file.",
+					"- pi_read: Read images (png, jpg, gif, webp) and any file outside the current workspace. Arguments: path (string, required), offset (1-indexed start line, optional), limit (max lines, optional). For text files inside the workspace use view_file, which returns the whole file inline.",
 				);
 			}
 			if (!content.includes("view_file")) {
@@ -117,7 +118,7 @@ export function adaptInstructionsForAntigravity(instructions: string): string {
 	} else if (adapted.includes("- read: Read file contents")) {
 		adapted = adapted.replace(
 			"- read: Read file contents",
-			"- pi_read: Read images (png, jpg, gif, webp), Pi skill files (SKILL.md), and files referenced by Pi skills. For other text files use view_file.",
+			"- pi_read: Read images (png, jpg, gif, webp) and any file outside the current workspace. Arguments: path (string, required), offset (1-indexed start line, optional), limit (max lines, optional). For text files inside the workspace use view_file, which returns the whole file inline.",
 		);
 	}
 
@@ -127,10 +128,10 @@ export function adaptInstructionsForAntigravity(instructions: string): string {
 			if (content.includes("- Use read to examine files instead of cat or sed.")) {
 				content = content.replace(
 					"- Use read to examine files instead of cat or sed.",
-					"- Use view_file to examine other text files instead of cat or sed.\n- Use pi_read to inspect images or screenshots (png, jpg, gif, webp) and read Pi skill files and their referenced files.",
+					"- Use view_file to examine text files inside the workspace instead of cat or sed, reading the whole file in one call; use pi_read for files outside the workspace.\n- Use pi_read to inspect images or screenshots (png, jpg, gif, webp).",
 				);
 			} else if (!content.includes("Use pi_read to inspect images") && (adapted.includes("pi_read:") || adapted.includes("- read:"))) {
-				content = `${content.trimEnd()}\n- Use pi_read to inspect images or screenshots (png, jpg, gif, webp) and read Pi skill files and their referenced files.\n`;
+				content = `${content.trimEnd()}\n- Use pi_read to inspect images or screenshots (png, jpg, gif, webp) and to read files outside the workspace.\n`;
 			}
 			content = content.replace(/\bUse bash\b/gu, "Use pi_bash");
 			content = content.replace(/\bUse edit\b/gu, "Use pi_edit");
@@ -144,7 +145,7 @@ export function adaptInstructionsForAntigravity(instructions: string): string {
 		if (adapted.includes("- Use read to examine files instead of cat or sed.")) {
 			adapted = adapted.replace(
 				"- Use read to examine files instead of cat or sed.",
-				"- Use view_file to examine other text files instead of cat or sed.\n- Use pi_read to inspect images or screenshots (png, jpg, gif, webp) and read Pi skill files and their referenced files.",
+				"- Use view_file to examine text files inside the workspace instead of cat or sed, reading the whole file in one call; use pi_read for files outside the workspace.\n- Use pi_read to inspect images or screenshots (png, jpg, gif, webp).",
 			);
 		}
 		adapted = adapted.replace(/\bUse bash\b/gu, "Use pi_bash");
@@ -152,9 +153,20 @@ export function adaptInstructionsForAntigravity(instructions: string): string {
 		adapted = adapted.replace(/\bUse write\b/gu, "Use pi_write");
 	}
 
+	// Antigravity's own guidance has the model consult a schema file before
+	// calling a lazy-loaded MCP tool. pi_read's projected definition above
+	// already carries its arguments and usage, so that round trip is wasted.
+	if (adapted.includes("- pi_read:") && !adapted.includes("lazy-loaded schema file")) {
+		const rule =
+			"- pi_read is fully defined in these instructions, including its arguments (path, offset, limit) and usage. Call it directly without reading its lazy-loaded schema file first.";
+		adapted = adapted.includes("</rules>")
+			? adapted.replace(/<\/rules>/u, `${rule}\n</rules>`)
+			: `${adapted.trimEnd()}\n${rule}`;
+	}
+
 	adapted = adapted.replace(/<skills>([\s\S]*?)<\/skills>/u, (_, skillsContent: string) => {
 		const content = skillsContent.replace(/\bUse the read tool\b/u, "Use pi_read");
-		return `<skills>${content}\nLoad Pi skill files (SKILL.md) and their referenced files using pi_read. Do not use Antigravity's native skill loader or view_file for these files.\n</skills>`;
+		return `<skills>${content}\nDo not use Antigravity's native skill loader for these files.\n</skills>`;
 	});
 
 	return adapted;

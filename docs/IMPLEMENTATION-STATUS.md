@@ -27,7 +27,7 @@ The bundled Gemini CLI implementation was superseded after its individual Code A
 
 ## Live validation
 
-Against `agy_acp_server` 1.3.0 on macOS ARM64 (2026-10-06): the tool filter removed the native built-ins and the model completed a file task through Pi's `read`; `tools native` served file reads through `fs/read_text_file`; `usage_update` produced non-zero Pi usage; `session/list` returned workspace sessions. `session/fork`/`session/close` return `{}` without advertising capabilities, and `additionalDirectories` is accepted but not enforced, so neither is used.
+Against `agy_acp_server` 1.3.0 on macOS ARM64 (2026-10-06): the tool filter removed the native built-ins and the model completed a file task through Pi's `read`; `tools native` served file reads through `fs/read_text_file`; `usage_update` produced non-zero Pi usage; `session/list` returned workspace sessions. `session/fork`/`session/close` return `{}` without advertising capabilities, and `additionalDirectories` is accepted but not enforced, so neither is used. Re-verified 2026-10-12 with a live `session/new` probe: passing `additionalDirectories` does not expand the server-side `view_file` whitelist, which stays derived from `cwd`, `GEMINI_HOME` and skill directories.
 
 On Linux with authenticated `agy_acp_server_1.1.1`, ACP protocol 1 initialization, authenticated model discovery, session creation, model control, streaming, cancellation recovery, cross-process session resume, native permission requests, authenticated loopback MCP execution, and exact-response prompts completed successfully.
 

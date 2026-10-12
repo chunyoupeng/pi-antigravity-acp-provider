@@ -72,7 +72,7 @@ const TOOL_HANDOFF_MS = 150_000;
  * invoke_subagent, define_subagent, manage_subagents and send_message, so
  * subagents cannot read or run outside Pi. Web search and URL fetch have no Pi
  * equivalent and stay native. `view_file` also stays native: Antigravity
- * offloads MCP results over about 4 KB, and every MCP image, to a file the
+ * offloads MCP results over 4096 bytes, and every MCP image, to a file the
  * model sees only as a path, while native results stay inline. */
 export const PI_OWNED_NATIVE_TOOLS = [
 	"run_command",
@@ -84,15 +84,17 @@ export const PI_OWNED_NATIVE_TOOLS = [
 	"start_subagent",
 ] as const;
 
-/** Pi tool descriptions replaced when Pi owns tools. Both `view_file` and
- * Pi's read reach the model, and an MCP text result over about 4 KB reaches
- * it only as an offloaded path. `view_file` returns an image as raw bytes, so
- * Pi's read handles images and Pi skill files, including referenced files that
- * may live outside Antigravity's workspace. */
+/** Pi tool descriptions replaced when Pi owns tools. The Antigravity server
+ * enforces its own view_file whitelist derived from the session cwd, so
+ * read covers images and every path outside that whitelist, while text
+ * files inside the workspace go through the native `view_file`, which
+ * returns the whole file inline (MCP results over 4096 bytes are offloaded,
+ * verified 2026-10-12 with a live probe: exactly 4096 bytes stays inline). */
 export const PI_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = {
 	read:
-		"Read images (png, jpg, gif, webp), Pi skill files (SKILL.md), and files referenced by Pi skills. " +
-		"For other text files use view_file, which returns the whole file inline.",
+		"Read images (png, jpg, gif, webp) and any file outside the current workspace. " +
+		"Arguments: path (string, required), offset (1-indexed start line, optional), limit (max lines, optional). " +
+		"For text files inside the workspace use view_file, which returns the whole file inline.",
 };
 
 /** Antigravity built-ins disabled in every tool mode. Each one costs prompt

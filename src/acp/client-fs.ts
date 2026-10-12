@@ -13,10 +13,11 @@ const MAX_READ_BYTES = 16 * 1024 * 1024;
 const MAX_WRITE_BYTES = 16 * 1024 * 1024;
 
 /** Roots the Antigravity server itself treats as workspace: the session cwd,
- * GEMINI_HOME (skills, plans and other artifacts) and the system temp dir. */
+ * the user's home directory, GEMINI_HOME (skills, plans and other artifacts)
+ * and the system temp dir. */
 export function clientFileRoots(cwd: string): string[] {
 	const geminiHome = process.env.GEMINI_HOME?.trim() || path.join(os.homedir(), ".gemini");
-	return [cwd, geminiHome, os.tmpdir()];
+	return [cwd, os.homedir(), geminiHome, os.tmpdir()];
 }
 
 /** ACP `fs/read_text_file`, served by the provider instead of the agent. */
