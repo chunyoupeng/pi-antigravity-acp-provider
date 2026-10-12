@@ -222,11 +222,14 @@ describe("prompt context", () => {
 		expect(result.prompt[1]).toEqual({ type: "text", text: "current" });
 	});
 
-	it("adapts Pi session instructions to steer read to images and view_file to text files", () => {
+	it("routes images and Pi skills through Pi read while keeping other text reads native", () => {
 		const rawInstructions =
 			"<tools>\n- read: Read file contents\n- bash: Execute commands\n</tools>\n\n" +
 			"<docs>\nPi documentation to strip\n</docs>\n\n" +
-			"<rules>\n- Use bash for file operations\n- Use read to examine files instead of cat or sed.\n</rules>";
+			"<rules>\n- Use bash for file operations\n- Use read to examine files instead of cat or sed.\n</rules>\n\n" +
+			"<skills>\nUse the read tool to load a skill's file when the task matches its description.\n" +
+			"When a skill file references a relative path, resolve it against the skill directory.\n" +
+			"<available_skills><skill><name>libgen</name><location>/home/test/.pi/agent/skills/libgen/SKILL.md</location></skill></available_skills>\n</skills>";
 		const context = normalizeContext({
 			systemPrompt: rawInstructions,
 			messages: [{ role: "user", content: "hello", timestamp: 1 }],
@@ -235,11 +238,17 @@ describe("prompt context", () => {
 		const text = (result.prompt[0] as { resource: { text: string } }).resource.text;
 		expect(text).not.toContain("<docs>");
 		expect(text).not.toContain("Pi documentation to strip");
-		expect(text).toContain("- pi_read: Read an image file (png, jpg, gif, webp) so you can see it. Use only for images. For text files use view_file.");
+		expect(text).toContain("- pi_read: Read images (png, jpg, gif, webp), Pi skill files (SKILL.md), and files referenced by Pi skills. For other text files use view_file.");
 		expect(text).toContain("- pi_bash: Execute commands");
 		expect(text).toContain("- Use pi_bash for file operations");
-		expect(text).toContain("- Use view_file to examine text files instead of cat or sed.");
-		expect(text).toContain("- Use pi_read to inspect images or screenshots (png, jpg, gif, webp).");
+		expect(text).toContain("- Use view_file to examine other text files instead of cat or sed.");
+		expect(text).toContain("- Use pi_read to inspect images or screenshots (png, jpg, gif, webp) and read Pi skill files and their referenced files.");
+		expect(text).toContain("Use pi_read to load a skill's file when the task matches its description.");
+		expect(text).toContain("Do not use Antigravity's native skill loader or view_file for these files.");
+		expect(text).toContain("<location>/home/test/.pi/agent/skills/libgen/SKILL.md</location>");
+		expect(text).toContain("When a skill file references a relative path, resolve it against the skill directory.");
+		expect(text).not.toContain("Use the read tool to load a skill's file");
+		expect(text).not.toContain("Use only for images");
 	});
 });
 

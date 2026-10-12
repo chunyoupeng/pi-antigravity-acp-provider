@@ -157,7 +157,7 @@ describe("Pi takeover of Antigravity capabilities", () => {
 		}
 	});
 
-	it("steers Pi's read to images only when Pi owns tools", async () => {
+	it("steers Pi's read to images and skill files when Pi owns tools", async () => {
 		const tools = [
 			{ name: "read", description: "Read a file", parameters: Type.Object({ path: Type.String() }) },
 			{ name: "echo", description: "Echo text", parameters: Type.Object({ text: Type.String() }) },

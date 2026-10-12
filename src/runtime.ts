@@ -87,11 +87,12 @@ export const PI_OWNED_NATIVE_TOOLS = [
 /** Pi tool descriptions replaced when Pi owns tools. Both `view_file` and
  * Pi's read reach the model, and an MCP text result over about 4 KB reaches
  * it only as an offloaded path. `view_file` returns an image as raw bytes, so
- * Pi's read, with its deferred image prompt, is kept for images only. */
+ * Pi's read handles images and Pi skill files, including referenced files that
+ * may live outside Antigravity's workspace. */
 export const PI_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = {
 	read:
-		"Read an image file (png, jpg, gif, webp) so you can see it. " +
-		"Use only for images. For text files use view_file, which returns the whole file inline.",
+		"Read images (png, jpg, gif, webp), Pi skill files (SKILL.md), and files referenced by Pi skills. " +
+		"For other text files use view_file, which returns the whole file inline.",
 };
 
 /** Antigravity built-ins disabled in every tool mode. Each one costs prompt
