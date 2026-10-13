@@ -41,4 +41,47 @@ describe("projectModels", () => {
 			await runtime.close();
 		}
 	});
+
+	it("restores stored dynamic models on offline refresh and persists discovered models", async () => {
+		const { provider, runtime } = createAntigravityProvider();
+		try {
+			const storedModel = projectModels([
+				{ modelId: "gemini-4-argon-low", name: "Gemini 4 Argon (Low)" },
+				{ modelId: "gemini-4-argon-medium", name: "Gemini 4 Argon (Medium)" },
+				{ modelId: "gemini-4-argon-high", name: "Gemini 4 Argon (High)" },
+			])[0]!;
+
+			await provider.refreshModels?.({
+				allowNetwork: false,
+				signal: new AbortController().signal,
+				stored: { models: [storedModel], checkedAt: 123 },
+				publish: async ({ update }) => {
+					update?.();
+					return true;
+				},
+			});
+			expect(provider.getModels?.().map((model) => model.id)).toEqual(["gemini-4-argon"]);
+
+			runtime.discoverModels = async () => [
+				{ modelId: "gemini-4-argon-low", name: "Gemini 4 Argon (Low)" },
+				{ modelId: "gemini-4-argon-high", name: "Gemini 4 Argon (High)" },
+			];
+			let persistedModels: unknown;
+			await provider.refreshModels?.({
+				allowNetwork: true,
+				signal: new AbortController().signal,
+				credential: { type: "oauth", refresh: "r", access: "a", expires: 999999 },
+				publish: async ({ persist, update }) => {
+					persistedModels = persist;
+					update?.();
+					return true;
+				},
+			});
+			expect(persistedModels).toMatchObject({
+				models: [expect.objectContaining({ id: "gemini-4-argon", provider: "antigravity-acp" })],
+			});
+		} finally {
+			await runtime.close();
+		}
+	});
 });

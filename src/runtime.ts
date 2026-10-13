@@ -92,9 +92,9 @@ export const PI_OWNED_NATIVE_TOOLS = [
  * verified 2026-10-12 with a live probe: exactly 4096 bytes stays inline). */
 export const PI_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = {
 	read:
-		"Read images (png, jpg, gif, webp) and any file outside the current workspace. " +
+		"Read images (png, jpg, gif, webp) and any file outside Active Workspaces and App Data Directory. " +
 		"Arguments: path (string, required), offset (1-indexed start line, optional), limit (max lines, optional). " +
-		"For text files inside the workspace use view_file, which returns the whole file inline.",
+		"For text files inside Active Workspaces or App Data Directory use view_file, which returns the whole file inline.",
 };
 
 /** Antigravity built-ins disabled in every tool mode. Each one costs prompt
@@ -1366,7 +1366,7 @@ function handoffResult(): CallToolResult {
 			type: "text",
 			text:
 				"[This call is still running in Pi. Its result will arrive as the next user message. " +
-				"End your turn now, without text or further tool calls, to receive it.]",
+				"End your turn now with a brief text response, and without further tool calls, to receive it.]",
 		}],
 	};
 }
@@ -1379,7 +1379,7 @@ function deferredImageResult(message: ToolResultMessage, imageCount: number): Ca
 		type: "text",
 		text:
 			`[${imageCount} image(s) from this result cannot be shown in a tool result. ` +
-			"They will arrive as the next user message. End your turn now, without text or further tool calls, to receive them.]",
+			"They will arrive as the next user message. End your turn now with a brief text response, and without further tool calls, to receive them.]",
 	});
 	return { content, isError: message.isError };
 }

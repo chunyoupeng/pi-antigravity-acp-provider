@@ -98,12 +98,12 @@ export function adaptInstructionsForAntigravity(instructions: string): string {
 			if (content.includes("- read: Read file contents")) {
 				content = content.replace(
 					"- read: Read file contents",
-					"- pi_read: Read images (png, jpg, gif, webp) and any file outside the current workspace. Arguments: path (string, required), offset (1-indexed start line, optional), limit (max lines, optional). For text files inside the workspace use view_file, which returns the whole file inline.",
+					"- pi_read: Read images (png, jpg, gif, webp) and any file outside Active Workspaces and App Data Directory. Arguments: path (string, required), offset (1-indexed start line, optional), limit (max lines, optional). For text files inside Active Workspaces or App Data Directory use view_file, which returns the whole file inline.",
 				);
 			} else if (content.includes("- read:")) {
 				content = content.replace(
 					/-\s+read:\s*(.*)/u,
-					"- pi_read: Read images (png, jpg, gif, webp) and any file outside the current workspace. Arguments: path (string, required), offset (1-indexed start line, optional), limit (max lines, optional). For text files inside the workspace use view_file, which returns the whole file inline.",
+					"- pi_read: Read images (png, jpg, gif, webp) and any file outside Active Workspaces and App Data Directory. Arguments: path (string, required), offset (1-indexed start line, optional), limit (max lines, optional). For text files inside Active Workspaces or App Data Directory use view_file, which returns the whole file inline.",
 				);
 			}
 			if (!content.includes("view_file")) {
@@ -118,7 +118,7 @@ export function adaptInstructionsForAntigravity(instructions: string): string {
 	} else if (adapted.includes("- read: Read file contents")) {
 		adapted = adapted.replace(
 			"- read: Read file contents",
-			"- pi_read: Read images (png, jpg, gif, webp) and any file outside the current workspace. Arguments: path (string, required), offset (1-indexed start line, optional), limit (max lines, optional). For text files inside the workspace use view_file, which returns the whole file inline.",
+			"- pi_read: Read images (png, jpg, gif, webp) and any file outside Active Workspaces and App Data Directory. Arguments: path (string, required), offset (1-indexed start line, optional), limit (max lines, optional). For text files inside Active Workspaces or App Data Directory use view_file, which returns the whole file inline.",
 		);
 	}
 
@@ -128,10 +128,10 @@ export function adaptInstructionsForAntigravity(instructions: string): string {
 			if (content.includes("- Use read to examine files instead of cat or sed.")) {
 				content = content.replace(
 					"- Use read to examine files instead of cat or sed.",
-					"- Use view_file to examine text files inside the workspace instead of cat or sed, reading the whole file in one call; use pi_read for files outside the workspace.\n- Use pi_read to inspect images or screenshots (png, jpg, gif, webp).",
+					"- Use view_file to examine text files inside Active Workspaces or App Data Directory instead of cat or sed, reading the whole file in one call; use pi_read for files outside them.\n- Use pi_read to inspect images or screenshots (png, jpg, gif, webp).",
 				);
 			} else if (!content.includes("Use pi_read to inspect images") && (adapted.includes("pi_read:") || adapted.includes("- read:"))) {
-				content = `${content.trimEnd()}\n- Use pi_read to inspect images or screenshots (png, jpg, gif, webp) and to read files outside the workspace.\n`;
+				content = `${content.trimEnd()}\n- Use pi_read to inspect images or screenshots (png, jpg, gif, webp) and to read files outside Active Workspaces and App Data Directory.\n`;
 			}
 			content = content.replace(/\bUse bash\b/gu, "Use pi_bash");
 			content = content.replace(/\bUse edit\b/gu, "Use pi_edit");
@@ -145,7 +145,7 @@ export function adaptInstructionsForAntigravity(instructions: string): string {
 		if (adapted.includes("- Use read to examine files instead of cat or sed.")) {
 			adapted = adapted.replace(
 				"- Use read to examine files instead of cat or sed.",
-				"- Use view_file to examine text files inside the workspace instead of cat or sed, reading the whole file in one call; use pi_read for files outside the workspace.\n- Use pi_read to inspect images or screenshots (png, jpg, gif, webp).",
+				"- Use view_file to examine text files inside Active Workspaces or App Data Directory instead of cat or sed, reading the whole file in one call; use pi_read for files outside them.\n- Use pi_read to inspect images or screenshots (png, jpg, gif, webp).",
 			);
 		}
 		adapted = adapted.replace(/\bUse bash\b/gu, "Use pi_bash");

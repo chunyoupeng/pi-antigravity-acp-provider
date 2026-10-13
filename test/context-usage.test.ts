@@ -238,10 +238,10 @@ describe("prompt context", () => {
 		const text = (result.prompt[0] as { resource: { text: string } }).resource.text;
 		expect(text).not.toContain("<docs>");
 		expect(text).not.toContain("Pi documentation to strip");
-		expect(text).toContain("- pi_read: Read images (png, jpg, gif, webp) and any file outside the current workspace. Arguments: path (string, required), offset (1-indexed start line, optional), limit (max lines, optional). For text files inside the workspace use view_file, which returns the whole file inline.");
+		expect(text).toContain("- pi_read: Read images (png, jpg, gif, webp) and any file outside Active Workspaces and App Data Directory. Arguments: path (string, required), offset (1-indexed start line, optional), limit (max lines, optional). For text files inside Active Workspaces or App Data Directory use view_file, which returns the whole file inline.");
 		expect(text).toContain("- pi_bash: Execute commands");
 		expect(text).toContain("- Use pi_bash for file operations");
-		expect(text).toContain("- Use view_file to examine text files inside the workspace instead of cat or sed, reading the whole file in one call; use pi_read for files outside the workspace.");
+		expect(text).toContain("- Use view_file to examine text files inside Active Workspaces or App Data Directory instead of cat or sed, reading the whole file in one call; use pi_read for files outside them.");
 		expect(text).toContain("- Use pi_read to inspect images or screenshots (png, jpg, gif, webp).");
 		expect(text).toContain("Use pi_read to load a skill's file when the task matches its description.");
 		expect(text).toContain("pi_read is fully defined in these instructions, including its arguments (path, offset, limit) and usage. Call it directly without reading its lazy-loaded schema file first.");

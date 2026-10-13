@@ -1,16 +1,17 @@
-import type {
-	Api,
-	ApiStreamOptions,
-	AssistantMessageEventStream,
-	TranscriptContext,
-	Model,
-	Provider,
-	RefreshModelsContext,
-	SimpleStreamOptions,
+import {
+	isModelType,
+	type Api,
+	type ApiStreamOptions,
+	type AssistantMessageEventStream,
+	type TranscriptContext,
+	type Model,
+	type Provider,
+	type RefreshModelsContext,
+	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 
 import { hasAntigravityAuth } from "./acp/antigravity.js";
-import { FALLBACK_MODELS, projectModels, PROVIDER_ID } from "./models.js";
+import { API_ID, FALLBACK_MODELS, projectModels, PROVIDER_ID } from "./models.js";
 import { AntigravityRuntime, MANAGED_AUTH_MARKER } from "./runtime.js";
 
 export interface AntigravityProviderBundle {
@@ -105,6 +106,22 @@ export function createAntigravityProvider(runtime = new AntigravityRuntime()): A
 		},
 		getModels: () => models,
 		async refreshModels(context: RefreshModelsContext) {
+			if (context.stored) {
+				const restored = context.stored.models.filter(
+					(model): model is Model<typeof API_ID> =>
+						isModelType(model, "chat") &&
+						model.provider === PROVIDER_ID &&
+						model.api === API_ID,
+				);
+				if (restored.length > 0) {
+					const published = await context.publish({
+						update: () => {
+							models = restored;
+						},
+					});
+					if (!published) return;
+				}
+			}
 			if (!context.allowNetwork) return;
 			const key =
 				context.credential?.type === "api_key"
@@ -122,6 +139,7 @@ export function createAntigravityProvider(runtime = new AntigravityRuntime()): A
 			}
 			if (discovered.length === 0) return;
 			await context.publish({
+				persist: { models: discovered, checkedAt: Date.now() },
 				update: () => {
 					models = discovered;
 				},
