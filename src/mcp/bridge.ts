@@ -13,9 +13,9 @@ import { Value } from "typebox/value";
 
 import { AntigravityAcpError } from "../acp/errors.js";
 import { PACKAGE_VERSION, PERMISSION_TOOL_NAME } from "../constants.js";
+import { projectToolSchema } from "./schema.js";
 
 const BODY_LIMIT = 1024 * 1024;
-const SCHEMA_LIMIT = 64 * 1024;
 const MAX_TOOLS = 64;
 
 interface BridgeTool {
@@ -45,7 +45,11 @@ export interface ToolOmission {
 export function piToolFingerprint(tools: readonly Tool[]): string {
 	const omissions: ToolOmission[] = [];
 	const projected = projectTools(tools, omissions);
-	return JSON.stringify([projected.map((tool) => [tool.mcpName, tool.description, tool.inputSchema]), omissions]);
+	return projectionFingerprint(projected, omissions);
+}
+
+function projectionFingerprint(tools: BridgeTool[], omissions: ToolOmission[]): string {
+	return JSON.stringify([tools.map((tool) => [tool.mcpName, tool.description, tool.inputSchema]), omissions]);
 }
 
 export function planToolProjection(tools: readonly Tool[]): ToolOmission[] {
@@ -64,7 +68,7 @@ export class PiMcpBridge {
 
 	constructor(private readonly options: PiMcpBridgeOptions) {
 		this.tools = projectTools(options.tools, this.omissions);
-		this.fingerprint = piToolFingerprint(options.tools);
+		this.fingerprint = projectionFingerprint(this.tools, this.omissions);
 	}
 
 	get empty(): boolean {
@@ -172,15 +176,12 @@ function projectTools(tools: readonly Tool[], omissions: ToolOmission[]): Bridge
 			omissions.push({ name: tool.name, reason: "duplicate or invalid projected name" });
 			continue;
 		}
-		const inputSchema = sanitizeSchema(tool.parameters);
-		if (
-			!inputSchema ||
-			inputSchema.type !== "object" ||
-			JSON.stringify(inputSchema).length > SCHEMA_LIMIT
-		) {
-			omissions.push({ name: tool.name, reason: "schema must be a supported, bounded object" });
+		const projected = projectToolSchema(tool.parameters);
+		if ("reason" in projected) {
+			omissions.push({ name: tool.name, reason: `schema omitted (${projected.reason})` });
 			continue;
 		}
+		const inputSchema = projected.schema;
 		names.add(mcpName);
 		output.push({
 			mcpName,
@@ -191,60 +192,6 @@ function projectTools(tools: readonly Tool[], omissions: ToolOmission[]): Bridge
 		});
 	}
 	return output;
-}
-
-function sanitizeSchema(value: unknown, depth = 0): Record<string, unknown> | undefined {
-	if (depth > 16 || !value || typeof value !== "object" || Array.isArray(value)) return undefined;
-	const source = value as Record<string, unknown>;
-	const output: Record<string, unknown> = {};
-	const scalarKeys = [
-		"type",
-		"title",
-		"description",
-		"format",
-		"pattern",
-		"minimum",
-		"maximum",
-		"minLength",
-		"maxLength",
-		"minItems",
-		"maxItems",
-	];
-	for (const key of scalarKeys) {
-		const candidate = source[key];
-		if (["string", "number", "boolean"].includes(typeof candidate)) output[key] = candidate;
-	}
-	if (Array.isArray(source.required)) {
-		output.required = source.required.filter((item): item is string => typeof item === "string");
-	}
-	if (Array.isArray(source.enum)) output.enum = source.enum.filter(jsonScalar);
-	if (jsonValue(source.default)) output.default = source.default;
-	if (typeof source.additionalProperties === "boolean") {
-		output.additionalProperties = source.additionalProperties;
-	} else if (source.additionalProperties && typeof source.additionalProperties === "object") {
-		const additional = sanitizeSchema(source.additionalProperties, depth + 1);
-		if (additional) output.additionalProperties = additional;
-	}
-	if (source.properties && typeof source.properties === "object" && !Array.isArray(source.properties)) {
-		const properties: Record<string, unknown> = {};
-		for (const [name, schema] of Object.entries(source.properties as Record<string, unknown>)) {
-			const sanitized = sanitizeSchema(schema, depth + 1);
-			if (sanitized) properties[name] = sanitized;
-		}
-		output.properties = properties;
-	}
-	if (source.items) {
-		const items = sanitizeSchema(source.items, depth + 1);
-		if (items) output.items = items;
-	}
-	for (const key of ["anyOf", "oneOf", "allOf"] as const) {
-		if (!Array.isArray(source[key])) continue;
-		const variants = source[key].map((item) => sanitizeSchema(item, depth + 1)).filter((item) => item !== undefined);
-		if (variants.length) output[key] = variants;
-	}
-	if (output.type === undefined && output.properties !== undefined) output.type = "object";
-	if (output.type === undefined && output.items !== undefined) output.type = "array";
-	return Object.keys(output).length > 0 ? output : undefined;
 }
 
 async function readJson(request: IncomingMessage): Promise<unknown> {
@@ -267,18 +214,4 @@ function validBearerToken(header: string | undefined, token: string): boolean {
 
 function toolError(text: string): CallToolResult {
 	return { content: [{ type: "text", text }], isError: true };
-}
-
-function jsonScalar(value: unknown): value is null | string | number | boolean {
-	return value === null || ["string", "number", "boolean"].includes(typeof value);
-}
-
-function jsonValue(value: unknown): boolean {
-	if (jsonScalar(value)) return true;
-	if (Array.isArray(value)) return value.every(jsonValue);
-	return Boolean(
-		value &&
-			typeof value === "object" &&
-			Object.values(value as Record<string, unknown>).every(jsonValue),
-	);
 }

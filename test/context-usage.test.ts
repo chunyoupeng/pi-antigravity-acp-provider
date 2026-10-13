@@ -31,7 +31,7 @@ describe("prompt context", () => {
 		expect(warm.prompt).toEqual([{ type: "text", text: "new" }]);
 	});
 
-	it("reconstructs trailing tool calls and results without replaying the old user prompt", () => {
+	it("reconstructs trailing tools and sends the active request explicitly to a fresh session", () => {
 		const context: Context = {
 			messages: [
 				{ role: "user", content: "inspect", timestamp: 1 },
@@ -56,12 +56,13 @@ describe("prompt context", () => {
 			],
 		};
 		const result = buildPromptParts(context, true);
-		expect(result.prompt).toHaveLength(2);
+		expect(result.prompt).toHaveLength(3);
 		expect(result.prompt[0]).toMatchObject({
 			type: "resource",
 			resource: { text: expect.stringMatching(/tool call read[\s\S]*file contents/u) },
 		});
 		expect(result.prompt[1]).toMatchObject({ type: "text", text: expect.stringContaining("Continue") });
+		expect(result.prompt[2]).toEqual({ type: "text", text: "inspect" });
 	});
 
 	it("replays transcript system sections separately from conversation history", () => {

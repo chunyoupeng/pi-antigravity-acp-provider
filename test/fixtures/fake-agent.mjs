@@ -174,6 +174,10 @@ for await (const line of rl) {
 		send({ jsonrpc: "2.0", id, result: {} });
 	} else if (method === "session/prompt") {
 		const text = params.prompt.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+		// Handoffs carry the original request explicitly, but tell the agent not
+		// to repeat completed actions. Model that instruction rather than treating
+		// scenario keywords in the replayed request as a fresh tool invocation.
+		const continuing = params.prompt.some((block) => block.type === "text" && block.text.startsWith("Continue the current Pi user request"));
 		if (scenario === "mode-drift" || scenario === "config-options-mode-drift") {
 			mode = "yolo";
 			send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId,
@@ -198,7 +202,7 @@ for await (const line of rl) {
 			}, Number(process.env.FAKE_PROGRESS_STEP_MS ?? 30));
 			continue;
 		}
-		if (text.includes("bridge") && mcpServer) {
+		if (!continuing && text.includes("bridge") && mcpServer) {
 			bridgePromptId = id;
 			const invocation = text.includes("parallel")
 				? Promise.all([
@@ -226,11 +230,11 @@ for await (const line of rl) {
 			});
 			continue;
 		}
-		if (text.includes("hang")) {
+		if (!continuing && text.includes("hang")) {
 			hangingPromptId = id;
 			continue;
 		}
-		if (text.includes("permission")) {
+		if (!continuing && text.includes("permission")) {
 			permissionPromptId = id;
 			send({
 				jsonrpc: "2.0",
