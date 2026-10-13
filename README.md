@@ -69,6 +69,10 @@ For API-key authentication, choose **Enter an API key** and then **Antigravity G
 
 Antigravity owns OAuth tokens under `~/.gemini/antigravity-acp/`; Pi stores only a non-secret configured marker. Existing `agy` CLI credentials and Gemini CLI credentials should not be assumed to authenticate this separate ACP server.
 
+### macOS credential storage
+
+On macOS the Antigravity server keeps the consumer token in the login keychain (service `gemini`, account `antigravity-acp`) and uses the 0600 file `~/.gemini/antigravity-acp/acp_token.json` only when that keychain is unusable. A keychain that is empty while a refreshable token file exists therefore leaves the server with no credentials it can see: every new ACP server process reports `Credentials missing or invalid`, opens interactive Google consent (which forces the consent screen on every process), and can exceed the session-setup deadline. This provider detects exactly that mismatch and pins the child to the secure-file backend it inspects, so the saved login is reused. Set `AGY_ACP_FORCE_FILE_STORAGE` yourself to take full control of the choice. `doctor`/`status` reports the expected backend as `Credential storage (preflight):`, since the running server's own functional probe can still fall back to the file store. An explicit `GEMINI_HOME` relocates the whole tree, including the token file, and is honored by setup, health checks, logout, and the credential-storage decision.
+
 ## Commands
 
 ```text

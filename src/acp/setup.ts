@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { Open, type File as ZipFile } from "unzipper";
 
 import { loadConfig, type RuntimeUpdateMode } from "../config.js";
-import { resolveAntigravityAcpLaunch, type AntigravityLaunch } from "./antigravity.js";
+import { resolveAntigravityAcpDirectory, resolveAntigravityAcpLaunch, type AntigravityLaunch } from "./antigravity.js";
 import { AntigravityAcpConnection } from "./connection.js";
 import { AntigravityAcpError } from "./errors.js";
 import {
@@ -719,7 +719,7 @@ function pointCurrentAt(root: string, destination: string): void {
 }
 
 function configureDefaultAuth(): void {
-	const directory = path.join(os.homedir(), ".gemini", "antigravity-acp");
+	const directory = resolveAntigravityAcpDirectory();
 	const settingsFile = path.join(directory, "settings.json");
 	const tokenFile = path.join(directory, "acp_token.json");
 	if (fs.existsSync(tokenFile)) return;

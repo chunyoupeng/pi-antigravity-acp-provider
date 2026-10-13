@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { readBundledRuntimeManifest, latestManifestRelease } from "../src/acp/runtime-manifest.js";
 import {
 	adoptLegacyCurrentRelease,
+	ensureAntigravityAcpReady,
 	isExpectedRuntimeIdentity,
 	repairRuntimeExecutablePermissions,
 	validateRuntimeArchiveEntries,
@@ -165,6 +166,38 @@ describe("managed runtime executable permissions", () => {
 		expect(() => repairRuntimeExecutablePermissions(directory, "linux")).toThrow(
 			"Managed ACP runtime payload is not a regular file",
 		);
+	});
+});
+
+describe("default auth profile", () => {
+	it("seeds the scoped profile under GEMINI_HOME and leaves the default profile alone", async () => {
+		const scopedHome = temporaryDirectory();
+		const defaultSettings = path.join(os.homedir(), ".gemini", "antigravity-acp", "settings.json");
+		const before = fs.existsSync(defaultSettings) ? fs.readFileSync(defaultSettings, "utf8") : undefined;
+		const binary = path.join(temporaryDirectory(), "external-agent");
+		fs.writeFileSync(binary, "external", { mode: 0o755 });
+		vi.stubEnv("AGY_ACP_BIN", binary);
+		vi.stubEnv("GEMINI_HOME", scopedHome);
+		vi.stubEnv("GEMINI_API_KEY", "");
+		await ensureAntigravityAcpReady();
+		expect(JSON.parse(fs.readFileSync(path.join(scopedHome, "antigravity-acp", "settings.json"), "utf8"))).toMatchObject({
+			auth: { type: "oauth-personal" },
+		});
+		const after = fs.existsSync(defaultSettings) ? fs.readFileSync(defaultSettings, "utf8") : undefined;
+		expect(after).toBe(before);
+	});
+
+	it("records an API key in the scoped profile", async () => {
+		const scopedHome = temporaryDirectory();
+		const binary = path.join(temporaryDirectory(), "external-agent");
+		fs.writeFileSync(binary, "external", { mode: 0o755 });
+		vi.stubEnv("AGY_ACP_BIN", binary);
+		vi.stubEnv("GEMINI_HOME", scopedHome);
+		vi.stubEnv("GEMINI_API_KEY", "scoped-key");
+		await ensureAntigravityAcpReady();
+		expect(JSON.parse(fs.readFileSync(path.join(scopedHome, "antigravity-acp", "settings.json"), "utf8"))).toMatchObject({
+			auth: { type: "gemini-api-key" },
+		});
 	});
 });
 
