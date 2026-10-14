@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { projectModels, resolveAcpModelId } from "../src/models.js";
+import { MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, projectModels, resolveAcpModelId } from "../src/models.js";
 import { createAntigravityProvider } from "../src/provider.js";
 
 describe("projectModels", () => {
@@ -12,6 +12,11 @@ describe("projectModels", () => {
 		]);
 		expect(models.map((model) => model.id)).toEqual(["gemini-a"]);
 		expect(models[0]?.cost.input).toBe(0);
+		expect(models[0]?.inputLimits?.images?.resize).toEqual({
+			maxWidth: MAX_IMAGE_DIMENSION,
+			maxHeight: MAX_IMAGE_DIMENSION,
+			maxBytes: MAX_IMAGE_BYTES,
+		});
 	});
 
 	it("collapses ACP effort variants into Pi reasoning levels", () => {
@@ -82,16 +87,22 @@ describe("projectModels", () => {
 				{ modelId: "gemini-4-argon-high", name: "Gemini 4 Argon (High)" },
 			])[0]!;
 
+			const { inputLimits: _omitted, ...legacyStoredModel } = storedModel;
 			await provider.refreshModels?.({
 				allowNetwork: false,
 				signal: new AbortController().signal,
-				stored: { models: [storedModel], checkedAt: 123 },
+				stored: { models: [legacyStoredModel], checkedAt: 123 },
 				publish: async ({ update }) => {
 					update?.();
 					return true;
 				},
 			});
 			expect(provider.getModels?.().map((model) => model.id)).toEqual(["gemini-4-argon"]);
+			expect(provider.getModels?.()[0]?.inputLimits?.images?.resize).toEqual({
+				maxWidth: MAX_IMAGE_DIMENSION,
+				maxHeight: MAX_IMAGE_DIMENSION,
+				maxBytes: MAX_IMAGE_BYTES,
+			});
 
 			runtime.discoverModels = async () => [
 				{ modelId: "gemini-4-argon-low", name: "Gemini 4 Argon (Low)" },

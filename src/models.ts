@@ -7,6 +7,9 @@ import type {
 
 export const PROVIDER_ID = "antigravity-acp";
 export const API_ID = "antigravity-acp";
+/** Cap inline base64 image payloads at 512 KiB and 1536px (2x2 Gemini 768px tiles). */
+export const MAX_IMAGE_BYTES = 512 * 1024;
+export const MAX_IMAGE_DIMENSION = 1536;
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
 type Effort = "low" | "medium" | "high";
@@ -148,6 +151,15 @@ function baseModel(
 		reasoning,
 		...(thinkingLevelMap ? { thinkingLevelMap } : {}),
 		input: ["text", "image"],
+		inputLimits: {
+			images: {
+				resize: {
+					maxWidth: MAX_IMAGE_DIMENSION,
+					maxHeight: MAX_IMAGE_DIMENSION,
+					maxBytes: MAX_IMAGE_BYTES,
+				},
+			},
+		},
 		cost: ZERO_COST,
 		contextWindow: 1_000_000,
 		maxTokens: 65_536,

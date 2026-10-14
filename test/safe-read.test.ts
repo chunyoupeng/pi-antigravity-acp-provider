@@ -4,9 +4,10 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import zlib from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { CHINESE_RATIO_THRESHOLD, chineseRatio, createSafeReadToolDefinition, STAGE_DIRECTORY_NAME } from "../extensions/safe-read.js";
+import { CHINESE_RATIO_THRESHOLD, chineseRatio, createSafeReadToolDefinition, MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, STAGE_DIRECTORY_NAME } from "../extensions/safe-read.js";
 import { PiMcpBridge } from "../src/mcp/bridge.js";
 
 const directories: string[] = [];
@@ -252,13 +253,58 @@ describe("Antigravity hybrid safe read", () => {
 		expect(textOf(result)).toBe("中".repeat(2000));
 	});
 
-	it("preserves images and their original structured output", async () => {
+	it("preserves small images and compresses oversized images below 512 KiB and 1536px", async () => {
 		const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==", "base64");
 		const f = fixture(png, "image.png");
 		const result = await f.read();
 		const original = await createReadToolDefinition(f.cwd).execute("read-test", { path: f.file }, undefined, undefined, f.ctx);
 		expect(result).toEqual(original);
 		expect(result.content.some((block) => block.type === "image")).toBe(true);
+
+		const width = 1800;
+		const height = 1200;
+		const raw = Buffer.alloc((width * 3 + 1) * height);
+		for (let y = 0; y < height; y++) {
+			raw[y * (width * 3 + 1)] = 0;
+			for (let x = 0; x < width * 3; x++) {
+				raw[y * (width * 3 + 1) + 1 + x] = (x * 31 + y * 17 + (x ^ y)) & 0xff;
+			}
+		}
+		const chunk = (type: string, data: Buffer) => {
+			const len = Buffer.alloc(4);
+			len.writeUInt32BE(data.length);
+			const body = Buffer.concat([Buffer.from(type), data]);
+			const crc = Buffer.alloc(4);
+			crc.writeUInt32BE(zlib.crc32(body) >>> 0);
+			return Buffer.concat([len, body, crc]);
+		};
+		const ihdr = Buffer.alloc(13);
+		ihdr.writeUInt32BE(width, 0);
+		ihdr.writeUInt32BE(height, 4);
+		ihdr[8] = 8;
+		ihdr[9] = 2;
+		const largePng = Buffer.concat([
+			Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+			chunk("IHDR", ihdr),
+			chunk("IDAT", zlib.deflateSync(raw, { level: 0 })),
+			chunk("IEND", Buffer.alloc(0)),
+		]);
+		expect(largePng.byteLength).toBeGreaterThan(2 * MAX_IMAGE_BYTES);
+		const largeFixture = fixture(largePng, "large.png");
+		const compressed = await largeFixture.read();
+		const textBlock = compressed.content.find((block) => block.type === "text");
+		const imageBlock = compressed.content.find((block) => block.type === "image");
+		expect(textBlock?.type).toBe("text");
+		if (textBlock?.type === "text") {
+			expect(textBlock.text).toContain(`original ${width}x${height}`);
+			const displayed = /displayed at (\d+)x(\d+)/u.exec(textBlock.text);
+			expect(Number(displayed?.[1])).toBeLessThanOrEqual(MAX_IMAGE_DIMENSION);
+			expect(Number(displayed?.[2])).toBeLessThanOrEqual(MAX_IMAGE_DIMENSION);
+		}
+		expect(imageBlock?.type).toBe("image");
+		if (imageBlock?.type === "image") {
+			expect(Buffer.byteLength(imageBlock.data, "utf8")).toBeLessThan(MAX_IMAGE_BYTES);
+		}
 	});
 
 	it("preserves errors and cancellation from the original reader", async () => {

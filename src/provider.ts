@@ -11,7 +11,7 @@ import {
 } from "@earendil-works/pi-ai";
 
 import { hasAntigravityAuth } from "./acp/antigravity.js";
-import { API_ID, FALLBACK_MODELS, projectModels, PROVIDER_ID } from "./models.js";
+import { API_ID, FALLBACK_MODELS, MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, projectModels, PROVIDER_ID } from "./models.js";
 import { AntigravityRuntime, MANAGED_AUTH_MARKER } from "./runtime.js";
 
 export interface AntigravityProviderBundle {
@@ -107,12 +107,37 @@ export function createAntigravityProvider(runtime = new AntigravityRuntime()): A
 		getModels: () => models,
 		async refreshModels(context: RefreshModelsContext) {
 			if (context.stored) {
-				const restored = context.stored.models.filter(
-					(model): model is Model<typeof API_ID> =>
-						isModelType(model, "chat") &&
-						model.provider === PROVIDER_ID &&
-						model.api === API_ID,
-				);
+				const restored = context.stored.models
+					.filter(
+						(model): model is Model<typeof API_ID> =>
+							isModelType(model, "chat") &&
+							model.provider === PROVIDER_ID &&
+							model.api === API_ID,
+					)
+					.map((model) => ({
+						...model,
+						inputLimits: {
+							...model.inputLimits,
+							images: {
+								...model.inputLimits?.images,
+								resize: {
+									...model.inputLimits?.images?.resize,
+									maxWidth: Math.min(
+										model.inputLimits?.images?.resize?.maxWidth ?? MAX_IMAGE_DIMENSION,
+										MAX_IMAGE_DIMENSION,
+									),
+									maxHeight: Math.min(
+										model.inputLimits?.images?.resize?.maxHeight ?? MAX_IMAGE_DIMENSION,
+										MAX_IMAGE_DIMENSION,
+									),
+									maxBytes: Math.min(
+										model.inputLimits?.images?.resize?.maxBytes ?? MAX_IMAGE_BYTES,
+										MAX_IMAGE_BYTES,
+									),
+								},
+							},
+						},
+					}));
 				if (restored.length > 0) {
 					const published = await context.publish({
 						update: () => {

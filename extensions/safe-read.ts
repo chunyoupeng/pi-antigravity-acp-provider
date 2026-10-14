@@ -9,6 +9,9 @@ import { access, mkdir, readdir, readFile, rename, rm, stat, utimes, writeFile }
 import path from "node:path";
 
 import { resolveAntigravityAcpDirectory } from "../src/acp/antigravity.js";
+import { MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION } from "../src/models.js";
+
+export { MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION } from "../src/models.js";
 
 const INLINE_BYTES = 4 * 1024;
 const PREVIEW_BYTES = 3 * 1024;
@@ -49,7 +52,15 @@ export function createSafeReadToolDefinition(cwd: string, appDataDirectory = res
 			// Capture the bytes from the original reader, not a second file read.
 			let file: { path: string; buffer: Buffer } | undefined;
 			let image = false;
+			const modelResize = ctx.model?.inputLimits?.images?.resize;
+			const resizeOptions = {
+				...modelResize,
+				maxWidth: Math.min(modelResize?.maxWidth ?? MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION),
+				maxHeight: Math.min(modelResize?.maxHeight ?? MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION),
+				maxBytes: Math.min(modelResize?.maxBytes ?? MAX_IMAGE_BYTES, MAX_IMAGE_BYTES),
+			};
 			const reader = createReadToolDefinition(cwd, {
+				resizeOptions,
 				operations: {
 					access: (path) => access(path, constants.R_OK),
 					detectImageMimeType: async (path) => {
@@ -64,7 +75,26 @@ export function createSafeReadToolDefinition(cwd: string, appDataDirectory = res
 					},
 				},
 			});
-			const result = await reader.execute(id, params, signal, onUpdate, ctx);
+			const readCtx =
+				ctx.model &&
+				(ctx.model.inputLimits?.images?.resize?.maxBytes !== resizeOptions.maxBytes ||
+					ctx.model.inputLimits?.images?.resize?.maxWidth !== resizeOptions.maxWidth ||
+					ctx.model.inputLimits?.images?.resize?.maxHeight !== resizeOptions.maxHeight)
+					? {
+							...ctx,
+							model: {
+								...ctx.model,
+								inputLimits: {
+									...ctx.model.inputLimits,
+									images: {
+										...ctx.model.inputLimits?.images,
+										resize: resizeOptions,
+									},
+								},
+							},
+						}
+					: ctx;
+			const result = await reader.execute(id, params, signal, onUpdate, readCtx);
 			if (!file || image || typeof result.structuredContent !== "string") return result;
 			if (file.buffer.byteLength <= INLINE_BYTES && Buffer.byteLength(result.structuredContent, "utf8") <= INLINE_BYTES) {
 				return result;
