@@ -46,7 +46,7 @@ export function decodeSessionState(response: unknown): SessionState {
 	return parsed.data as SessionState;
 }
 
-export function findSessionSelector(state: SessionState, category: "model" | "mode"): SelectOption | undefined {
+export function findSessionSelector(state: SessionState, category: "model" | "mode" | "thought_level"): SelectOption | undefined {
 	return state.configOptions?.find((option): option is SelectOption =>
 		option.type === "select" && (option.category === category || option.id === category),
 	);

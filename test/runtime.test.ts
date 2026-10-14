@@ -1,4 +1,4 @@
-import { normalizeContext, type Context, type Model } from "@earendil-works/pi-ai";
+import { normalizeContext, type Context, type Model, type ToolResultMessage } from "@earendil-works/pi-ai";
 import type { AcpToolActivity } from "../src/acp/events.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 
 import { AntigravityAcpConnection } from "../src/acp/connection.js";
 import { AcpSessionStore } from "../src/acp/session-store.js";
+import { MAX_TEXT_RESULT_BYTES } from "../src/models.js";
 import {
 	AntigravityRuntime,
 	PERMISSION_RESULT_KIND,
@@ -455,7 +456,8 @@ describe("AntigravityRuntime", () => {
 		}
 	});
 
-	it("sends images from a Pi tool result as a follow-up prompt instead of over MCP", async () => {
+	/** Runs one bridged Pi tool call and returns what the agent received over MCP. */
+	async function relayToolResult(content: ToolResultMessage["content"]): Promise<string> {
 		const runtime = new AntigravityRuntime(
 			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent] }),
 		);
@@ -482,31 +484,38 @@ describe("AntigravityRuntime", () => {
 					messages: [
 						...firstContext.messages,
 						firstDone.message,
-						{
-							role: "toolResult",
-							toolCallId: call.id,
-							toolName: call.name,
-							content: [
-								{ type: "text", text: "Read image file [image/png]" },
-								{ type: "image", data: "aW1n", mimeType: "image/png" },
-							],
-							isError: false,
-							timestamp: 2,
-						},
+						{ role: "toolResult", toolCallId: call.id, toolName: call.name, content, isError: false, timestamp: 2 },
 					],
 				},
 				{ apiKey: "test-key" },
 			);
 			const secondEvents = [];
 			for await (const event of secondWriter.stream) secondEvents.push(event);
-			const text = secondWriter.message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
-			// The MCP result carries the text and a note; the image arrives in the next prompt.
-			expect(text).toContain("Read image file [image/png]\n[1 image(s) from this result cannot be shown in a tool result.");
-			expect(text).toContain("saw image/png after: Image(s) returned by your echo tool call:\nContinue the task using these images.");
 			expect(secondEvents.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+			return secondWriter.message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
 		} finally {
 			await runtime.close();
 		}
+	}
+
+	it("returns images from a Pi tool result over MCP in the same turn", async () => {
+		// mcpMaxOutputBytes keeps the image inline, so no follow-up prompt is needed.
+		expect(await relayToolResult([
+			{ type: "text", text: "Read image file [image/png]" },
+			{ type: "image", data: "aW1n", mimeType: "image/png" },
+		])).toBe("Read image file [image/png]\n[image image/png aW1n]");
+	});
+
+	it("caps oversized Pi tool text at the inline limit and saves all of it", async () => {
+		const lines = Array.from({ length: 1000 }, (_, index) => `${index + 1}: ${"y".repeat(80)}`);
+		const text = await relayToolResult([{ type: "text", text: lines.join("\n") }]);
+		expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(MAX_TEXT_RESULT_BYTES);
+		const note = /\n\n\[Showing lines 1-(\d+) of 1000 \(46 KiB limit\)\. Full output: (.+)\. Read the rest with pi_read \(offset=(\d+)\)\.\]$/u.exec(text);
+		if (!note) throw new Error(`Missing note in: ${text.slice(-300)}`);
+		expect(text.slice(0, note.index)).toBe(lines.slice(0, Number(note[1])).join("\n"));
+		expect(Number(note[3])).toBe(Number(note[1]) + 1);
+		expect(fs.readFileSync(note[2]!, "utf8")).toBe(lines.join("\n"));
+		fs.rmSync(note[2]!, { force: true });
 	});
 
 	it.each(["parallel", "parallel reversed"])("batches %s MCP calls into one Pi tool turn", async (scenario) => {

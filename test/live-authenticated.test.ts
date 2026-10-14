@@ -1,4 +1,3 @@
-import type { ToolCallUpdate } from "@agentclientprotocol/sdk";
 import type { Message, Model } from "@earendil-works/pi-ai";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -7,14 +6,15 @@ import path from "node:path";
 import zlib from "node:zlib";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
-import { createReadToolDefinition } from "@earendil-works/pi-coding-agent";
 
+import { createSafeReadToolDefinition } from "../extensions/safe-read.js";
 import { AntigravityAcpConnection } from "../src/acp/connection.js";
-import { AntigravityRuntime, MANAGED_AUTH_MARKER, PI_OWNED_NATIVE_TOOLS, UNUSED_NATIVE_TOOLS } from "../src/runtime.js";
+import { projectModels } from "../src/models.js";
+import { AntigravityRuntime, MANAGED_AUTH_MARKER } from "../src/runtime.js";
 
 const enabled = process.env.PI_ANTIGRAVITY_ACP_LIVE === "1";
 const model: Model<"antigravity-acp"> = {
-	id: "gemini-3.8-flash-high",
+	id: "gemini-3.8-flash",
 	name: "Gemini 3.8 Flash",
 	api: "antigravity-acp",
 	provider: "antigravity-acp",
@@ -43,7 +43,8 @@ function solidPng(size: number, rgb: [number, number, number]): Buffer {
 	return Buffer.concat([
 		Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
 		chunk("IHDR", header),
-		chunk("IDAT", zlib.deflateSync(Buffer.concat(Array.from({ length: size }, () => row)))),
+		// Stored, not compressed, so a 64px image exceeds the 4 KiB MCP default.
+		chunk("IDAT", zlib.deflateSync(Buffer.concat(Array.from({ length: size }, () => row)), { level: 0 })),
 		chunk("IEND", Buffer.alloc(0)),
 	]);
 }
@@ -84,58 +85,51 @@ describe.skipIf(!enabled)("authenticated Google Antigravity ACP server", () => {
 		}
 	}, 180_000);
 
-	// MCP results over about 4 KB reach the model only as an offloaded file
-	// path, so native view_file must stay enabled under Pi tools.
-	it("reads text past 4 KB inline with the Pi tool filter", async () => {
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "agy-live-view-"));
+	// A Pi read result past the old 4 KiB MCP threshold reaches the model inline
+	// once mcpMaxOutputBytes is raised; native view_file is disabled.
+	it("reads a 30 KB text file with one Pi read call", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "agy-live-read-"));
 		const marker = randomUUID();
-		const filler = Array.from({ length: 300 }, (_, index) => `filler line ${index}: ${"x".repeat(60)}`);
+		const filler = Array.from({ length: 400 }, (_, index) => `filler line ${index}: ${"x".repeat(60)}`);
 		const textPath = path.join(cwd, "large.txt");
 		fs.writeFileSync(textPath, [...filler, `LIVE_MARKER=${marker}`, ""].join("\n"));
-
-		const messages: string[] = [];
-		const tools = new Map<string, Partial<ToolCallUpdate>>();
-		const connection = new AntigravityAcpConnection({
-			cwd,
-			operationTimeoutMs: 120_000,
-			handlers: {
-				onUpdate: (notification) => {
-					const update = notification.update;
-					if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
-						messages.push(update.content.text);
-					} else if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
-						tools.set(update.toolCallId, { ...tools.get(update.toolCallId), ...update });
-					}
-				},
-				onPermission: async (request) => {
-					const allowOnce = request.options.find((option) => option.kind === "allow_once");
-					return allowOnce
-						? { outcome: { outcome: "selected", optionId: allowOnce.optionId } }
-						: { outcome: { outcome: "cancelled" } };
-				},
+		const read = createSafeReadToolDefinition(cwd);
+		type ReadContext = Parameters<typeof read.execute>[4];
+		const tools = [{ name: read.name, description: read.description, parameters: read.parameters }];
+		const messages: Message[] = [
+			{
+				role: "user",
+				content:
+					`Read ${textPath} in full. Do not use subagents or commands. ` +
+					"Reply with exactly: MARKER=<the value after LIVE_MARKER= on the last line>",
+				timestamp: 1,
 			},
-		});
+		];
+		const runtime = new AntigravityRuntime(undefined, "yolo", undefined, undefined, "pi");
+		const transcript: string[] = [];
 		try {
-			const session = await connection.newSession(cwd, undefined, [], {
-				agy: { disabledTools: [...PI_OWNED_NATIVE_TOOLS, ...UNUSED_NATIVE_TOOLS] },
-			});
-			const response = await connection.prompt({
-				sessionId: session.sessionId,
-				prompt: [
-					{
-						type: "text",
-						text:
-							`Read ${textPath} in full with one file viewing tool call. Do not use subagents or commands. ` +
-							"Reply with exactly: MARKER=<the value after LIVE_MARKER= on the last line>",
-					},
-				],
-			});
-			const toolLog = JSON.stringify([...tools.values()]);
-			expect(response.stopReason, toolLog).toBe("end_turn");
-			expect(toolLog).not.toMatch(/output was large|Resource offloaded/u);
-			expect(messages.join(""), toolLog).toContain(`MARKER=${marker}`);
+			for (let turn = 0; turn < 6; turn++) {
+				const writer = runtime.stream(model, { tools, messages }, { apiKey: MANAGED_AUTH_MARKER });
+				for await (const _event of writer.stream) void _event;
+				const message = writer.message;
+				messages.push(message);
+				transcript.push(JSON.stringify(message.content));
+				if (message.stopReason !== "toolUse") break;
+				for (const block of message.content) {
+					if (block.type !== "toolCall") continue;
+					const result = await read.execute(block.id, block.arguments as { path: string }, undefined, undefined, { cwd, model } as unknown as ReadContext);
+					messages.push({ role: "toolResult", toolCallId: block.id, toolName: block.name, content: result.content, isError: false, timestamp: messages.length + 1 });
+				}
+			}
+			const reads = messages.flatMap((message) =>
+				message.role === "assistant" ? message.content.filter((block) => block.type === "toolCall") : [],
+			);
+			const last = messages.at(-1);
+			const reply = last?.role === "assistant" ? last.content.map((block) => (block.type === "text" ? block.text : "")).join("") : "";
+			expect(reads, transcript.join("\n")).toHaveLength(1);
+			expect(reply, transcript.join("\n")).toContain(`MARKER=${marker}`);
 		} finally {
-			await connection.close();
+			await runtime.close();
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}
 	}, 300_000);
@@ -235,61 +229,26 @@ describe.skipIf(!enabled)("authenticated Google Antigravity ACP server", () => {
 		}
 	}, 300_000);
 
-	// Pi's own read definition and native view_file both reach the model. With
-	// the description override it must pick view_file, because a Pi read
-	// result over about 4 KB reaches the model only as an offloaded path.
-	it("reads a large text file with view_file when Pi's read is also offered", async () => {
-		const cwd = fs.mkdtempSync(path.join(process.cwd(), ".live-read-"));
-		const marker = randomUUID();
-		const filler = Array.from({ length: 300 }, (_, index) => `filler line ${index}: ${"x".repeat(60)}`);
-		const textPath = path.join(cwd, "large.txt");
-		fs.writeFileSync(textPath, [...filler, `LIVE_MARKER=${marker}`, ""].join("\n"));
-		const read = createReadToolDefinition(process.cwd());
-		const tools = [{ name: read.name, description: read.description, parameters: read.parameters }];
-		const messages: Message[] = [
-			{
-				role: "user",
-				content:
-					`Read ${textPath} in full. Do not use subagents or commands. ` +
-					"Reply with exactly: MARKER=<the value after LIVE_MARKER= on the last line>",
-				timestamp: 1,
-			},
-		];
+	// Antigravity 1.4 folds thinking-level variants into a model family plus a
+	// thought_level selector; each level must be selected and confirmed.
+	it("discovers thinking levels and switches between them", async () => {
 		const runtime = new AntigravityRuntime(undefined, "yolo", undefined, undefined, "pi");
-		const transcript: string[] = [];
 		try {
-			for (let turn = 0; turn < 6; turn++) {
-				const writer = runtime.stream(model, { tools, messages }, { apiKey: MANAGED_AUTH_MARKER });
+			const models = projectModels(await runtime.discoverModels(MANAGED_AUTH_MARKER));
+			const family = models.find((candidate) => candidate.thinkingLevelMap?.low && candidate.thinkingLevelMap.high);
+			expect(family, JSON.stringify(models)).toBeDefined();
+			for (const reasoning of ["low", "high"] as const) {
+				const writer = runtime.stream(
+					family!,
+					{ messages: [{ role: "user", content: "Reply with exactly: OK", timestamp: 1 }] },
+					{ apiKey: MANAGED_AUTH_MARKER, reasoning },
+				);
 				for await (const _event of writer.stream) void _event;
-				const message = writer.message;
-				messages.push(message);
-				transcript.push(JSON.stringify(message.content));
-				if (message.stopReason !== "toolUse") break;
-				for (const block of message.content) {
-					if (block.type !== "toolCall") continue;
-					messages.push({
-						role: "toolResult",
-						toolCallId: block.id,
-						toolName: block.name,
-						content: [{ type: "text", text: "Use view_file for text files" }],
-						isError: true,
-						timestamp: messages.length + 1,
-					});
-				}
+				expect(writer.message.stopReason, JSON.stringify(writer.message)).toBe("stop");
+				expect(writer.message.responseModel).toBe(family!.thinkingLevelMap![reasoning]);
 			}
-			const piReads = messages.flatMap((message) =>
-				message.role === "assistant" ? message.content.filter((block) => block.type === "toolCall") : [],
-			);
-			const last = messages.at(-1);
-			const reply =
-				last?.role === "assistant"
-					? last.content.map((block) => (block.type === "text" ? block.text : "")).join("")
-					: "";
-			expect(piReads, transcript.join("\n")).toEqual([]);
-			expect(reply, transcript.join("\n")).toContain(`MARKER=${marker}`);
 		} finally {
 			await runtime.close();
-			fs.rmSync(cwd, { recursive: true, force: true });
 		}
 	}, 300_000);
 });

@@ -10,9 +10,18 @@ export const API_ID = "antigravity-acp";
 /** Cap inline base64 image payloads at 512 KiB and 1536px (2x2 Gemini 768px tiles). */
 export const MAX_IMAGE_BYTES = 512 * 1024;
 export const MAX_IMAGE_DIMENSION = 1536;
+/** `_meta.antigravity.mcpMaxOutputBytes`: each MCP result item up to this size
+ * (images by decoded bytes) reaches the model inline; a larger one is only a
+ * file path. Above every image Pi sends (verified 2026-10-15, server 1.4.0). */
+export const MCP_MAX_OUTPUT_BYTES = 1024 * 1024;
+/** The harness cuts any text result over 48 KiB to its head regardless of
+ * mcpMaxOutputBytes (verified 2026-10-15, server 1.4.0), so Pi tool text is
+ * capped below that with its continuation note intact. */
+export const MAX_TEXT_RESULT_BYTES = 46 * 1024;
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
-type Effort = "low" | "medium" | "high";
+const EFFORTS = ["low", "medium", "high"] as const;
+type Effort = (typeof EFFORTS)[number];
 type Variants = Partial<Record<Effort, string>>;
 
 export const FALLBACK_MODELS: readonly Model<typeof API_ID>[] = [
@@ -94,8 +103,23 @@ export function resolveAcpModelId(
 	model: Model<typeof API_ID>,
 	reasoning: ThinkingLevel | undefined,
 ): string {
+	const effort = resolveEffort(model, reasoning);
+	return effort ? (model.thinkingLevelMap?.[effort] ?? model.id) : model.id;
+}
+
+/** The family (Pi model ID) and thinking level that a resolved ACP model ID is
+ * a variant of, for servers with a separate thought_level selector. */
+export function resolveAcpThinking(
+	model: Model<typeof API_ID>,
+	acpModelId: string,
+): { model: string; level: Effort } | undefined {
+	const level = EFFORTS.find((effort) => model.thinkingLevelMap?.[effort] === acpModelId);
+	return level ? { model: model.id, level } : undefined;
+}
+
+function resolveEffort(model: Model<typeof API_ID>, reasoning: ThinkingLevel | undefined): Effort | undefined {
 	const map = model.thinkingLevelMap;
-	if (!model.reasoning || !map) return model.id;
+	if (!model.reasoning || !map) return undefined;
 	const preferred: Effort =
 		reasoning === "minimal" || reasoning === "low"
 			? "low"
@@ -108,11 +132,7 @@ export function resolveAcpModelId(
 			: preferred === "high"
 				? ["high", "medium", "low"]
 				: ["medium", "high", "low"];
-	for (const effort of order) {
-		const value = map[effort];
-		if (typeof value === "string" && value) return value;
-	}
-	return model.id;
+	return order.find((effort) => typeof map[effort] === "string" && map[effort] !== "");
 }
 
 function reasoningModel(

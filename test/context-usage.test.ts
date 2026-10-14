@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
 	adaptInstructionsForAntigravity,
 	buildPromptParts,
+	PI_BASH_DESCRIPTION,
 	PI_READ_DESCRIPTION,
 	PI_READ_EXAMINE_RULE,
 	PI_READ_ROUTING_RULE,
@@ -202,11 +203,10 @@ describe("prompt context", () => {
 		expect(text).not.toContain("<docs>");
 		expect(text).not.toContain("Pi documentation to strip");
 		expect(text).toContain(`- pi_read: ${PI_READ_DESCRIPTION}`);
-		expect(text).toContain("- pi_bash: Execute commands");
+		expect(text).toContain(`- pi_bash: ${PI_BASH_DESCRIPTION}`);
 		expect(text).toContain("- Use pi_bash for file operations");
 		expect(text).toContain(PI_READ_EXAMINE_RULE);
-		expect(text).not.toContain("Use view_file to examine text files");
-		expect(text).toContain("- Use pi_read to inspect images or screenshots (png, jpg, gif, webp).");
+		expect(text).not.toContain("view_file");
 		expect(text).toContain("Use pi_read to load a skill's file when the task matches its description.");
 		expect(text).toContain(PI_READ_ROUTING_RULE);
 		expect(text).toContain("Do not use Antigravity's native skill loader for these files.");

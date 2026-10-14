@@ -25,6 +25,7 @@ import { PromptWatchdog } from "./prompt-watchdog.js";
 import {
 	decodeSessionState,
 	findSessionSelector,
+	selectorValues,
 	type AcpNewSessionResponse,
 	type SessionState,
 } from "./session-state.js";
@@ -244,8 +245,23 @@ export class AntigravityAcpConnection {
 		return this.updateSessionState(sessionId, response);
 	}
 
-	async setModel(sessionId: string, modelId: string, signal?: AbortSignal): Promise<void> {
+	/** `thinking` names the model family and level that `modelId` is a variant
+	 * of. Antigravity 1.4 offers families in the model selector plus a separate
+	 * thought_level selector; it accepts a variant ID but reports the family,
+	 * so the family and level are set and confirmed one by one instead. */
+	async setModel(
+		sessionId: string,
+		modelId: string,
+		signal?: AbortSignal,
+		thinking?: { model: string; level: string },
+	): Promise<void> {
 		await this.initialize(signal);
+		const models = findSessionSelector(this.sessions.get(sessionId) ?? {}, "model");
+		if (thinking && thinking.model !== modelId && models && selectorValues(models).some((option) => option.value === thinking.model)) {
+			await this.setSelector(sessionId, "model", thinking.model, signal);
+			if (await this.setSelector(sessionId, "thought_level", thinking.level, signal)) return;
+			throw new AntigravityAcpError("protocol", `Antigravity offered no thinking levels for ${thinking.model}`);
+		}
 		if (await this.setSelector(sessionId, "model", modelId, signal)) return;
 		// Older official Antigravity builds still implement this removed draft
 		// method. Use the SDK's supported generic request API, not private internals.
@@ -356,7 +372,7 @@ export class AntigravityAcpConnection {
 
 	private async setSelector(
 		sessionId: string,
-		category: "model" | "mode",
+		category: "model" | "mode" | "thought_level",
 		value: string,
 		signal?: AbortSignal,
 	): Promise<boolean> {

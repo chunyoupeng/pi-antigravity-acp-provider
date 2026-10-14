@@ -13,13 +13,15 @@ import {
 	getCurrentTools,
 	normalizeContext,
 	type Context,
-	type ImageContent,
 	type Model,
 	type SimpleStreamOptions,
 	type ToolResultMessage,
 } from "@earendil-works/pi-ai";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { createHash } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import {
 	clearAntigravityCredentials,
@@ -53,8 +55,8 @@ import {
 	type PiToolInvocation,
 } from "./mcp/bridge.js";
 import type { PermissionMode, ToolOwner } from "./config.js";
-import { resolveAcpModelId } from "./models.js";
-import { PI_READ_DESCRIPTION, type PromptParts, buildPromptParts, currentSystemInstructions } from "./stream/context.js";
+import { MAX_TEXT_RESULT_BYTES, MCP_MAX_OUTPUT_BYTES, resolveAcpModelId, resolveAcpThinking } from "./models.js";
+import { PI_BASH_DESCRIPTION, PI_READ_DESCRIPTION, type PromptParts, buildPromptParts, currentSystemInstructions } from "./stream/context.js";
 import { PiEventWriter } from "./stream/pi-events.js";
 import { contextUsage, usageFromPrompt, withContextUsage } from "./stream/usage.js";
 import { RuntimeMetrics } from "./status.js";
@@ -67,14 +69,13 @@ const TOOL_BATCH_MS = 100;
 const TOOL_HANDOFF_MS = 150_000;
 
 /** Antigravity built-ins disabled when Pi owns tool execution. The model then
- * runs commands and changes files only through Pi's bridged tools, so Pi's
- * tool set, hooks and rendering apply. `start_subagent` also removes
+ * reads, runs commands and changes files only through Pi's bridged tools, so
+ * Pi's tool set, hooks and rendering apply. `start_subagent` also removes
  * invoke_subagent, define_subagent, manage_subagents and send_message, so
  * subagents cannot read or run outside Pi. Web search and URL fetch have no Pi
- * equivalent and stay native. `view_file` also stays native: Antigravity
- * offloads MCP results over 4096 bytes, and every MCP image, to a file the
- * model sees only as a path, while native results stay inline. */
+ * equivalent and stay native. */
 export const PI_OWNED_NATIVE_TOOLS = [
+	"view_file",
 	"run_command",
 	"create_file",
 	"edit_file",
@@ -84,13 +85,11 @@ export const PI_OWNED_NATIVE_TOOLS = [
 	"start_subagent",
 ] as const;
 
-/** Pi tool descriptions replaced when Pi owns tools. read covers images and
- * is the first read of every text file: it pages Chinese files in raw UTF-8
- * (MCP results over 4096 bytes are offloaded, verified 2026-10-12 with a live
- * probe: exactly 4096 bytes stays inline) and routes non-Chinese files to the
- * native `view_file`, whose whitelist the server derives from the session cwd. */
+/** Pi tool descriptions replaced when Pi owns tools: they state the 46 KiB
+ * page and argument list that the lazy-loaded MCP schema would otherwise hold. */
 export const PI_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = {
 	read: PI_READ_DESCRIPTION,
+	bash: PI_BASH_DESCRIPTION,
 };
 
 /** Antigravity built-ins disabled in every tool mode. Each one costs prompt
@@ -120,12 +119,6 @@ interface LateResult {
 	result: ToolResultMessage;
 }
 
-/** Images from a Pi tool result, held back from MCP and sent as a prompt. */
-interface DeferredImages {
-	toolName: string;
-	images: ImageContent[];
-}
-
 interface Binding {
 	key: string;
 	cwd: string;
@@ -144,7 +137,6 @@ interface Binding {
 	writer: PiEventWriter | undefined;
 	permission: PendingPermission | undefined;
 	pendingTools: Map<string, PendingPiTool>;
-	deferredImages: DeferredImages[];
 	lateResults: LateResult[];
 	toolBatchTimer: ReturnType<typeof setTimeout> | undefined;
 	bridge: PiMcpBridge | undefined;
@@ -276,7 +268,9 @@ export class AntigravityRuntime {
 			this.assertEpoch(epoch);
 			const session = await connection.newSession(process.cwd(), signal);
 			this.assertEpoch(epoch);
-			return sessionModels(session)?.availableModels ?? [];
+			// The legacy list keeps one entry per thinking-level variant; Antigravity
+			// 1.4's model selector folds them into families.
+			return session.models?.availableModels ?? sessionModels(session)?.availableModels ?? [];
 		} finally {
 			await connection.close();
 		}
@@ -615,17 +609,11 @@ export class AntigravityRuntime {
 				this.noteContinuationInstructions(binding, context);
 				binding.pendingContextCount = context.messages.length;
 				binding.pendingContextFingerprint = messagesFingerprint(context.messages);
-				// Antigravity shows an MCP image to the model only as an offloaded
-				// file path, so images go out as a prompt once the turn ends.
-				const deferImages = binding.initialize.agentCapabilities?.promptCapabilities?.image === true;
 				for (const { pending, message } of results) {
 					binding.pendingTools.delete(pending.invocation.id);
 					const result = message as ToolResultMessage;
-					const images = result.content.filter((block): block is ImageContent => block.type === "image");
-					const deferred = deferImages && images.length > 0;
-					if (deferred) binding.deferredImages.push({ toolName: pending.invocation.name, images });
 					if (pending.abandoned) binding.lateResults.push({ toolName: pending.invocation.name, result });
-					else pending.resolve(deferred ? deferredImageResult(result, images.length) : toMcpToolResult(result));
+					else pending.resolve(toMcpToolResult(result));
 				}
 				await this.awaitContinuation(binding, writer, options.signal);
 				return;
@@ -663,7 +651,7 @@ export class AntigravityRuntime {
 				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 			}
 			if (binding.modelId !== acpModelId) {
-				await binding.connection.setModel(binding.session.sessionId, acpModelId, options.signal);
+				await binding.connection.setModel(binding.session.sessionId, acpModelId, options.signal, resolveAcpThinking(model, acpModelId));
 				binding.modelId = acpModelId;
 			}
 			attachWriter(binding, writer);
@@ -702,7 +690,6 @@ export class AntigravityRuntime {
 				if (options.signal.aborted) onTurnAbort();
 			}
 			binding.toolTracker.clear();
-			binding.deferredImages = [];
 			binding.lateResults = [];
 			binding.updateQueue = Promise.resolve();
 			let response = await binding.connection.prompt(
@@ -714,15 +701,12 @@ export class AntigravityRuntime {
 				// Drain ordered async observers before closing the Pi content stream.
 				// Nothing below awaits, so a continuation cannot queue work unseen.
 				await binding.updateQueue;
-				if (
-					response.stopReason !== "end_turn" || binding.abortRequested ||
-					(binding.deferredImages.length === 0 && binding.lateResults.length === 0)
-				) break;
+				if (response.stopReason !== "end_turn" || binding.abortRequested || binding.lateResults.length === 0) break;
 				this.metrics.record(response, usageFromPrompt(response));
 				response = await binding.connection.prompt(
 					{
 						sessionId: binding.session.sessionId,
-						prompt: followUpPrompt(binding.lateResults.splice(0), binding.deferredImages.splice(0)),
+						prompt: followUpPrompt(binding.lateResults.splice(0)),
 					},
 					options.signal,
 				);
@@ -760,7 +744,6 @@ export class AntigravityRuntime {
 			if (completeTurn) cancelPiTools(binding, "Antigravity turn ended before Pi returned the tool result");
 			completeTurn?.();
 			binding.turnCompletion = undefined;
-			binding.deferredImages = [];
 			binding.lateResults = [];
 			binding.abortRequested = false;
 			binding.writer = undefined;
@@ -889,10 +872,11 @@ export class AntigravityRuntime {
 			const piOwnsTools =
 				toolOwner === "pi" && initialize.agentCapabilities?.mcpCapabilities?.http === true;
 			const meta: SessionMeta = {
-				agy: {
+				antigravity: {
 					disabledTools: piOwnsTools
 						? [...PI_OWNED_NATIVE_TOOLS, ...UNUSED_NATIVE_TOOLS]
 						: [...UNUSED_NATIVE_TOOLS],
+					mcpMaxOutputBytes: MCP_MAX_OUTPUT_BYTES,
 				},
 			};
 			const piSessionId = key.startsWith("sid:") ? key.slice(4) : undefined;
@@ -931,7 +915,7 @@ export class AntigravityRuntime {
 				throw new AntigravityAcpError("protocol", "Antigravity did not confirm the requested permission mode");
 			}
 			const currentModel = sessionModels(session)?.currentModelId;
-			if (currentModel !== acpModelId) await connection.setModel(session.sessionId, acpModelId, signal);
+			if (currentModel !== acpModelId) await connection.setModel(session.sessionId, acpModelId, signal, resolveAcpThinking(model, acpModelId));
 			this.assertEpoch(epoch);
 			if (mode !== this.permissionMode) throw new AntigravityAcpError("protocol", "Permission mode changed during session setup; retry the turn");
 			const createdBinding: Binding = {
@@ -952,7 +936,6 @@ export class AntigravityRuntime {
 				writer,
 				permission: undefined,
 				pendingTools: new Map(),
-				deferredImages: [],
 				lateResults: [],
 				toolBatchTimer: undefined,
 				bridge,
@@ -1349,11 +1332,38 @@ function toMcpToolResult(message: ToolResultMessage): CallToolResult {
 	return {
 		content: message.content.map((block) =>
 			block.type === "text"
-				? { type: "text" as const, text: block.text }
+				? { type: "text" as const, text: inlineToolText(block.text) }
 				: { type: "image" as const, data: block.data, mimeType: block.mimeType },
 		),
 		isError: message.isError,
 	};
+}
+
+/** Pi's read and bash page their own text. Text from any other tool over
+ * MAX_TEXT_RESULT_BYTES keeps its head inline and is saved in full, where the
+ * harness would otherwise cut it without saying where the rest is. */
+function inlineToolText(text: string): string {
+	if (Buffer.byteLength(text, "utf8") <= MAX_TEXT_RESULT_BYTES) return text;
+	const lines = text.split("\n");
+	let bytes = 0;
+	let shown = 0;
+	while (shown < lines.length) {
+		const next = Buffer.byteLength(lines[shown]!, "utf8") + 1;
+		if (bytes + next > MAX_TEXT_RESULT_BYTES - 1024) break;
+		bytes += next;
+		shown++;
+	}
+	const file = path.join(os.tmpdir(), `pi-antigravity-output-${crypto.randomUUID()}.txt`);
+	let rest: string;
+	try {
+		fs.writeFileSync(file, text);
+		rest = `Full output: ${file}. Read the rest with pi_read (offset=${shown + 1}).`;
+	} catch {
+		rest = "The rest could not be saved.";
+	}
+	return shown === 0
+		? `[Line 1 exceeds ${MAX_TEXT_RESULT_BYTES / 1024} KiB. ${rest}]`
+		: `${lines.slice(0, shown).join("\n")}\n\n[Showing lines 1-${shown} of ${lines.length} (${MAX_TEXT_RESULT_BYTES / 1024} KiB limit). ${rest}]`;
 }
 
 function handoffResult(): CallToolResult {
@@ -1367,21 +1377,8 @@ function handoffResult(): CallToolResult {
 	};
 }
 
-function deferredImageResult(message: ToolResultMessage, imageCount: number): CallToolResult {
-	const content = message.content.flatMap((block) =>
-		block.type === "text" ? [{ type: "text" as const, text: block.text }] : [],
-	);
-	content.push({
-		type: "text",
-		text:
-			`[${imageCount} image(s) from this result cannot be shown in a tool result. ` +
-			"They will arrive as the next user message. End your turn now with a brief text response, and without further tool calls, to receive them.]",
-	});
-	return { content, isError: message.isError };
-}
-
-/** Late Pi tool results and held-back images, sent after the turn ends. */
-function followUpPrompt(lateResults: LateResult[], images: DeferredImages[]): ContentBlock[] {
+/** Pi tool results that arrived after Antigravity abandoned the MCP call. */
+function followUpPrompt(lateResults: LateResult[]): ContentBlock[] {
 	const prompt: ContentBlock[] = lateResults.map(({ toolName, result }) => ({
 		type: "text",
 		text:
@@ -1389,18 +1386,7 @@ function followUpPrompt(lateResults: LateResult[], images: DeferredImages[]): Co
 			`${result.isError ? "It failed with" : "Its result"}:\n` +
 			result.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n"),
 	}));
-	if (images.length > 0) return [...prompt, ...deferredImagePrompt(images)];
 	prompt.push({ type: "text", text: "Continue the task using this result." });
-	return prompt;
-}
-
-function deferredImagePrompt(entries: DeferredImages[]): ContentBlock[] {
-	const prompt: ContentBlock[] = [];
-	for (const { toolName, images } of entries) {
-		prompt.push({ type: "text", text: `Image(s) returned by your ${toolName} tool call:` });
-		for (const image of images) prompt.push({ type: "image", data: image.data, mimeType: image.mimeType });
-	}
-	prompt.push({ type: "text", text: "Continue the task using these images." });
 	return prompt;
 }
 

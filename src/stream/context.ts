@@ -93,30 +93,24 @@ export function buildPromptParts(
 	return { prompt, messageCount: context.messages.length };
 }
 
-/** `pi_read` is the first read for every text file: it classifies the file by
- * its share of Chinese characters and routes large non-Chinese files to the
- * native `view_file`, keeping Chinese text out of `view_file`'s `\uXXXX`
- * escaping (see extensions/safe-read.ts). */
+/** Pi's read and bash page text at 45 KiB for Antigravity (see extensions/safe-read.ts). */
 export const PI_READ_DESCRIPTION =
-	"Read text files (inside or outside Active Workspaces) and images (png, jpg, gif, webp). " +
+	"Read text files and images (png, jpg, gif, webp) at any path. " +
 	"Arguments: path (string, required), offset (1-indexed start line, optional), limit (max lines, optional). " +
-	"Files up to 4 KiB return inline. Larger files return a summary (size, line count, Chinese share, next step) and a preview of up to 3 KiB; stop there if the preview is enough. " +
-	"For the rest, files with at least 10% Chinese characters list page offsets to read with pi_read in parallel; non-Chinese files name one view_file call (on the file itself inside Active Workspaces or App Data Directory, otherwise on a complete copy pi_read places in App Data Directory).";
+	"Text returns at most 2000 lines or 45 KiB per call; a longer file ends with the offset to continue from.";
+export const PI_BASH_DESCRIPTION =
+	"Execute bash commands in the current working directory. " +
+	"Arguments: command (string, required), timeout (seconds, optional). " +
+	"Output returns its last 2000 lines or 45 KiB; longer output names a file holding all of it, readable with pi_read.";
 export const PI_READ_EXAMINE_RULE =
-	"- Use pi_read first to examine any text file instead of cat or sed, inside or outside Active Workspaces; follow its routing to parallel pi_read pages (Chinese) or view_file (non-Chinese).\n" +
-	"- Use pi_read to inspect images or screenshots (png, jpg, gif, webp).";
+	"- Use pi_read to examine files and images instead of cat or sed.";
 export const PI_READ_FALLBACK_RULE =
-	"- Use pi_read to inspect images or screenshots (png, jpg, gif, webp) and as the first read of any text file; follow its routing to parallel pi_read pages (Chinese) or view_file (non-Chinese).";
+	"- Use pi_read to examine files and images.";
 export const PI_READ_ROUTING_RULE =
-	"- pi_read is fully defined in these instructions, including its arguments (path, offset, limit) and usage. Call it directly without reading its lazy-loaded schema file first. " +
-	"When pi_read advertises parallel page offsets, call pi_read for all of them in parallel in a single turn. " +
-	"When pi_read names a view_file call for a non-Chinese file, make that single view_file call (on the file itself, or on its copy in App Data Directory). Skip both when the pi_read preview already answers the question.";
+	"- pi_read (path, offset, limit) and pi_bash (command, timeout) are fully defined in these instructions, including their arguments and usage. Call them directly without reading their lazy-loaded schema file first.";
 
 /**
  * Adapts Pi's system instructions for the Antigravity ACP environment.
- * When Pi owns tools, read handles images/screenshots and is the first read
- * of every text file; it pages Chinese files in parallel and routes
- * non-Chinese files to the native view_file.
  * Bridged Pi tools are prefixed with `pi_` to match Antigravity MCP bridge names.
  */
 export function adaptInstructionsForAntigravity(instructions: string): string {
@@ -140,11 +134,14 @@ export function adaptInstructionsForAntigravity(instructions: string): string {
 					`- pi_read: ${PI_READ_DESCRIPTION}`,
 				);
 			}
-			if (!content.includes("view_file")) {
-				content = `${content.trimEnd()}\n- view_file: View the contents of a file within the allowed directories (native Antigravity text file reader, inline and fast)\n`;
+			if (content.includes("- bash:")) {
+				content = content.replace(
+					/-\s+bash:\s*(.*)/u,
+					`- pi_bash: ${PI_BASH_DESCRIPTION}`,
+				);
 			}
 			content = content.replace(/-\s+([a-zA-Z0-9_-]+):/gu, (match, name: string) => {
-				if (name.startsWith("pi_") || name === "view_file") return match;
+				if (name.startsWith("pi_")) return match;
 				return `- pi_${name}:`;
 			});
 			return `<tools>${content}</tools>`;
@@ -164,7 +161,7 @@ export function adaptInstructionsForAntigravity(instructions: string): string {
 					"- Use read to examine files instead of cat or sed.",
 					PI_READ_EXAMINE_RULE,
 				);
-			} else if (!content.includes("Use pi_read to inspect images") && (adapted.includes("pi_read:") || adapted.includes("- read:"))) {
+			} else if (!content.includes("Use pi_read to examine") && (adapted.includes("pi_read:") || adapted.includes("- read:"))) {
 				content = `${content.trimEnd()}\n${PI_READ_FALLBACK_RULE}\n`;
 			}
 			content = content.replace(/\bUse bash\b/gu, "Use pi_bash");
@@ -188,9 +185,11 @@ export function adaptInstructionsForAntigravity(instructions: string): string {
 	}
 
 	// Antigravity's own guidance has the model consult a schema file before
-	// calling a lazy-loaded MCP tool. pi_read's projected definition above
-	// already carries its arguments and usage, so that round trip is wasted.
-	if (adapted.includes("- pi_read:") && !adapted.includes("lazy-loaded schema file")) {
+	// calling a lazy-loaded MCP tool. pi_read and pi_bash's projected definitions
+	// above already carry their arguments and usage, so that round trip is wasted.
+	// (Eager MCP loading would avoid it too, but drops the tool-call _meta that
+	// identifies bridged Pi calls.)
+	if ((adapted.includes("- pi_read:") || adapted.includes("- pi_bash:")) && !adapted.includes("lazy-loaded schema file")) {
 		const rule = PI_READ_ROUTING_RULE;
 		adapted = adapted.includes("</rules>")
 			? adapted.replace(/<\/rules>/u, `${rule}\n</rules>`)

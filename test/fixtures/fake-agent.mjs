@@ -7,9 +7,12 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 const scenario = process.argv[2];
-const modern = scenario?.startsWith("config-options");
+// "thinking-levels" mirrors Antigravity 1.4: the model selector lists families
+// with a separate thinking_level selector, and the legacy list keeps variants.
+const thinkingLevels = scenario === "thinking-levels";
+const modern = scenario?.startsWith("config-options") || thinkingLevels;
 const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
-let model = "auto";
+let model = thinkingLevels ? "gemini-flash-high" : "auto";
 let mode = "default";
 let permissionPromptId;
 let hangingPromptId;
@@ -149,7 +152,17 @@ for await (const line of rl) {
 		send({
 			jsonrpc: "2.0",
 			id,
-			result: modern ? { sessionId: "fake-session", configOptions: sessionConfigOptions() } : {
+			result: thinkingLevels ? {
+				sessionId: "fake-session",
+				configOptions: sessionConfigOptions(),
+				models: {
+					currentModelId: model,
+					availableModels: ["high", "medium", "low"].map((level) => ({
+						modelId: `gemini-flash-${level}`,
+						name: `Gemini Flash (${level[0].toUpperCase()}${level.slice(1)})`,
+					})),
+				},
+			} : modern ? { sessionId: "fake-session", configOptions: sessionConfigOptions() } : {
 				sessionId: "fake-session",
 				modes: sessionModes(),
 				models: {
@@ -174,6 +187,8 @@ for await (const line of rl) {
 	} else if (method === "session/set_config_option") {
 		selectionMethods.push(`set_config_option:${params.configId}=${params.value}`);
 		if (params.configId === "model-selector") model = params.value;
+		else if (thinkingLevels && params.configId === "model") model = params.value === "gemini-flash" ? `gemini-flash-${model.split("-").at(-1)}` : params.value;
+		else if (thinkingLevels && params.configId === "thinking_level") model = `gemini-flash-${params.value}`;
 		else if (params.configId === "permission-selector") {
 			if (scenario !== "config-options-ignored-mode") mode = params.value;
 		}
@@ -400,6 +415,17 @@ function sessionModes(restored = false) {
 }
 
 function sessionConfigOptions() {
+	if (thinkingLevels) {
+		const level = model.split("-").at(-1);
+		return [
+			{ id: "model", name: "Model", category: "model", type: "select", currentValue: "gemini-flash",
+				options: [{ value: "gemini-flash", name: "Gemini Flash" }] },
+			{ id: "thinking_level", name: "Thinking Level", category: "thought_level", type: "select", currentValue: level,
+				options: ["low", "medium", "high"].map((value) => ({ value, name: value })) },
+			{ id: "permission-selector", name: "Permissions", category: "mode", type: "select", currentValue: mode,
+				options: ["default", "auto_edit", "yolo"].map((value) => ({ value, name: value })) },
+		];
+	}
 	return [
 		{ id: "model-selector", name: "Model", category: "model", type: "select", currentValue: model,
 			options: [{ group: "google", name: "Google", options: [
@@ -435,7 +461,7 @@ async function invokeMcpTool(server, text, abandonAfterMs) {
 			undefined,
 			abandonAfterMs === undefined ? undefined : { timeout: abandonAfterMs },
 		);
-		return result.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+		return result.content.map((block) => block.type === "image" ? `[image ${block.mimeType} ${block.data}]` : block.text).join("\n");
 	} finally {
 		await client.close();
 	}

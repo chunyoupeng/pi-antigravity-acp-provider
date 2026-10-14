@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { AntigravityAcpConnection } from "../src/acp/connection.js";
 import { AcpSessionStore } from "../src/acp/session-store.js";
 import type { ToolOwner } from "../src/config.js";
+import { MCP_MAX_OUTPUT_BYTES, projectModels } from "../src/models.js";
 import { AntigravityRuntime, PI_OWNED_NATIVE_TOOLS, PI_TOOL_DESCRIPTIONS, UNUSED_NATIVE_TOOLS } from "../src/runtime.js";
 
 const fakeAgent = fileURLToPath(new URL("./fixtures/fake-agent.mjs", import.meta.url));
@@ -56,7 +57,7 @@ describe("Pi takeover of Antigravity capabilities", () => {
 		const runtime = runtimeFor("default");
 		try {
 			const echoed = JSON.parse((await ask(runtime, "inspect meta")).text);
-			expect(echoed.meta.new).toEqual({ agy: { disabledTools: [...PI_OWNED_NATIVE_TOOLS, ...UNUSED_NATIVE_TOOLS] } });
+			expect(echoed.meta.new).toEqual({ antigravity: { disabledTools: [...PI_OWNED_NATIVE_TOOLS, ...UNUSED_NATIVE_TOOLS], mcpMaxOutputBytes: MCP_MAX_OUTPUT_BYTES } });
 			expect(echoed.clientCapabilities.fs).toEqual({ readTextFile: false, writeTextFile: false });
 		} finally {
 			await runtime.close();
@@ -67,7 +68,7 @@ describe("Pi takeover of Antigravity capabilities", () => {
 		const runtime = runtimeFor("default", "native");
 		try {
 			const echoed = JSON.parse((await ask(runtime, "inspect meta")).text);
-			expect(echoed.meta.new).toEqual({ agy: { disabledTools: [...UNUSED_NATIVE_TOOLS] } });
+			expect(echoed.meta.new).toEqual({ antigravity: { disabledTools: [...UNUSED_NATIVE_TOOLS], mcpMaxOutputBytes: MCP_MAX_OUTPUT_BYTES } });
 			expect(echoed.clientCapabilities.fs).toEqual({ readTextFile: true, writeTextFile: true });
 		} finally {
 			await runtime.close();
@@ -97,6 +98,30 @@ describe("Pi takeover of Antigravity capabilities", () => {
 			const { message } = await ask(runtime, "report usage");
 			expect(message.usage).toMatchObject({ input: 1234, output: 0, totalTokens: 1234 });
 			expect((await runtime.snapshot()).metrics.latestContext).toEqual({ used: 1234, size: 100000 });
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("discovers thinking levels and selects them through the family and thinking_level selectors", async () => {
+		const runtime = runtimeFor("thinking-levels");
+		try {
+			const [flash] = projectModels(await runtime.discoverModels("test-key"));
+			expect(flash).toMatchObject({ id: "gemini-flash", reasoning: true });
+			expect(flash?.thinkingLevelMap).toMatchObject({ low: "gemini-flash-low", medium: "gemini-flash-medium", high: "gemini-flash-high" });
+			const writer = runtime.stream(
+				flash!,
+				normalizeContext({ messages: [{ role: "user", content: "inspect meta", timestamp: 1 }] }),
+				{ apiKey: "test-key", reasoning: "low" },
+			);
+			for await (const _event of writer.stream) void _event;
+			expect(writer.message.stopReason).toBe("stop");
+			const block = writer.message.content.find((item) => item.type === "text");
+			expect(JSON.parse(block?.type === "text" ? block.text : "").selectionMethods).toEqual([
+				"set_config_option:permission-selector=yolo",
+				"set_config_option:model=gemini-flash",
+				"set_config_option:thinking_level=low",
+			]);
 		} finally {
 			await runtime.close();
 		}
@@ -132,7 +157,7 @@ describe("Pi takeover of Antigravity capabilities", () => {
 			await runtime.attachSession("pi-session", "listed-session");
 			const echoed = JSON.parse((await ask(runtime, "inspect meta", "pi-session")).text);
 			expect(echoed.sessionId).toBe("listed-session");
-			expect(echoed.meta.resume).toEqual({ agy: { disabledTools: [...PI_OWNED_NATIVE_TOOLS, ...UNUSED_NATIVE_TOOLS] } });
+			expect(echoed.meta.resume).toEqual({ antigravity: { disabledTools: [...PI_OWNED_NATIVE_TOOLS, ...UNUSED_NATIVE_TOOLS], mcpMaxOutputBytes: MCP_MAX_OUTPUT_BYTES } });
 		} finally {
 			await runtime.close();
 		}
@@ -157,12 +182,16 @@ describe("Pi takeover of Antigravity capabilities", () => {
 		}
 	});
 
-	it("steers Pi's read to images and skill files when Pi owns tools", async () => {
+	it("steers Pi's read and bash descriptions when Pi owns tools", async () => {
 		const tools = [
 			{ name: "read", description: "Read a file", parameters: Type.Object({ path: Type.String() }) },
+			{ name: "bash", description: "Run a shell command", parameters: Type.Object({ command: Type.String() }) },
 			{ name: "echo", description: "Echo text", parameters: Type.Object({ text: Type.String() }) },
 		];
-		for (const [owner, read] of [["pi", PI_TOOL_DESCRIPTIONS.read], ["native", "Read a file"]] as const) {
+		for (const [owner, read, bash] of [
+			["pi", PI_TOOL_DESCRIPTIONS.read, PI_TOOL_DESCRIPTIONS.bash],
+			["native", "Read a file", "Run a shell command"],
+		] as const) {
 			const runtime = runtimeFor("default", owner);
 			try {
 				const writer = runtime.stream(
@@ -174,6 +203,7 @@ describe("Pi takeover of Antigravity capabilities", () => {
 				const block = writer.message.content.find((item) => item.type === "text");
 				expect(JSON.parse(block?.type === "text" ? block.text : "")).toEqual([
 					{ name: "pi_read", description: read },
+					{ name: "pi_bash", description: bash },
 					{ name: "pi_echo", description: "Echo text" },
 				]);
 			} finally {
