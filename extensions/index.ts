@@ -40,7 +40,6 @@ import { AcpSessionStore } from "../src/acp/session-store.js";
 import { runSetupWizard } from "../src/wizard.js";
 import { fetchUsage, formatUsage } from "../src/usage.js";
 import { registerToolActivity } from "./tool-activity.js";
-import { createSafeReadToolDefinition } from "./safe-read.js";
 
 // Pi may start several sessions in one process; prune once.
 let historyPruned = false;
@@ -52,7 +51,6 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 	);
 	const { provider } = createAntigravityProvider(runtime);
 	pi.registerProvider(provider);
-	pi.registerTool(createSafeReadToolDefinition(process.cwd()));
 
 	pi.registerTool({
 		name: PERMISSION_TOOL_NAME,
