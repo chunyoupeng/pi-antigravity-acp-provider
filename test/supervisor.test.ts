@@ -438,6 +438,28 @@ describe("applyDefaultTlsEnvironment", () => {
 	});
 });
 
+describe("server stderr log", () => {
+	it("appends redacted, pid-tagged stderr lines including an unterminated tail", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "antigravity-acp-log-"));
+		const logPath = path.join(directory, "logs", "acp-server.log");
+		const script =
+			'process.stderr.write("Wiping credentials\\nrefresh_token=1//secretsecretsecret\\n"); process.stderr.write("tail without newline");';
+		const child = new AntigravityProcess({ cwd: process.cwd(), command: process.execPath, args: ["-e", script], logPath });
+		await child.exited;
+		let log = "";
+		for (let attempt = 0; attempt < 50 && !log.includes(" exit pid="); attempt += 1) {
+			await delay(20);
+			log = await fs.readFile(logPath, "utf8").catch(() => "");
+		}
+		const pid = child.pid;
+		expect(log).toMatch(new RegExp(`start pid=${pid} cwd=`));
+		expect(log).toContain(`[${pid}] Wiping credentials\n`);
+		expect(log).toContain(`[${pid}] tail without newline\n`);
+		expect(log).toContain(`exit pid=${pid} code=0`);
+		expect(log).not.toContain("secretsecretsecret");
+	});
+});
+
 describe.skipIf(process.platform === "win32")("parent-death supervisor", () => {
 	it("escalates from TERM to KILL for a stuck direct child", async () => {
 		const child = new AntigravityProcess({

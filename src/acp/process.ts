@@ -4,11 +4,14 @@ import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
+import { resolveConfigRoot } from "../config.js";
 import { resolveAntigravityAcpLaunch } from "./antigravity.js";
 import { redact } from "./errors.js";
 import { applyAcpProxyEnvironment } from "./proxy.js";
 import { applyCredentialStorageEnvironment, type CredentialStorageOptions } from "./credential-storage.js";
 const STDERR_LIMIT = 16 * 1024;
+// Rotated once to `.1` when a new server starts past this size.
+const SERVER_LOG_LIMIT = 5 * 1024 * 1024;
 // Longer than supervisor.mjs's 750 ms agent-tree escalation window.
 const KILL_GRACE_MS = 1_500;
 let nextGeneration = 1;
@@ -22,6 +25,9 @@ export interface AntigravityProcessOptions {
 	/** Overrides the credential-storage resolution seams (keychain probe and
 	 * token path) in tests; production callers leave this unset. */
 	credentialStorage?: Omit<CredentialStorageOptions, "env">;
+	/** Appends the child's redacted stderr here. Defaults to
+	 * `resolveServerLogPath()` for the real server and to no log otherwise. */
+	logPath?: string;
 }
 
 export interface ProcessExit {
@@ -32,6 +38,12 @@ export interface ProcessExit {
 
 export function resolveSupervisorEntry(): string {
 	return fileURLToPath(new URL("./supervisor.mjs", import.meta.url));
+}
+
+/** Persistent server stderr, so auth events such as "Wiping credentials" or a
+ * failed refresh survive the process that logged them. */
+export function resolveServerLogPath(): string {
+	return path.join(resolveConfigRoot(), "logs", "acp-server.log");
 }
 
 export function resolveAntigravityAcpEntry(): string {
@@ -125,6 +137,8 @@ export class AntigravityProcess {
 	readonly output: WritableStream<Uint8Array>;
 	readonly exited: Promise<ProcessExit>;
 	private stderr = "";
+	private log: fs.WriteStream | undefined;
+	private logPartial = "";
 	private ignoredStdoutNoise = 0;
 	private settled = false;
 	private closing?: Promise<void>;
@@ -132,6 +146,7 @@ export class AntigravityProcess {
 	constructor(options: AntigravityProcessOptions) {
 		let command: string;
 		let args: string[];
+		let logPath = options.logPath;
 		if (options.command) {
 			command = options.command;
 			args = options.args ?? [];
@@ -140,6 +155,7 @@ export class AntigravityProcess {
 			const launch = options.entryPath
 				? { command: nodeBinary, args: [options.entryPath, ...(options.args ?? [])] }
 				: resolveAntigravityAcpLaunch();
+			if (!options.entryPath) logPath ??= resolveServerLogPath();
 			command = nodeBinary;
 			args = [resolveSupervisorEntry(), "--command", launch.command, ...launch.args];
 		}
@@ -161,9 +177,11 @@ export class AntigravityProcess {
 			detached: process.platform !== "win32",
 		});
 		this.child = child;
+		if (logPath) this.log = openServerLog(logPath, `${new Date().toISOString()} start pid=${child.pid ?? "?"} cwd=${path.resolve(options.cwd)}`);
 		child.stderr.setEncoding("utf8");
 		child.stderr.on("data", (chunk: string) => {
 			this.stderr = redact((this.stderr + chunk).slice(-STDERR_LIMIT));
+			this.appendLog(chunk);
 		});
 		child.once("error", (cause) => {
 			this.finish(resolveExit, null, null, `spawn failed: ${cause.message}`);
@@ -186,6 +204,13 @@ export class AntigravityProcess {
 
 	get ignoredStdoutNoiseLines(): number {
 		return this.ignoredStdoutNoise;
+	}
+
+	private appendLog(chunk: string): void {
+		if (!this.log) return;
+		const lines = (this.logPartial + chunk).split("\n");
+		this.logPartial = lines.pop() ?? "";
+		if (lines.length > 0) this.log.write(lines.map((line) => `[${this.child.pid}] ${redact(line)}\n`).join(""));
 	}
 
 	recordCompatibilityNoise(): void {
@@ -243,7 +268,30 @@ export class AntigravityProcess {
 	): void {
 		if (this.settled) return;
 		this.settled = true;
+		if (this.log) {
+			this.appendLog(this.logPartial ? "\n" : "");
+			this.log.end(`${new Date().toISOString()} exit pid=${this.child.pid ?? "?"} code=${code} signal=${signal}\n`);
+			this.log = undefined;
+		}
 		resolve({ code, signal, stderrTail: redact(stderrTail) });
+	}
+}
+
+function openServerLog(file: string, header: string): fs.WriteStream | undefined {
+	try {
+		fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+		try {
+			if (fs.statSync(file).size > SERVER_LOG_LIMIT) fs.renameSync(file, `${file}.1`);
+		} catch {
+			// No log yet.
+		}
+		const stream = fs.createWriteStream(file, { flags: "a", mode: 0o600 });
+		// Logging is diagnostic only; a full disk must not break the session.
+		stream.on("error", () => undefined);
+		stream.write(`${header}\n`);
+		return stream;
+	} catch {
+		return undefined;
 	}
 }
 
