@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { resolveAntigravityAcpLaunch } from "./antigravity.js";
 import { redact } from "./errors.js";
 import { applyAcpProxyEnvironment } from "./proxy.js";
+import { applyCredentialStorageEnvironment, type CredentialStorageOptions } from "./credential-storage.js";
 const STDERR_LIMIT = 16 * 1024;
 // Longer than supervisor.mjs's 750 ms agent-tree escalation window.
 const KILL_GRACE_MS = 1_500;
@@ -18,6 +19,9 @@ export interface AntigravityProcessOptions {
 	command?: string;
 	args?: string[];
 	env?: NodeJS.ProcessEnv;
+	/** Overrides the credential-storage resolution seams (keychain probe and
+	 * token path) in tests; production callers leave this unset. */
+	credentialStorage?: Omit<CredentialStorageOptions, "env">;
 }
 
 export interface ProcessExit {
@@ -144,7 +148,10 @@ export class AntigravityProcess {
 			resolveExit = resolve;
 		});
 
-		const env = applyDefaultTlsEnvironment(applyAcpProxyEnvironment(options.env ?? process.env));
+		const env = applyCredentialStorageEnvironment(
+			applyDefaultTlsEnvironment(applyAcpProxyEnvironment(options.env ?? process.env)),
+			options.credentialStorage ?? {},
+		);
 		const child = spawn(command, args, {
 			cwd: path.resolve(options.cwd),
 			env,

@@ -262,16 +262,48 @@ describe("abort cleanup", () => {
 	});
 });
 
+describe("context handoff transport", () => {
+	it("sends active text/images and bounded labelled results through the ACP child", async () => {
+		const { runtime, entries } = setup();
+		const image = { type: "image" as const, data: "aGVsbG8=", mimeType: "image/png" };
+		const context = normalizeContext({ messages: [
+			{ role: "system", content: "BASE_RULE", sections: { rule: "OLD_RULE" }, timestamp: 0 },
+			{ role: "user", content: [{ type: "text", text: "ACTIVE_REQUEST" }, image], timestamp: 1 },
+			{ role: "assistant", content: [{ type: "toolCall", id: "external-call", name: "read", arguments: { path: "a.ts" } }],
+				api: model.api, provider: "other-provider", model: "external", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "toolUse", timestamp: 2 },
+			{ role: "toolResult", toolCallId: "external-call", toolName: "read", content: [{ type: "text", text: "x".repeat(40_000) + "RESULT_TAIL" }], isError: false, timestamp: 3 },
+			{ role: "system", content: "NEW_RULE", sections: { rule: "UPDATED_RULE" }, timestamp: 4 },
+		] });
+		const response = await drain(runtime.stream({ ...model, input: ["text", "image"] }, context, { sessionId: "handoff", apiKey: "test-key" }));
+		expect(response.stopReason).toBe("stop");
+		const prompts = entries().filter((entry) => entry.method === "session/prompt");
+		expect(prompts).toHaveLength(1);
+		const prompt = prompts[0]!.prompt as Array<{ type: string; resource?: { text?: string }; text?: string }>;
+		expect(prompt).toContainEqual({ type: "text", text: "ACTIVE_REQUEST" });
+		expect(prompt).toContainEqual(image);
+		const reconstruction = prompt[0]!.resource!.text!;
+		expect(reconstruction).toContain("BASE_RULE");
+		expect(reconstruction).toContain("NEW_RULE");
+		expect(reconstruction).toContain("UPDATED_RULE");
+		expect(reconstruction).not.toContain("OLD_RULE");
+		expect(reconstruction).toContain("[tool call read id=external-call]");
+		expect(reconstruction).toContain("## Tool result (read id=external-call)");
+		expect(reconstruction).toContain("RESULT_TAIL");
+		expect(reconstruction.slice(reconstruction.indexOf("# Prior conversation")).length).toBeLessThanOrEqual(32_000);
+	});
+});
+
 describe("tool projection diagnostics", () => {
 	it.each([undefined, "no-mcp"])("reports omitted tools and their reasons (agent=%s)", async (scenario) => {
 		const { runtime } = setup(scenario);
 		const writer = runtime.stream(model, { tools: [{ name: "unsupported", description: "bad", parameters: Type.String() }], messages: [user("hello")] }, { sessionId: "omissions", apiKey: "test-key" });
 		await drain(writer);
-		expect((await runtime.snapshot()).processes[0]?.omittedTools).toEqual([{ name: "unsupported", reason: expect.stringContaining(scenario ? "MCP over HTTP" : "bounded object") }]);
+		expect((await runtime.snapshot()).processes[0]?.omittedTools).toEqual([{ name: "unsupported", reason: expect.stringContaining(scenario ? "MCP over HTTP" : "not_object") }]);
 	});
 
 	it("revalidates changed tools before a continuation early return", async () => {
-		const { runtime, connections } = setup();
+		const { runtime, connections, entries } = setup();
 		const first = await drain(runtime.stream(model, { tools, messages: [user("use bridge")] }, { sessionId: "changed-tools", apiKey: "test-key" }));
 		const call = first.content.find((block) => block.type === "toolCall");
 		if (call?.type !== "toolCall") throw new Error("missing tool");
@@ -280,6 +312,10 @@ describe("tool projection diagnostics", () => {
 		] }, { sessionId: "changed-tools", apiKey: "test-key" }));
 		expect(next.stopReason).toBe("stop"); expect(connections).toHaveLength(2);
 		expect((await runtime.snapshot()).processes[0]?.omittedTools[0]?.name).toBe("unprojectable");
+		const prompts = entries().filter((entry) => entry.method === "session/prompt");
+		expect(prompts).toHaveLength(2);
+		expect(prompts[1]?.prompt).toContainEqual({ type: "text", text: "use bridge" });
+		expect(JSON.stringify(prompts[1]?.prompt)).toContain(`tool call echo id=${call.id}`);
 	});
 
 	it("names all capped tools, excludes the permission broker and fingerprints descriptions/omissions", () => {

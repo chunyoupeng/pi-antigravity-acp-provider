@@ -1,6 +1,6 @@
 {
   "name": "@chunyoupeng/pi-antigravity-acp-provider",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "Google Antigravity ACP provider for Pi where Pi runs the tools; fork of zacbemis/pi-antigravity-acp-provider",
   "type": "module",
   "license": "MIT",

@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
 	AntigravityProcess,
@@ -23,6 +23,7 @@ const envDumpFixture = fileURLToPath(new URL("./fixtures/env-dump-agent.mjs", im
 const cleanupPids = new Set<number>();
 
 afterEach(() => {
+	vi.unstubAllEnvs();
 	for (const pid of cleanupPids) {
 		try {
 			process.kill(pid, "SIGKILL");
@@ -220,6 +221,87 @@ describe("applyDefaultTlsEnvironment", () => {
 		expect(reported.sslCertFile).toBe("/custom/integration-ca.crt");
 	});
 
+	it("pins the spawned child to the secure-file credential backend when the keychain entry is missing", async () => {
+		// Integration check for the real spawn path: the macOS default is the
+		// login keychain, so a refreshable token file the keychain does not
+		// mirror would otherwise trigger interactive consent in every process.
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "antigravity-credential-"));
+		const tokenPath = path.join(directory, "acp_token.json");
+		await fs.writeFile(tokenPath, '{"refresh_token":"fixture"}');
+		const baseEnv: NodeJS.ProcessEnv = { ...process.env };
+		delete baseEnv.AGY_ACP_FORCE_FILE_STORAGE;
+		const child = new AntigravityProcess({
+			cwd: process.cwd(),
+			entryPath: envDumpFixture,
+			args: [],
+			env: baseEnv,
+			credentialStorage: { platform: "darwin", tokenPath, keychainEntry: () => false },
+		});
+		const exit = await Promise.race([
+			child.exited,
+			delay(2_000).then(() => {
+				throw new Error("env-dump agent did not exit");
+			}),
+		]);
+		expect(exit.code).toBe(0);
+		const reported = JSON.parse(exit.stderrTail) as { forceFileStorage: string | null };
+		expect(reported.forceFileStorage).toBe("1");
+	});
+
+	it("leaves the child credential backend untouched for a populated keychain", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "antigravity-credential-"));
+		const tokenPath = path.join(directory, "acp_token.json");
+		await fs.writeFile(tokenPath, '{"refresh_token":"fixture"}');
+		const baseEnv: NodeJS.ProcessEnv = { ...process.env };
+		delete baseEnv.AGY_ACP_FORCE_FILE_STORAGE;
+		const child = new AntigravityProcess({
+			cwd: process.cwd(),
+			entryPath: envDumpFixture,
+			args: [],
+			env: baseEnv,
+			credentialStorage: { platform: "darwin", tokenPath, keychainEntry: () => true },
+		});
+		const exit = await Promise.race([
+			child.exited,
+			delay(2_000).then(() => {
+				throw new Error("env-dump agent did not exit");
+			}),
+		]);
+		expect(exit.code).toBe(0);
+		const reported = JSON.parse(exit.stderrTail) as { forceFileStorage: string | null };
+		expect(reported.forceFileStorage).toBeNull();
+	});
+
+	it("pins the spawned child from its own GEMINI_HOME, not the parent environment", async () => {
+		// The child can run with a store the launching process never sees; the
+		// decision must follow the environment the child actually receives.
+		const childHome = await fs.mkdtemp(path.join(os.tmpdir(), "antigravity-child-home-"));
+		const acpDirectory = path.join(childHome, "antigravity-acp");
+		await fs.mkdir(acpDirectory, { recursive: true });
+		await fs.writeFile(path.join(acpDirectory, "acp_token.json"), '{"refresh_token":"fixture"}');
+		const parentHome = await fs.mkdtemp(path.join(os.tmpdir(), "antigravity-parent-home-"));
+		vi.stubEnv("GEMINI_HOME", parentHome);
+		const baseEnv: NodeJS.ProcessEnv = { ...process.env, GEMINI_HOME: childHome };
+		delete baseEnv.AGY_ACP_FORCE_FILE_STORAGE;
+		delete baseEnv.GEMINI_API_KEY;
+		const child = new AntigravityProcess({
+			cwd: process.cwd(),
+			entryPath: envDumpFixture,
+			args: [],
+			env: baseEnv,
+			credentialStorage: { platform: "darwin", keychainEntry: () => false },
+		});
+		const exit = await Promise.race([
+			child.exited,
+			delay(2_000).then(() => {
+				throw new Error("env-dump agent did not exit");
+			}),
+		]);
+		expect(exit.code).toBe(0);
+		const reported = JSON.parse(exit.stderrTail) as { forceFileStorage: string | null };
+		expect(reported.forceFileStorage).toBe("1");
+	});
+
 	it("injects a detected fallback bundle when SSL_CERT_FILE is unset", async () => {
 		// Simulate an environment with no SSL_CERT_FILE (NixOS/minimal Linux) by
 		// passing a filtered env; applyDefaultTlsEnvironment must detect the
@@ -294,7 +376,13 @@ describe("applyDefaultTlsEnvironment", () => {
 					NIX_SSL_CERT_FILE: certFile,
 				};
 				delete env.SSL_CERT_FILE;
-				const child = new AntigravityProcess({ cwd: process.cwd(), entryPath: envDumpFixture, env });
+				delete env.AGY_ACP_FORCE_FILE_STORAGE;
+				const child = new AntigravityProcess({
+					cwd: process.cwd(),
+					entryPath: envDumpFixture,
+					env,
+					credentialStorage: { platform: "linux" },
+				});
 				try {
 					const exit = await Promise.race([
 						child.exited,
@@ -303,7 +391,7 @@ describe("applyDefaultTlsEnvironment", () => {
 						}),
 					]);
 					expect(exit.code).toBe(0);
-					expect(JSON.parse(exit.stderrTail)).toEqual({ sslCertFile: certFile });
+					expect(JSON.parse(exit.stderrTail)).toEqual({ sslCertFile: certFile, forceFileStorage: null });
 				} finally {
 					await child.close();
 				}

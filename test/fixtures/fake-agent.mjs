@@ -205,6 +205,10 @@ for await (const line of rl) {
 			continue;
 		}
 		const text = params.prompt.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+		// Handoffs carry the original request explicitly, but tell the agent not
+		// to repeat completed actions. Model that instruction rather than treating
+		// scenario keywords in the replayed request as a fresh tool invocation.
+		const continuing = params.prompt.some((block) => block.type === "text" && block.text.startsWith("Continue the current Pi user request"));
 		if (scenario === "mode-drift" || scenario === "config-options-mode-drift") {
 			mode = "yolo";
 			send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId,
@@ -273,10 +277,12 @@ for await (const line of rl) {
 			void listMcpTools(mcpServer).then((tools) => reply(params.sessionId, id, JSON.stringify(tools)));
 			continue;
 		}
-		if (text.includes("Continue from the reconstructed Pi context")) {
+		if (text.includes("Continue from the reconstructed Pi context") || continuing) {
 			const resources = params.prompt.filter((block) => block.type === "resource").map((block) => block.resource.text);
-			reply(params.sessionId, id, resources.join("\n"));
-			continue;
+			if (resources.length > 0) {
+				reply(params.sessionId, id, resources.join("\n"));
+				continue;
+			}
 		}
 		if (text.includes("after its MCP request had already returned")) {
 			reply(params.sessionId, id, text);
@@ -290,7 +296,7 @@ for await (const line of rl) {
 			setTimeout(() => reply(params.sessionId, id, "gave up waiting"), timeout[1] ? 1_000 : 300);
 			continue;
 		}
-		if (text.includes("bridge") && mcpServer) {
+		if (!continuing && text.includes("bridge") && mcpServer) {
 			bridgePromptId = id;
 			const invocation = text.includes("parallel")
 				? Promise.all([
@@ -318,7 +324,7 @@ for await (const line of rl) {
 			});
 			continue;
 		}
-		if (text.includes("hang")) {
+		if (!continuing && text.includes("hang")) {
 			hangingPromptId = id;
 			continue;
 		}
@@ -340,7 +346,7 @@ for await (const line of rl) {
 			});
 			continue;
 		}
-		if (text.includes("permission")) {
+		if (!continuing && text.includes("permission")) {
 			permissionPromptId = id;
 			send({
 				jsonrpc: "2.0",

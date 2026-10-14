@@ -305,13 +305,13 @@ Pi exposes TypeBox/JSON-schema tool definitions, while Gemini's function declara
 
 Projection rules:
 
-1. Dereference only bounded, acyclic local references.
-2. Preserve object properties, descriptions, required lists, enums, primitive/array/object shapes, and safe numeric/string constraints supported by the pinned Gemini build.
-3. Set or normalize `additionalProperties` according to observed Gemini requirements; never widen a constrained schema silently.
-4. Reject recursion, ambiguous unions, executable/custom validators, unsupported keywords/formats, excessive depth/property count, and oversized descriptions.
-5. Omit rejected tools from MCP `tools/list`, record tool name plus keyword/reason in diagnostics, and optionally warn once in UI. Never let one marketplace schema fail the whole Gemini session.
-6. Validate MCP call arguments again against the original Pi schema before emitting the Pi tool call; the sanitized model schema is not the authorization boundary.
-7. Fixture-test representative built-in and marketplace schemas against the real bundled CLI/model API.
+1. Project a conservative JSON-schema subset; reject references and other unsupported keywords, including when nested, rather than dropping their constraints.
+2. Preserve object properties, descriptions, required lists, scalar `enum`/`const` values (including false, zero and null), primitive/array/object shapes, and supported numeric/string/collection constraints. Add a singleton enum alongside a const for consumers which ignore const.
+3. Preserve supported `additionalProperties` constraints. Keep empty/typeless nested schemas as supplied; never infer a contradictory type or silently widen a constrained schema.
+4. Reject executable/custom validators, proxies, accessors, unsafe property names, malformed keyword values and cycles. Bound schema depth to 16, traversal work to 100,000 visits/keys/elements, and projected JSON to 64 KiB per tool. Drop non-scalar annotation defaults without traversing them.
+5. Omit rejected tools from MCP `tools/list`, record tool name plus a stable reason in diagnostics, and warn once in UI. Never let one marketplace schema fail the whole Antigravity session.
+6. Validate MCP call arguments again against the original Pi schema before emitting the Pi tool call; the projected model schema is not the authorization boundary.
+7. Synthetic MCP tests exercise advertised schemas, original argument validation and rejection of hostile schemas. Compatibility of every projected keyword with live Google inference is not implied by these tests.
 
 ## 11. Compatibility rules
 

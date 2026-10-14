@@ -661,7 +661,8 @@ describe("AntigravityRuntime", () => {
 			for await (const _event of second.stream) void _event;
 			const text = second.message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
 			// Delivered as a new prompt, not over the finished MCP request.
-			expect(text).toContain("## Tool result (echo)\nslow echo result");
+		expect(text).toContain("## Tool result (echo id=");
+		expect(text).toContain("slow echo result");
 			expect(second.message.stopReason).toBe("stop");
 		} finally {
 			await runtime.close();

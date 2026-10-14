@@ -72,7 +72,7 @@ In Pi:
 6. Complete the Google login in the browser.
 7. Run `/antigravity-acp setup` again to perform a network auth probe and model discovery.
 8. Run `/model` and select one of the `antigravity-acp` models.
-9. Press **Shift+Tab** to choose the reasoning effort. Flash models expose low, medium, and high; Pro exposes only the tiers advertised by Antigravity.
+9. Press **Shift+Tab** to choose the reasoning effort. Only tiers advertised by Antigravity are exposed. A model with a single tier (for example Argon Medium during rollout) remains a reasoning model with that tier; the provider does not invent Low/High variants.
 10. Send a prompt. The default permission mode is `yolo`, so Antigravity-native commands and edits can run without confirmation.
 
 The provider first looks at `AGY_ACP_BIN`, then its verified managed `~/.local/opt/agy-acp/current/` release, `~/.local/bin/agy_acp_server.par`, and `PATH`. Set `AGY_ACP_BIN` to explicitly prefer an externally managed runtime. If absent, it installs the platform build published in the ACP registry. A global `agy` or `gemini` command is not required.
@@ -95,6 +95,14 @@ Set `PI_ANTIGRAVITY_ACP_OAUTH_MODE=manual` to force this flow, or `PI_ANTIGRAVIT
 For API-key authentication, choose **Enter an API key** and then **Antigravity Gemini API key** in `/login`, or set `GEMINI_API_KEY` before starting Pi.
 
 Antigravity owns OAuth tokens under `~/.gemini/antigravity-acp/` (on macOS, in the Keychain under service `gemini`); Pi stores only a non-secret configured marker. Existing `agy` CLI credentials and Gemini CLI credentials should not be assumed to authenticate this separate ACP server.
+
+### Model availability
+
+The model catalog comes from the official ACP server. A successful model listing or selection is not an inference/access probe: newly listed models can still fail because of plan eligibility, staged rollout, or backend availability. As of October 13, 2026, Google's [Argon announcement](https://www.antigravity.google/blog/gemini-4-argon-in-google-antigravity) and [model availability table](https://www.antigravity.google/docs/models/) list Gemini 4 Argon for Google AI Ultra and eligible Enterprise subscriptions, not AI Pro. If it returns `Requested entity was not found`, check access in the official Antigravity app/CLI with the same account; do not guess alternate model IDs or assume the listing proves access. Use another advertised model while investigating.
+
+### macOS credential storage
+
+On macOS the Antigravity server keeps the consumer token in the login keychain (service `gemini`, account `antigravity-acp`) and uses the 0600 file `~/.gemini/antigravity-acp/acp_token.json` only when that keychain is unusable. A keychain that is empty while a refreshable token file exists therefore leaves the server with no credentials it can see: every new ACP server process reports `Credentials missing or invalid`, opens interactive Google consent (which forces the consent screen on every process), and can exceed the session-setup deadline. This provider detects exactly that mismatch and pins the child to the secure-file backend it inspects, so the saved login is reused. Set `AGY_ACP_FORCE_FILE_STORAGE` yourself to take full control of the choice. `doctor`/`status` reports the expected backend as `Credential storage (preflight):`, since the running server's own functional probe can still fall back to the file store. An explicit `GEMINI_HOME` relocates the whole tree, including the token file, and is honored by setup, health checks, logout, and the credential-storage decision.
 
 ## Commands
 
