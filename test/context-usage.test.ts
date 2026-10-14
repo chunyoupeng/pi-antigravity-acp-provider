@@ -1,7 +1,13 @@
 import { type Context, normalizeContext } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 
-import { adaptInstructionsForAntigravity, buildPromptParts } from "../src/stream/context.js";
+import {
+	adaptInstructionsForAntigravity,
+	buildPromptParts,
+	PI_READ_DESCRIPTION,
+	PI_READ_EXAMINE_RULE,
+	PI_READ_ROUTING_RULE,
+} from "../src/stream/context.js";
 import { quotaFromPrompt } from "../src/status.js";
 import { usageFromPrompt } from "../src/stream/usage.js";
 
@@ -195,13 +201,14 @@ describe("prompt context", () => {
 		const text = (result.prompt[0] as { resource: { text: string } }).resource.text;
 		expect(text).not.toContain("<docs>");
 		expect(text).not.toContain("Pi documentation to strip");
-		expect(text).toContain("- pi_read: Read images (png, jpg, gif, webp) and any file outside Active Workspaces and App Data Directory. Arguments: path (string, required), offset (1-indexed start line, optional), limit (max lines, optional). For text files inside Active Workspaces or App Data Directory use view_file, which returns the whole file inline.");
+		expect(text).toContain(`- pi_read: ${PI_READ_DESCRIPTION}`);
 		expect(text).toContain("- pi_bash: Execute commands");
 		expect(text).toContain("- Use pi_bash for file operations");
-		expect(text).toContain("- Use view_file to examine text files inside Active Workspaces or App Data Directory instead of cat or sed, reading the whole file in one call; use pi_read for files outside them.");
+		expect(text).toContain(PI_READ_EXAMINE_RULE);
+		expect(text).not.toContain("Use view_file to examine text files");
 		expect(text).toContain("- Use pi_read to inspect images or screenshots (png, jpg, gif, webp).");
 		expect(text).toContain("Use pi_read to load a skill's file when the task matches its description.");
-		expect(text).toContain("pi_read is fully defined in these instructions, including its arguments (path, offset, limit) and usage. Call it directly without reading its lazy-loaded schema file first.");
+		expect(text).toContain(PI_READ_ROUTING_RULE);
 		expect(text).toContain("Do not use Antigravity's native skill loader for these files.");
 		expect(text).toContain("<location>/home/test/.pi/agent/skills/libgen/SKILL.md</location>");
 		expect(text).toContain("When a skill file references a relative path, resolve it against the skill directory.");

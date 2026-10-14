@@ -54,7 +54,7 @@ import {
 } from "./mcp/bridge.js";
 import type { PermissionMode, ToolOwner } from "./config.js";
 import { resolveAcpModelId } from "./models.js";
-import { type PromptParts, buildPromptParts, currentSystemInstructions } from "./stream/context.js";
+import { PI_READ_DESCRIPTION, type PromptParts, buildPromptParts, currentSystemInstructions } from "./stream/context.js";
 import { PiEventWriter } from "./stream/pi-events.js";
 import { contextUsage, usageFromPrompt, withContextUsage } from "./stream/usage.js";
 import { RuntimeMetrics } from "./status.js";
@@ -84,17 +84,13 @@ export const PI_OWNED_NATIVE_TOOLS = [
 	"start_subagent",
 ] as const;
 
-/** Pi tool descriptions replaced when Pi owns tools. The Antigravity server
- * enforces its own view_file whitelist derived from the session cwd, so
- * read covers images and every path outside that whitelist, while text
- * files inside the workspace go through the native `view_file`, which
- * returns the whole file inline (MCP results over 4096 bytes are offloaded,
- * verified 2026-10-12 with a live probe: exactly 4096 bytes stays inline). */
+/** Pi tool descriptions replaced when Pi owns tools. read covers images and
+ * is the first read of every text file: it pages Chinese files in raw UTF-8
+ * (MCP results over 4096 bytes are offloaded, verified 2026-10-12 with a live
+ * probe: exactly 4096 bytes stays inline) and routes non-Chinese files to the
+ * native `view_file`, whose whitelist the server derives from the session cwd. */
 export const PI_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = {
-	read:
-		"Read images (png, jpg, gif, webp) and any file outside Active Workspaces and App Data Directory. " +
-		"Arguments: path (string, required), offset (1-indexed start line, optional), limit (max lines, optional). " +
-		"For text files inside Active Workspaces or App Data Directory use view_file, which returns the whole file inline.",
+	read: PI_READ_DESCRIPTION,
 };
 
 /** Antigravity built-ins disabled in every tool mode. Each one costs prompt
