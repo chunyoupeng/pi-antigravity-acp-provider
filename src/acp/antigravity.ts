@@ -89,9 +89,12 @@ export function hasKeychainCredential(authType: string | undefined): boolean {
 	}
 }
 
-/** Fallback when the server's `logout` RPC is unavailable. */
+/** Removes keychain-stored logins. Runs on every logout (not only when the
+ * server's `logout` RPC is unavailable): with the provider's secure-file
+ * default the server only clears the file, and a leftover keychain entry would
+ * be migrated back into the file on the next spawn, undoing an account switch. */
 export function clearKeychainCredentials(): void {
-	if (!keychainEnabled()) return;
+	if (process.platform !== "darwin") return;
 	for (const account of ["antigravity-acp", "antigravity-acp-business"]) {
 		try {
 			execFileSync(SECURITY_CLI, ["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account], {
@@ -176,6 +179,7 @@ export function clearAntigravityCredentials(
 	directory = resolveAntigravityAcpDirectory(),
 ): void {
 	fs.rmSync(path.join(directory, "acp_token.json"), { force: true });
+	fs.rmSync(path.join(directory, "acp_business_token.json"), { force: true });
 	const settingsPath = path.join(directory, "settings.json");
 	try {
 		const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as Record<string, unknown>;

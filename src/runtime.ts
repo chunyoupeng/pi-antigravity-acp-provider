@@ -398,7 +398,7 @@ export class AntigravityRuntime {
 		// Never touch real credentials from an injected (test) connection.
 		if (this.ensureAgent) {
 			clearAntigravityCredentials();
-			if (!server) clearKeychainCredentials();
+			clearKeychainCredentials();
 		}
 		return { server };
 	}
