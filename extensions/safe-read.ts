@@ -1,6 +1,8 @@
 import {
+	type BashOperations,
 	type BashToolOptions,
 	createBashToolDefinition,
+	createLocalBashOperations,
 	createReadToolDefinition,
 	detectSupportedImageMimeTypeFromFile,
 	formatSize,
@@ -9,7 +11,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { access, readFile, writeFile } from "node:fs/promises";
+import { access, appendFile, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -17,10 +19,21 @@ import { MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, MAX_TEXT_RESULT_BYTES } from "../
 
 export { MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, MAX_TEXT_RESULT_BYTES } from "../src/models.js";
 
+/** Default period of complete stdout/stderr silence before an untimed command
+ * detaches to the background instead of hanging the MCP turn. Kept below
+ * TOOL_HANDOFF_MS (150s) so a hung SSH/daemon pipe returns within the turn. */
+export const DEFAULT_BASH_IDLE_DETACH_MS = 120_000;
+
+export interface SafeBashToolOptions extends BashToolOptions {
+	/** Idle stdout/stderr window in ms before an untimed command detaches to the background (default: 120_000). */
+	idleDetachMs?: number;
+}
+
 /** Room left for the continuation note, so the whole result stays within MAX_TEXT_RESULT_BYTES. */
 const BODY_BYTES = MAX_TEXT_RESULT_BYTES - 1024;
 const BODY_LIMIT = formatSize(BODY_BYTES);
-const BASH_STATUS = /\n\n(Command (?:exited with code -?\d+|timed out after \d+ seconds|terminated without an exit code|aborted))$/u;
+const BASH_STATUS =
+	/\n\n(Command (?:exited with code -?\d+|timed out after \d+ seconds|terminated without an exit code|aborted)|\[Command produced no new output for [\d.]+s and was detached to background[^\n]*\])$/u;
 const BASH_NOTE = /\n\n\[Showing (?:lines \d+-\d+ of (\d+)|last .+? of line (\d+))[^\n]*?Full output: ([^\n]+)\]$/u;
 
 /**
@@ -128,18 +141,39 @@ function pageText(content: string, filePath: string, offset?: number, limit?: nu
 
 /**
  * Pi's bash for Antigravity. Output over 45 KiB keeps its last 45 KiB inline,
- * as Pi keeps the tail, and names a file holding the complete output.
+ * as Pi keeps the tail, and names a file holding the complete output. Untimed
+ * commands that produce no new output for `idleDetachMs` (default 120s) detach
+ * to the background without killing the process, so active downloads/builds keep
+ * running while hung SSH/daemon pipes return their collected output.
  */
-export function createSafeBashToolDefinition(cwd: string, options?: BashToolOptions) {
+export function createSafeBashToolDefinition(cwd: string, options?: SafeBashToolOptions) {
 	const original = createBashToolDefinition(cwd, options);
+	const baseOps =
+		options?.operations ??
+		createLocalBashOperations(options?.shellPath === undefined ? undefined : { shellPath: options.shellPath });
+	const idleDetachMs = options?.idleDetachMs ?? DEFAULT_BASH_IDLE_DETACH_MS;
 	return {
 		...original,
 		execute: async (...args: Parameters<typeof original.execute>) => {
 			const signal = args[2];
 			if (args[4].model?.provider !== "antigravity-acp") return original.execute(...args);
+			let detachedNote: string | undefined;
+			const safeTool = createBashToolDefinition(cwd, {
+				...options,
+				operations: {
+					exec: async (command, execCwd, execOptions) => {
+						if (execOptions.timeout !== undefined || idleDetachMs <= 0) {
+							return baseOps.exec(command, execCwd, execOptions);
+						}
+						return runWithIdleDetach(baseOps, command, execCwd, execOptions, idleDetachMs, (note) => {
+							detachedNote = note;
+						});
+					},
+				},
+			});
 			let result: Awaited<ReturnType<typeof original.execute>>;
 			try {
-				result = await original.execute(...args);
+				result = await safeTool.execute(...args);
 			} catch (error) {
 				if (signal?.aborted || !(error instanceof Error) || Buffer.byteLength(error.message, "utf8") <= MAX_TEXT_RESULT_BYTES) {
 					throw error;
@@ -147,10 +181,112 @@ export function createSafeBashToolDefinition(cwd: string, options?: BashToolOpti
 				throw new Error(await tailText(error.message, signal));
 			}
 			const block = result.content[0];
-			if (block?.type !== "text" || Buffer.byteLength(block.text, "utf8") <= MAX_TEXT_RESULT_BYTES) return result;
-			return { ...result, content: [{ type: "text" as const, text: await tailText(block.text, signal) }] };
+			if (block?.type !== "text") return result;
+			const rawText = detachedNote ? `${block.text}\n\n${detachedNote}` : block.text;
+			if (Buffer.byteLength(rawText, "utf8") <= MAX_TEXT_RESULT_BYTES) {
+				return detachedNote ? { ...result, content: [{ type: "text" as const, text: rawText }] } : result;
+			}
+			return { ...result, content: [{ type: "text" as const, text: await tailText(rawText, signal) }] };
 		},
 	};
+}
+
+function runWithIdleDetach(
+	baseOps: BashOperations,
+	command: string,
+	execCwd: string,
+	execOptions: Parameters<BashOperations["exec"]>[2],
+	idleDetachMs: number,
+	onDetached: (note: string) => void,
+): Promise<{ exitCode: number | null }> {
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		let detached = false;
+		let idleTimer: NodeJS.Timeout | undefined;
+		let detachedLogPath: string | undefined;
+		let writeChain = Promise.resolve();
+		const preDetachChunks: Buffer[] = [];
+		let preDetachBytes = 0;
+
+		const childAbort = new AbortController();
+		const onCallerAbort = () => {
+			if (!detached) childAbort.abort();
+		};
+		if (execOptions.signal?.aborted) {
+			childAbort.abort();
+		} else {
+			execOptions.signal?.addEventListener("abort", onCallerAbort, { once: true });
+		}
+
+		const cleanup = () => {
+			if (idleTimer) {
+				clearTimeout(idleTimer);
+				idleTimer = undefined;
+			}
+			execOptions.signal?.removeEventListener("abort", onCallerAbort);
+		};
+
+		const armIdleTimer = () => {
+			if (settled || detached) return;
+			if (idleTimer) clearTimeout(idleTimer);
+			idleTimer = setTimeout(() => {
+				idleTimer = undefined;
+				if (settled || detached) return;
+				detached = true;
+				settled = true;
+				cleanup();
+				detachedLogPath = path.join(os.tmpdir(), `pi-bash-detached-${randomUUID()}.log`);
+				const logPath = detachedLogPath;
+				const initial = Buffer.concat(preDetachChunks);
+				preDetachChunks.length = 0;
+				writeChain = writeFile(logPath, initial).catch(() => {});
+				const secs = Math.round((idleDetachMs / 1000) * 10) / 10;
+				onDetached(
+					`[Command produced no new output for ${secs}s and was detached to background (not killed). Ongoing output: ${logPath}]`,
+				);
+				void writeChain.then(() => resolve({ exitCode: 0 }));
+			}, idleDetachMs);
+			idleTimer.unref?.();
+		};
+
+		armIdleTimer();
+
+		baseOps
+			.exec(command, execCwd, {
+				...execOptions,
+				signal: childAbort.signal,
+				onData: (chunk) => {
+					if (!detached) {
+						preDetachChunks.push(chunk);
+						preDetachBytes += chunk.byteLength;
+						while (preDetachBytes > MAX_TEXT_RESULT_BYTES && preDetachChunks.length > 1) {
+							preDetachBytes -= preDetachChunks.shift()!.byteLength;
+						}
+						armIdleTimer();
+						execOptions.onData(chunk);
+					} else if (detachedLogPath) {
+						const logPath = detachedLogPath;
+						writeChain = writeChain.then(() => appendFile(logPath, chunk)).catch(() => {});
+					}
+				},
+			})
+			.then(
+				(result) => {
+					if (settled) return;
+					settled = true;
+					cleanup();
+					preDetachChunks.length = 0;
+					resolve(result);
+				},
+				(error) => {
+					if (settled) return;
+					settled = true;
+					cleanup();
+					preDetachChunks.length = 0;
+					reject(error);
+				},
+			);
+	});
 }
 
 /** Re-truncates Pi's bash text to a 45 KiB tail, keeping its exit status. Pi

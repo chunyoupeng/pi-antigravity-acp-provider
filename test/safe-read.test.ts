@@ -310,4 +310,78 @@ describe("Antigravity safe bash", () => {
 		const ctx = { ...f.ctx, model: { ...f.ctx.model!, provider: "other" } };
 		expect(textOf(await f.tool.execute("bash-test", { command: "echo hi" }, undefined, undefined, ctx))).toBe(content);
 	});
+
+	it("detaches a stalled untimed command without killing it and logs subsequent output", async () => {
+		const cwd = tempDir();
+		let childAborted = false;
+		let emitLateChunk: ((chunk: Buffer) => void) | undefined;
+		let finishBackground: (() => void) | undefined;
+		const tool = createSafeBashToolDefinition(cwd, {
+			idleDetachMs: 60,
+			operations: {
+				exec: (_command, _execCwd, { onData, signal }) =>
+					new Promise<{ exitCode: number | null }>((resolve) => {
+						signal?.addEventListener("abort", () => {
+							childAborted = true;
+						});
+						onData(Buffer.from("server started\nps aux output\n", "utf8"));
+						emitLateChunk = onData;
+						finishBackground = () => resolve({ exitCode: 0 });
+					}),
+			},
+		});
+		type BashContext = Parameters<typeof tool.execute>[4];
+		const ctx = {
+			cwd,
+			model: { id: "gemini-4-argon", provider: "antigravity-acp", input: ["text", "image"] },
+			sessionManager: { getSessionId: () => "sess-1", getSessionFile: () => undefined },
+		} as unknown as BashContext;
+
+		const result = await tool.execute("bash-detach", { command: "ssh autodl 'nohup server.py & tail'" }, undefined, undefined, ctx);
+		const text = textOf(result);
+		expect(childAborted).toBe(false);
+		expect(text).toContain("server started\nps aux output");
+		const match = /\[Command produced no new output for 0\.1s and was detached to background \(not killed\)\. Ongoing output: ([^\]]+)\]$/u.exec(text);
+		expect(match).not.toBeNull();
+		const logPath = match![1]!;
+		expect(fs.readFileSync(logPath, "utf8")).toBe("server started\nps aux output\n");
+
+		emitLateChunk?.(Buffer.from("late daemon log line\n", "utf8"));
+		await new Promise((r) => setTimeout(r, 20));
+		expect(fs.readFileSync(logPath, "utf8")).toBe("server started\nps aux output\nlate daemon log line\n");
+		finishBackground?.();
+		fs.rmSync(logPath, { force: true });
+	});
+
+	it("does not detach an active long download/build that keeps emitting output past idleDetachMs", async () => {
+		const cwd = tempDir();
+		let childAborted = false;
+		const tool = createSafeBashToolDefinition(cwd, {
+			idleDetachMs: 80,
+			operations: {
+				exec: async (_command, _execCwd, { onData, signal }) => {
+					signal?.addEventListener("abort", () => {
+						childAborted = true;
+					});
+					for (let step = 1; step <= 4; step++) {
+						await new Promise((r) => setTimeout(r, 35));
+						onData(Buffer.from(`downloading chunk ${step}/4\n`, "utf8"));
+					}
+					return { exitCode: 0 };
+				},
+			},
+		});
+		type BashContext = Parameters<typeof tool.execute>[4];
+		const ctx = {
+			cwd,
+			model: { id: "gemini-4-argon", provider: "antigravity-acp", input: ["text", "image"] },
+			sessionManager: { getSessionId: () => "sess-1", getSessionFile: () => undefined },
+		} as unknown as BashContext;
+
+		const result = await tool.execute("bash-active", { command: "curl -O bigfile" }, undefined, undefined, ctx);
+		const text = textOf(result);
+		expect(childAborted).toBe(false);
+		expect(text).toBe("downloading chunk 1/4\ndownloading chunk 2/4\ndownloading chunk 3/4\ndownloading chunk 4/4\n");
+		expect(text).not.toContain("detached to background");
+	});
 });
