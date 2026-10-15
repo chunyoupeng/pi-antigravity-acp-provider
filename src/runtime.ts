@@ -48,6 +48,7 @@ import { AcpToolTracker, type AcpToolActivity, mapSessionUpdate, toolActivityDet
 import { ensureAntigravityAcpReady } from "./acp/setup.js";
 import { HeadlessOAuthRelay, shouldUseHeadlessOAuth } from "./acp/headless-oauth.js";
 import {
+	BRIDGE_NAME,
 	PiMcpBridge,
 	piToolFingerprint,
 	planToolProjection,
@@ -876,6 +877,7 @@ export class AntigravityRuntime {
 					disabledTools: piOwnsTools
 						? [...PI_OWNED_NATIVE_TOOLS, ...UNUSED_NATIVE_TOOLS]
 						: [...UNUSED_NATIVE_TOOLS],
+					eagerMcpServers: [BRIDGE_NAME],
 					mcpMaxOutputBytes: MCP_MAX_OUTPUT_BYTES,
 				},
 			};

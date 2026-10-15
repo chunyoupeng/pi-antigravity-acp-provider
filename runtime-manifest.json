@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-10-03T11:44:17.523Z",
+  "generatedAt": "2026-10-14T11:59:05.492Z",
   "releases": [
     {
       "version": "1.1.1",
@@ -198,8 +198,76 @@
           "args": []
         }
       }
+    },
+    {
+      "version": "1.4.0",
+      "platforms": {
+        "darwin-aarch64": {
+          "archive": "https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-1.4.0-darwin-arm64.zip",
+          "archiveSha256": "21a32eeab85b394a515510c84539bda4b2504bf2917e0a201f5c4130b13581a5",
+          "archiveBytes": 112734313,
+          "binaryName": "agy_acp_server.par",
+          "binaryBytes": 280980064,
+          "harnessName": "localharness_external",
+          "harnessBytes": 120246928,
+          "args": []
+        },
+        "darwin-x86_64": {
+          "archive": "https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-1.4.0-darwin-x86_64.zip",
+          "archiveSha256": "407b6b8ef167bb207d1effdbd488bacf63ba7dab2b47d4a47d8ea3710a8c0f55",
+          "archiveBytes": 118343529,
+          "binaryName": "agy_acp_server.par",
+          "binaryBytes": 285170112,
+          "harnessName": "localharness_external",
+          "harnessBytes": 124910048,
+          "args": []
+        },
+        "linux-x86_64": {
+          "archive": "https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-1.4.0-linux-x86_64.zip",
+          "archiveSha256": "fbb2d54dd94fb897845308d3b6b46187c627f1c60078ded81adeeaf8b90c5d7a",
+          "archiveBytes": 336175910,
+          "binaryName": "agy_acp_server.par",
+          "binaryBytes": 930814465,
+          "harnessName": "localharness_external",
+          "harnessBytes": 131187512,
+          "args": [
+            "--uid="
+          ]
+        },
+        "linux-aarch64": {
+          "archive": "https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-1.4.0-linux-arm64.zip",
+          "archiveSha256": "3dc43a21f5402b23a4dba7b320a6745e9dbf4b6ead912ce9fc76011ea3a08a7e",
+          "archiveBytes": 321912925,
+          "binaryName": "agy_acp_server.par",
+          "binaryBytes": 933404508,
+          "harnessName": "localharness_external",
+          "harnessBytes": 124895000,
+          "args": [
+            "--uid="
+          ]
+        },
+        "windows-x86_64": {
+          "archive": "https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-1.4.0-windows-x86_64.zip",
+          "archiveSha256": "d737aad2d6388e071bc907db415c129a256915d275f436e68f10dcdf6af896da",
+          "archiveBytes": 125646049,
+          "binaryName": "agy_acp_server.exe",
+          "binaryBytes": 82245832,
+          "harnessName": "localharness_external.exe",
+          "harnessBytes": 146036888,
+          "args": []
+        },
+        "windows-aarch64": {
+          "archive": "https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-1.4.0-windows-arm64.zip",
+          "archiveSha256": "37fac14835f06caf05b4b93fed59a0e16e7c716e3ec95f03d4779a61abe3c2e6",
+          "archiveBytes": 126083066,
+          "binaryName": "agy_acp_server.exe",
+          "binaryBytes": 86867784,
+          "harnessName": "localharness_external.exe",
+          "harnessBytes": 136970904,
+          "args": []
+        }
+      }
     }
   ],
-  "signature": "yfTGgbXRKpUL41Sz8FG6z7NkleAa51sRkyRdSeYoBqvwssibrR16Wq7wl95UVk4L0Z/MtHgiA5pI0M5Ep9rRCA=="
+  "signature": "BcTbZD/xTU1KNGqxbG8p0hCjwkC0Qqol5XAdtbk8Aa+7hJciXZwMPBcGqo4B5UnZZ99iX66RvtUPco/QjnVvCg=="
 }
-

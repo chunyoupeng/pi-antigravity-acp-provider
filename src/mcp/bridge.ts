@@ -17,7 +17,7 @@ import { projectToolSchema } from "./schema.js";
 
 const BODY_LIMIT = 1024 * 1024;
 const MAX_TOOLS = 64;
-const BRIDGE_NAME = "pi-bridge";
+export const BRIDGE_NAME = "pi-bridge";
 
 interface BridgeTool {
 	mcpName: string;
@@ -85,8 +85,8 @@ export class PiMcpBridge {
 	reports(title: string | null | undefined, meta: unknown): boolean {
 		const mcp = meta && typeof meta === "object" ? (meta as { mcp?: { server?: unknown; tool?: unknown } }).mcp : undefined;
 		if (mcp?.server === BRIDGE_NAME) return true;
-		// Activity rows read "Running pi_read"; permission requests "pi-bridge_pi_read".
-		const name = /^(?:Running )?(?:pi-bridge_)?(\S+)$/u.exec(title ?? "")?.[1];
+		// Activity rows read "Running pi_read"; permission requests "pi-bridge_pi_read" or "Run pi_read?".
+		const name = /^(?:Running |Run )?(?:(?:mcp_)?pi-bridge_)?(\S+?)\??$/u.exec(title ?? "")?.[1];
 		return name !== undefined && this.tools.some((tool) => tool.mcpName === name || tool.piName === name);
 	}
 

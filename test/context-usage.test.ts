@@ -7,7 +7,6 @@ import {
 	PI_BASH_DESCRIPTION,
 	PI_READ_DESCRIPTION,
 	PI_READ_EXAMINE_RULE,
-	PI_READ_ROUTING_RULE,
 } from "../src/stream/context.js";
 import { quotaFromPrompt } from "../src/status.js";
 import { usageFromPrompt } from "../src/stream/usage.js";
@@ -208,7 +207,6 @@ describe("prompt context", () => {
 		expect(text).toContain(PI_READ_EXAMINE_RULE);
 		expect(text).not.toContain("view_file");
 		expect(text).toContain("Use pi_read to load a skill's file when the task matches its description.");
-		expect(text).toContain(PI_READ_ROUTING_RULE);
 		expect(text).toContain("Do not use Antigravity's native skill loader for these files.");
 		expect(text).toContain("<location>/home/test/.pi/agent/skills/libgen/SKILL.md</location>");
 		expect(text).toContain("When a skill file references a relative path, resolve it against the skill directory.");

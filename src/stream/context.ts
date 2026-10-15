@@ -106,8 +106,6 @@ export const PI_READ_EXAMINE_RULE =
 	"- Use pi_read to examine files and images instead of cat or sed.";
 export const PI_READ_FALLBACK_RULE =
 	"- Use pi_read to examine files and images.";
-export const PI_READ_ROUTING_RULE =
-	"- pi_read (path, offset, limit) and pi_bash (command, timeout) are fully defined in these instructions, including their arguments and usage. Call them directly without reading their lazy-loaded schema file first.";
 
 /**
  * Adapts Pi's system instructions for the Antigravity ACP environment.
@@ -182,18 +180,6 @@ export function adaptInstructionsForAntigravity(instructions: string): string {
 		adapted = adapted.replace(/\bUse bash\b/gu, "Use pi_bash");
 		adapted = adapted.replace(/\bUse edit\b/gu, "Use pi_edit");
 		adapted = adapted.replace(/\bUse write\b/gu, "Use pi_write");
-	}
-
-	// Antigravity's own guidance has the model consult a schema file before
-	// calling a lazy-loaded MCP tool. pi_read and pi_bash's projected definitions
-	// above already carry their arguments and usage, so that round trip is wasted.
-	// (Eager MCP loading would avoid it too, but drops the tool-call _meta that
-	// identifies bridged Pi calls.)
-	if ((adapted.includes("- pi_read:") || adapted.includes("- pi_bash:")) && !adapted.includes("lazy-loaded schema file")) {
-		const rule = PI_READ_ROUTING_RULE;
-		adapted = adapted.includes("</rules>")
-			? adapted.replace(/<\/rules>/u, `${rule}\n</rules>`)
-			: `${adapted.trimEnd()}\n${rule}`;
 	}
 
 	adapted = adapted.replace(/<skills>([\s\S]*?)<\/skills>/u, (_, skillsContent: string) => {

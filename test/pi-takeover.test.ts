@@ -57,7 +57,7 @@ describe("Pi takeover of Antigravity capabilities", () => {
 		const runtime = runtimeFor("default");
 		try {
 			const echoed = JSON.parse((await ask(runtime, "inspect meta")).text);
-			expect(echoed.meta.new).toEqual({ antigravity: { disabledTools: [...PI_OWNED_NATIVE_TOOLS, ...UNUSED_NATIVE_TOOLS], mcpMaxOutputBytes: MCP_MAX_OUTPUT_BYTES } });
+			expect(echoed.meta.new).toEqual({ antigravity: { disabledTools: [...PI_OWNED_NATIVE_TOOLS, ...UNUSED_NATIVE_TOOLS], eagerMcpServers: ["pi-bridge"], mcpMaxOutputBytes: MCP_MAX_OUTPUT_BYTES } });
 			expect(echoed.clientCapabilities.fs).toEqual({ readTextFile: false, writeTextFile: false });
 		} finally {
 			await runtime.close();
@@ -68,7 +68,7 @@ describe("Pi takeover of Antigravity capabilities", () => {
 		const runtime = runtimeFor("default", "native");
 		try {
 			const echoed = JSON.parse((await ask(runtime, "inspect meta")).text);
-			expect(echoed.meta.new).toEqual({ antigravity: { disabledTools: [...UNUSED_NATIVE_TOOLS], mcpMaxOutputBytes: MCP_MAX_OUTPUT_BYTES } });
+			expect(echoed.meta.new).toEqual({ antigravity: { disabledTools: [...UNUSED_NATIVE_TOOLS], eagerMcpServers: ["pi-bridge"], mcpMaxOutputBytes: MCP_MAX_OUTPUT_BYTES } });
 			expect(echoed.clientCapabilities.fs).toEqual({ readTextFile: true, writeTextFile: true });
 		} finally {
 			await runtime.close();
@@ -157,7 +157,7 @@ describe("Pi takeover of Antigravity capabilities", () => {
 			await runtime.attachSession("pi-session", "listed-session");
 			const echoed = JSON.parse((await ask(runtime, "inspect meta", "pi-session")).text);
 			expect(echoed.sessionId).toBe("listed-session");
-			expect(echoed.meta.resume).toEqual({ antigravity: { disabledTools: [...PI_OWNED_NATIVE_TOOLS, ...UNUSED_NATIVE_TOOLS], mcpMaxOutputBytes: MCP_MAX_OUTPUT_BYTES } });
+			expect(echoed.meta.resume).toEqual({ antigravity: { disabledTools: [...PI_OWNED_NATIVE_TOOLS, ...UNUSED_NATIVE_TOOLS], eagerMcpServers: ["pi-bridge"], mcpMaxOutputBytes: MCP_MAX_OUTPUT_BYTES } });
 		} finally {
 			await runtime.close();
 		}
