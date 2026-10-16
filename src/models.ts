@@ -10,6 +10,10 @@ export const API_ID = "antigravity-acp";
 /** Cap inline base64 image payloads at 512 KiB and 1536px (2x2 Gemini 768px tiles). */
 export const MAX_IMAGE_BYTES = 512 * 1024;
 export const MAX_IMAGE_DIMENSION = 1536;
+/** Antigravity's harness compacts a conversation at its checkpoint limit,
+ * 256k tokens, although the model accepts 1M. Matching it lets Pi compact
+ * first, visibly, instead of the harness silently replacing history. */
+export const CONTEXT_WINDOW = 256_000;
 /** `_meta.antigravity.mcpMaxOutputBytes`: each MCP result item up to this size
  * (images by decoded bytes) reaches the model inline; a larger one is only a
  * file path. Above every image Pi sends (verified 2026-10-15, server 1.4.0). */
@@ -181,7 +185,7 @@ function baseModel(
 			},
 		},
 		cost: ZERO_COST,
-		contextWindow: 1_000_000,
+		contextWindow: CONTEXT_WINDOW,
 		maxTokens: 65_536,
 	};
 }

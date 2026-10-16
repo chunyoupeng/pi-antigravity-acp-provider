@@ -11,7 +11,7 @@ import {
 } from "@earendil-works/pi-ai";
 
 import { hasAntigravityAuth } from "./acp/antigravity.js";
-import { API_ID, FALLBACK_MODELS, MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, projectModels, PROVIDER_ID } from "./models.js";
+import { API_ID, CONTEXT_WINDOW, FALLBACK_MODELS, MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, projectModels, PROVIDER_ID } from "./models.js";
 import { AntigravityRuntime, MANAGED_AUTH_MARKER } from "./runtime.js";
 
 export interface AntigravityProviderBundle {
@@ -116,6 +116,7 @@ export function createAntigravityProvider(runtime = new AntigravityRuntime()): A
 					)
 					.map((model) => ({
 						...model,
+						contextWindow: Math.min(model.contextWindow, CONTEXT_WINDOW),
 						inputLimits: {
 							...model.inputLimits,
 							images: {

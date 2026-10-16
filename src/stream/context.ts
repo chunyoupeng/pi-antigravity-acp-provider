@@ -3,7 +3,9 @@ import { getCurrentSystemPrompt, type Context, type Message } from "@earendil-wo
 
 import { AntigravityAcpError } from "../acp/errors.js";
 
-const MAX_RECONSTRUCTION_CHARS = 32_000;
+/** About 150k tokens at Pi's 4 chars/token estimate, leaving room under the
+ * harness's 256k compaction limit for instructions, tools and further work. */
+export const MAX_RECONSTRUCTION_CHARS = 600_000;
 const MAX_INSTRUCTION_BYTES = 256 * 1024;
 const ENTRY_SEPARATOR = "\n\n";
 const HISTORY_HEADING =

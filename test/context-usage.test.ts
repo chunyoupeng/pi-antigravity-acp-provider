@@ -98,7 +98,7 @@ describe("prompt context", () => {
 		const context = normalizeContext({
 			systemPrompt: instructions,
 			messages: [
-				{ role: "user", content: `Old history start${"x".repeat(40_000)}Recent history end`, timestamp: 1 },
+				{ role: "user", content: `Old history start${"x".repeat(610_000)}Recent history end`, timestamp: 1 },
 				{ role: "user", content: "new", timestamp: 2 },
 			],
 		});
@@ -218,7 +218,7 @@ describe("prompt context", () => {
 describe("instruction safety", () => {
 	it("preserves instructions and untrusted-history labels despite long history", () => {
 		const result = buildPromptParts({ systemPrompt: "  REQUIRED_PROJECT_RULE  ", messages: [
-			{ role: "user", content: "x".repeat(40_000), timestamp: 1 },
+			{ role: "user", content: "x".repeat(610_000), timestamp: 1 },
 			{ role: "user", content: "next", timestamp: 2 },
 		]}, true);
 		const text = JSON.stringify(result.prompt);

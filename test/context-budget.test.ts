@@ -1,10 +1,11 @@
 import type { AssistantMessage, Context, ToolResultMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 
-import { buildPromptParts } from "../src/stream/context.js";
+import { buildPromptParts, MAX_RECONSTRUCTION_CHARS } from "../src/stream/context.js";
 import { usageFromPrompt } from "../src/stream/usage.js";
 
-const LIMIT = 32_000;
+const LIMIT = MAX_RECONSTRUCTION_CHARS;
+const OVER_LIMIT = LIMIT + 8_000;
 const IMAGE = { type: "image" as const, data: "aGVsbG8=", mimeType: "image/png" };
 function assistant(content: AssistantMessage["content"]): AssistantMessage {
 	return { role: "assistant", content, api: "antigravity-acp", provider: "antigravity-acp", model: "auto",
@@ -28,7 +29,7 @@ function resourceText(block: unknown): string {
 
 describe("bounded context reconstruction", () => {
 	it("delivers the active request and images explicitly despite an oversized tool result", () => {
-		const { prompt } = buildPromptParts(toolContext("x".repeat(40_000) + "RESULT_TAIL"), true);
+		const { prompt } = buildPromptParts(toolContext("x".repeat(OVER_LIMIT) + "RESULT_TAIL"), true);
 		const history = resourceText(prompt[0]);
 		expect(history.length).toBeLessThanOrEqual(LIMIT);
 		expect(history).toContain("[truncated older context]");
@@ -43,7 +44,7 @@ describe("bounded context reconstruction", () => {
 	});
 
 	it("preserves Pi transcript instructions independently of the history budget", () => {
-		const context = toolContext("x".repeat(40_000));
+		const context = toolContext("x".repeat(OVER_LIMIT));
 		const instructions = "  PRESERVE_SPACES  " + "π".repeat(20_000);
 		context.messages.unshift({ role: "system", content: instructions, sections: { rule: "old", removed: "obsolete" }, timestamp: 0 });
 		context.messages.push({ role: "system", content: "ADDITIONAL_RULE", sections: { rule: "NEW_RULE", removed: null }, timestamp: 4 });
@@ -58,15 +59,15 @@ describe("bounded context reconstruction", () => {
 	});
 
 	it("never truncates the explicit current request", () => {
-		const request = "REQUEST_START" + "q".repeat(50_000) + "REQUEST_END";
-		const context = toolContext("x".repeat(40_000));
+		const request = "REQUEST_START" + "q".repeat(OVER_LIMIT) + "REQUEST_END";
+		const context = toolContext("x".repeat(OVER_LIMIT));
 		context.messages[0] = { role: "user", content: request, timestamp: 1 };
 		expect(buildPromptParts(context, true).prompt.at(-1)).toEqual({ type: "text", text: request });
 	});
 
 	it("keeps a small tool result whole even when call arguments are huge", () => {
 		const context = toolContext("RESULT_OK");
-		context.messages[1] = assistant([{ type: "toolCall", id: "call-1", name: "read", arguments: { text: "x".repeat(40_000) + "ARGS_TAIL" } }]);
+		context.messages[1] = assistant([{ type: "toolCall", id: "call-1", name: "read", arguments: { text: "x".repeat(OVER_LIMIT) + "ARGS_TAIL" } }]);
 		const text = resourceText(buildPromptParts(context, true).prompt[0]);
 		expect(text.length).toBeLessThanOrEqual(LIMIT);
 		expect(text).toContain("[tool call read id=call-1] [truncated]");
@@ -76,12 +77,12 @@ describe("bounded context reconstruction", () => {
 
 	it("retains every parallel call/result identity and drops older history first", () => {
 		const context = toolContext("first");
-		context.messages.unshift({ role: "user", content: "OLD_CANARY" + "o".repeat(40_000), timestamp: 0 });
+		context.messages.unshift({ role: "user", content: "OLD_CANARY" + "o".repeat(OVER_LIMIT), timestamp: 0 });
 		context.messages[2] = assistant([
 			{ type: "toolCall", id: "call-1", name: "read", arguments: {} },
 			{ type: "toolCall", id: "call-2", name: "write", arguments: {} },
 		]);
-		context.messages.push(result("x".repeat(40_000) + "SECOND_TAIL", "call-2", "write"));
+		context.messages.push(result("x".repeat(OVER_LIMIT) + "SECOND_TAIL", "call-2", "write"));
 		const text = resourceText(buildPromptParts(context, true).prompt[0]);
 		expect(text.length).toBeLessThanOrEqual(LIMIT);
 		for (const label of ["[tool call read id=call-1]", "[tool call write id=call-2]", "## Tool result (read id=call-1)", "## Tool result (write id=call-2)"]) expect(text).toContain(label);
@@ -113,9 +114,10 @@ describe("bounded context reconstruction", () => {
 	});
 
 	it("does not split surrogate pairs or lose truncation fences", () => {
+		const pairs = Math.floor(LIMIT / 2) + 4_000;
 		for (const name of ["read", "reads"]) {
-			const context = toolContext("😀".repeat(20_000) + "END");
-			context.messages[2] = result("😀".repeat(20_000) + "END", "call-1", name);
+			const context = toolContext("😀".repeat(pairs) + "END");
+			context.messages[2] = result("😀".repeat(pairs) + "END", "call-1", name);
 			const text = resourceText(buildPromptParts(context, true).prompt[0]);
 			expect(text.length).toBeLessThanOrEqual(LIMIT);
 			expect(text).toContain("😀END");
@@ -131,7 +133,7 @@ describe("bounded context reconstruction", () => {
 	});
 
 	it("bounds warm external deltas and explicitly sends an unseen request", () => {
-		const context = toolContext("x".repeat(40_000) + "RESULT_TAIL");
+		const context = toolContext("x".repeat(OVER_LIMIT) + "RESULT_TAIL");
 		const { prompt } = buildPromptParts(context, false, 0);
 		const text = resourceText(prompt[0]);
 		expect(text.length).toBeLessThanOrEqual(LIMIT);

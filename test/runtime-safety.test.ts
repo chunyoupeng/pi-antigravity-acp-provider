@@ -272,7 +272,7 @@ describe("context handoff transport", () => {
 			{ role: "assistant", content: [{ type: "toolCall", id: "external-call", name: "read", arguments: { path: "a.ts" } }],
 				api: model.api, provider: "other-provider", model: "external", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "toolUse", timestamp: 2 },
-			{ role: "toolResult", toolCallId: "external-call", toolName: "read", content: [{ type: "text", text: "x".repeat(40_000) + "RESULT_TAIL" }], isError: false, timestamp: 3 },
+			{ role: "toolResult", toolCallId: "external-call", toolName: "read", content: [{ type: "text", text: "x".repeat(610_000) + "RESULT_TAIL" }], isError: false, timestamp: 3 },
 			{ role: "system", content: "NEW_RULE", sections: { rule: "UPDATED_RULE" }, timestamp: 4 },
 		] });
 		const response = await drain(runtime.stream({ ...model, input: ["text", "image"] }, context, { sessionId: "handoff", apiKey: "test-key" }));
@@ -290,7 +290,7 @@ describe("context handoff transport", () => {
 		expect(reconstruction).toContain("[tool call read id=external-call]");
 		expect(reconstruction).toContain("## Tool result (read id=external-call)");
 		expect(reconstruction).toContain("RESULT_TAIL");
-		expect(reconstruction.slice(reconstruction.indexOf("# Prior conversation")).length).toBeLessThanOrEqual(32_000);
+		expect(reconstruction.slice(reconstruction.indexOf("# Prior conversation")).length).toBeLessThanOrEqual(600_000);
 	});
 });
 

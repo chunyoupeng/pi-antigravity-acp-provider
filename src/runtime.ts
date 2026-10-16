@@ -841,6 +841,7 @@ export class AntigravityRuntime {
 			clientFs: toolOwner === "native",
 			handlers: {
 				onUpdate: (notification) => this.consumeUpdate(binding, notification),
+				onStall: (info) => this.noteBackendStall(binding, info),
 				onPermission: async (request) => {
 					await binding?.updateQueue;
 					return this.requestPermission(binding, request);
@@ -1069,6 +1070,20 @@ export class AntigravityRuntime {
 				resolve({ outcome: { outcome: "cancelled" } });
 			}
 		});
+	}
+
+	private noteBackendStall(binding: Binding | undefined, info: { busy: boolean; silentMs: number; abortInMs?: number }): void {
+		const writer = binding?.writer;
+		if (!writer || writer.finished) return;
+		const seconds = Math.max(1, Math.round(info.silentMs / 1000));
+		const work = info.busy ? " with tool/permission work still outstanding" : "";
+		const abort = info.abortInMs === undefined
+			? "The turn keeps waiting; Esc aborts it."
+			: `It will abort itself in ${Math.max(1, Math.round(info.abortInMs / 1000))}s if there is still no response; Esc aborts it now.`;
+		writer.text(
+			`\n\n⚠️ No response from Antigravity for ${seconds}s${work}. The model backend is likely ` +
+			`unreachable (for example repeated 502s) and silently retrying. ${abort} After it fails, retry later or switch models.\n\n`,
+		);
 	}
 
 	private async consumeUpdate(binding: Binding | undefined, notification: SessionNotification): Promise<void> {
