@@ -3,9 +3,15 @@ import { getCurrentSystemPrompt, type Context, type Message } from "@earendil-wo
 
 import { AntigravityAcpError } from "../acp/errors.js";
 
-/** About 150k tokens at Pi's 4 chars/token estimate, leaving room under the
- * harness's 256k compaction limit for instructions, tools and further work. */
-export const MAX_RECONSTRUCTION_CHARS = 600_000;
+/** Antigravity keeps about the first 192 KB of one user input and cuts the
+ * rest, for the model too (measured 2026-10-17, server 1.4.0: a 400k-character
+ * rebuild reached the model as 68k tokens, its newest results gone). A prompt
+ * (instructions, history and request, in UTF-8 bytes) stays below that, with
+ * room for the harness's own wrapper. */
+export const MAX_PROMPT_BYTES = 160 * 1024;
+/** History keeps room for the active tool loop's labels beside an oversized
+ * request, which is never truncated. */
+const MIN_HISTORY_BYTES = 16 * 1024;
 const MAX_INSTRUCTION_BYTES = 256 * 1024;
 const ENTRY_SEPARATOR = "\n\n";
 const HISTORY_HEADING =
@@ -17,6 +23,7 @@ const CONTINUATION_LABEL =
 const WARM_CONTINUATION =
 	"Continue the current Pi user request already given in this session. Incorporate the latest tool results without repeating completed tool actions.";
 const LINE_BREAKS = /[\r\n\v\f\u0085\u2028\u2029]+/gu;
+const SECTION_SEPARATOR = "\n\n---\n\n";
 
 /** Instructions are never silently truncated or counted as consumed by a tool continuation. */
 export function currentSystemInstructions(context: Context): string {
@@ -61,36 +68,42 @@ export function buildPromptParts(
 	// Keep every call/result identity belonging to the active request, including
 	// parallel calls and multi-step tool loops, not only the last result's tail.
 	const pinStart = hasTrailingResults ? latestIndex + 1 : historyEnd;
+	// A warm session which already received this request only needs new results
+	// and a continuation. Resending its text/images could restart completed work.
+	const request: ContentBlock[] = [];
+	if (!fresh && hasTrailingResults && unseenStart !== undefined && unseenStart > latestIndex) {
+		request.push({ type: "text", text: WARM_CONTINUATION });
+	} else {
+		// The active request is an explicit user turn, never solely untrusted,
+		// truncatable history. This also preserves its image blocks on handoff.
+		if (hasTrailingResults) request.push({ type: "text", text: CONTINUATION_LABEL });
+		if (typeof latest.content === "string") {
+			if (latest.content.length > 0) request.push({ type: "text", text: latest.content });
+		} else {
+			for (const block of latest.content) {
+				if (block.type === "text") request.push({ type: "text", text: block.text });
+				else request.push({ type: "image", data: block.data, mimeType: block.mimeType });
+			}
+		}
+	}
+	let budget = MAX_PROMPT_BYTES - request.reduce((total, block) => total + (block.type === "text" ? utf8Bytes(block.text) : 0), 0);
 	const prompt: ContentBlock[] = [];
 	if (fresh) {
 		const sections: string[] = [];
 		const instructions = currentSystemInstructions(context);
-		if (instructions) sections.push(`# Pi session instructions\n\n${adaptInstructionsForAntigravity(instructions)}`);
-		const history = boundedSection(HISTORY_HEADING, historyEntries(context.messages, 0, historyEnd, latestIndex, pinStart));
+		if (instructions) {
+			const section = `# Pi session instructions\n\n${adaptInstructionsForAntigravity(instructions)}`;
+			sections.push(section);
+			budget -= utf8Bytes(section) + utf8Bytes(SECTION_SEPARATOR);
+		}
+		const history = boundedSection(HISTORY_HEADING, historyEntries(context.messages, 0, historyEnd, latestIndex, pinStart), budget);
 		if (history) sections.push(history);
-		if (sections.length) prompt.push(contextResource("context", sections.join("\n\n---\n\n")));
+		if (sections.length) prompt.push(contextResource("context", sections.join(SECTION_SEPARATOR)));
 	} else if (unseenStart !== undefined && unseenStart < historyEnd) {
-		const delta = boundedSection(DELTA_HEADING, historyEntries(context.messages, unseenStart, historyEnd, latestIndex, pinStart));
+		const delta = boundedSection(DELTA_HEADING, historyEntries(context.messages, unseenStart, historyEnd, latestIndex, pinStart), budget);
 		if (delta) prompt.push(contextResource("external-delta", delta));
 	}
-
-	// A warm session which already received this request only needs new results
-	// and a continuation. Resending its text/images could restart completed work.
-	if (!fresh && hasTrailingResults && unseenStart !== undefined && unseenStart > latestIndex) {
-		prompt.push({ type: "text", text: WARM_CONTINUATION });
-		return { prompt, messageCount: context.messages.length };
-	}
-	// The active request is an explicit user turn, never solely untrusted,
-	// truncatable history. This also preserves its image blocks on handoff.
-	if (hasTrailingResults) prompt.push({ type: "text", text: CONTINUATION_LABEL });
-	if (typeof latest.content === "string") {
-		if (latest.content.length > 0) prompt.push({ type: "text", text: latest.content });
-	} else {
-		for (const block of latest.content) {
-			if (block.type === "text") prompt.push({ type: "text", text: block.text });
-			else prompt.push({ type: "image", data: block.data, mimeType: block.mimeType });
-		}
-	}
+	prompt.push(...request);
 	if (prompt.length === 0) throw new AntigravityAcpError("invalid_input", "User message has no supported content");
 	return { prompt, messageCount: context.messages.length };
 }
@@ -199,21 +212,22 @@ function contextResource(kind: string, text: string): ContentBlock {
 	} };
 }
 
-/** Adapted from robertvitali's 8481e20 labelled history budgeting. Only untrusted
- * history is charged here; trusted instructions keep their independent byte
- * limit and transcript-delta semantics. Drop old entries first, retain active
- * labels, and allocate result bodies before filling the remaining older data. */
-function boundedSection(heading: string, entries: HistoryEntry[]): string {
+/** Adapted from robertvitali's 8481e20 labelled history budgeting. History gets
+ * the bytes the prompt has left after the instructions and the request, which
+ * are never truncated. Drop old entries first, retain active labels, and
+ * allocate result bodies before filling the remaining older data. */
+function boundedSection(heading: string, entries: HistoryEntry[], available: number): string {
 	if (entries.length === 0) return "";
+	const limit = Math.max(available, MIN_HISTORY_BYTES);
 	const full = [heading, ...entries.map((entry) => renderEntry(entry))].join(ENTRY_SEPARATOR);
-	if (full.length <= MAX_RECONSTRUCTION_CHARS) return full;
+	if (utf8Bytes(full) <= limit) return full;
 	const prefix = `${heading}${ENTRY_SEPARATOR}[truncated older context]`;
 	const firstPinned = entries.findIndex((entry) => entry.pinned);
 	const pinnedStart = firstPinned < 0 ? entries.length : firstPinned;
 	const pinned = entries.slice(pinnedStart);
 	const rendered = pinned.map(minimalEntry);
-	let remaining = MAX_RECONSTRUCTION_CHARS - prefix.length -
-		rendered.reduce((total, text) => total + ENTRY_SEPARATOR.length + text.length, 0);
+	let remaining = limit - utf8Bytes(prefix) -
+		rendered.reduce((total, text) => total + ENTRY_SEPARATOR.length + utf8Bytes(text), 0);
 	if (remaining < 0) {
 		throw new AntigravityAcpError("invalid_input", "The latest Pi tool turn does not fit in the Antigravity ACP context budget");
 	}
@@ -222,15 +236,15 @@ function boundedSection(heading: string, entries: HistoryEntry[]): string {
 		const entry = pinned[index]!;
 		const whole = renderEntry(entry);
 		if (entry.body === undefined || rendered[index] === whole || allowance <= 0) return 0;
-		const extra = whole.length - rendered[index]!.length;
+		const extra = utf8Bytes(whole) - utf8Bytes(rendered[index]!);
 		if (extra <= allowance) {
 			rendered[index] = whole;
 			return extra;
 		}
-		const kept = tailCodePoints(entry.body, allowance);
+		const kept = tailBytes(entry.body, allowance);
 		if (!kept) return 0;
 		rendered[index] = renderEntry(entry, kept);
-		return kept.length;
+		return utf8Bytes(kept);
 	};
 	// Huge arguments must not crowd out results. Calls/text get at most half
 	// the remaining room; results get the rest, newest first.
@@ -250,14 +264,15 @@ function boundedSection(heading: string, entries: HistoryEntry[]): string {
 	for (let index = pinnedStart - 1; index >= 0; index--) {
 		const entry = entries[index]!;
 		const whole = renderEntry(entry);
-		if (whole.length + ENTRY_SEPARATOR.length <= remaining) {
+		const size = utf8Bytes(whole);
+		if (size + ENTRY_SEPARATOR.length <= remaining) {
 			older.unshift(whole);
-			remaining -= whole.length + ENTRY_SEPARATOR.length;
+			remaining -= size + ENTRY_SEPARATOR.length;
 			continue;
 		}
 		if (older.length === 0 && entry.body !== undefined) {
-			const available = remaining - ENTRY_SEPARATOR.length - renderEntry(entry, "").length;
-			const kept = tailCodePoints(entry.body, available);
+			const room = remaining - ENTRY_SEPARATOR.length - utf8Bytes(renderEntry(entry, ""));
+			const kept = tailBytes(entry.body, room);
 			if (kept) older.unshift(renderEntry(entry, kept));
 		}
 		break;
@@ -283,14 +298,18 @@ function renderEntry(entry: HistoryEntry, body = entry.body): string {
 	return `${label}\n${fence}\n${body}\n${fence}`;
 }
 
-/** Tail in UTF-16 code units, without starting inside a surrogate pair. */
-function tailCodePoints(text: string, length: number): string {
-	if (length <= 0) return "";
-	let start = text.length - length;
-	if (start <= 0) return text;
-	const unit = text.charCodeAt(start);
-	if (unit >= 0xdc00 && unit <= 0xdfff) start++;
-	return text.slice(start);
+function utf8Bytes(text: string): number {
+	return Buffer.byteLength(text, "utf8");
+}
+
+/** The last `bytes` UTF-8 bytes of text, never starting inside a character. */
+function tailBytes(text: string, bytes: number): string {
+	if (bytes <= 0) return "";
+	const encoded = Buffer.from(text, "utf8");
+	if (encoded.length <= bytes) return text;
+	let start = encoded.length - bytes;
+	while (start < encoded.length && (encoded[start]! & 0xc0) === 0x80) start++;
+	return encoded.subarray(start).toString("utf8");
 }
 
 function historyEntries(messages: Message[], start: number, end: number, currentIndex: number, pinStart: number): HistoryEntry[] {

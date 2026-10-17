@@ -37,6 +37,7 @@ import {
 } from "./acp/connection.js";
 import { abortError, AntigravityAcpError, errorMessage } from "./acp/errors.js";
 import { AcpSessionStore } from "./acp/session-store.js";
+import { contextTokensInUse, transcriptCheckpoints } from "./acp/transcript-usage.js";
 import { sessionModels, sessionModes, type AcpModelInfo, type AcpNewSessionResponse, type SessionState } from "./acp/session-state.js";
 import {
 	MANAGED_AUTH_MARKER,
@@ -153,6 +154,10 @@ interface Binding {
 	/** True when the Antigravity built-ins in PI_OWNED_NATIVE_TOOLS are disabled. */
 	piOwnsTools: boolean;
 	contextTokens: number | undefined;
+	/** Harness checkpoints already in the transcript when this binding first saw it. */
+	harnessCheckpoints: number | undefined;
+	/** The harness replaced this session's history with its own summary. */
+	harnessCheckpointed: boolean;
 }
 
 export interface PermissionView {
@@ -566,14 +571,21 @@ export class AntigravityRuntime {
 			binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 		}
 
+		// Pi compacted (or otherwise rewrote) the history this session holds while
+		// the prompt waited on Pi, or the harness replaced it with its own summary.
+		// Resuming would keep Antigravity's version, so the turn restarts in a
+		// fresh session built from Pi's context.
+		const diverged = (binding.permission !== undefined || binding.pendingTools.size > 0) &&
+			(binding.harnessCheckpointed || contextDiverged(binding, context));
+
 		// A permission tool result resumes the still-running ACP prompt rather than
 		// starting a second Antigravity turn.
 		if (binding.permission) {
 			const pending = binding.permission;
 			const result = findPermissionResult(context, pending.id);
-			if (!result) {
+			if (!result || diverged) {
 				cancelPermission(binding);
-				await this.dropBinding(key, binding);
+				await this.dropBinding(key, binding, diverged);
 				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 			} else {
 				attachWriter(binding, writer);
@@ -601,9 +613,11 @@ export class AntigravityRuntime {
 				pending,
 				message: findToolResult(context, pending.invocation.id, pending.invocation.name),
 			}));
-			if (results.some((result) => result.message === undefined)) {
-				cancelPiTools(binding, "Pi continued without returning every requested tool result");
-				await this.dropBinding(key, binding);
+			if (diverged || results.some((result) => result.message === undefined)) {
+				cancelPiTools(binding, diverged
+					? "Antigravity restarts from Pi's context"
+					: "Pi continued without returning every requested tool result");
+				await this.dropBinding(key, binding, diverged);
 				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 			} else {
 				attachWriter(binding, writer);
@@ -635,7 +649,7 @@ export class AntigravityRuntime {
 			// A queued caller may hold an obsolete binding after shutdown/mode changes.
 			binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 			if (
-				binding.needsReconstruction || binding.mode !== this.permissionMode ||
+				binding.needsReconstruction || binding.harnessCheckpointed || binding.mode !== this.permissionMode ||
 				this.confirmedMode(binding) !== this.permissionMode ||
 				binding.toolFingerprint !== piToolFingerprint(tools) ||
 				context.messages.length < binding.messageCount ||
@@ -953,6 +967,8 @@ export class AntigravityRuntime {
 				toolOwner,
 				piOwnsTools,
 				contextTokens: undefined,
+				harnessCheckpoints: undefined,
+				harnessCheckpointed: false,
 			};
 			binding = createdBinding;
 			this.persistBinding(createdBinding);
@@ -1028,7 +1044,8 @@ export class AntigravityRuntime {
 				if (binding.toolBatchTimer) clearTimeout(binding.toolBatchTimer);
 				binding.toolBatchTimer = setTimeout(() => {
 					binding.toolBatchTimer = undefined;
-					binding.writer?.done("toolUse");
+					// The step's usage update may still be resolving its real count.
+					void binding.updateQueue.then(() => binding.writer?.done("toolUse"));
 				}, TOOL_BATCH_MS);
 				binding.toolBatchTimer.unref();
 			} catch {
@@ -1072,6 +1089,23 @@ export class AntigravityRuntime {
 		});
 	}
 
+	/** The harness summarised the session on its own. The byte count it leaves
+	 * stays high, so Pi compacts, and the next call rebuilds from Pi's context. */
+	private noteHarnessCheckpoint(binding: Binding, writer: PiEventWriter, checkpoints: number): void {
+		if (binding.harnessCheckpoints === undefined || checkpoints <= binding.harnessCheckpoints) {
+			binding.harnessCheckpoints ??= checkpoints;
+			return;
+		}
+		binding.harnessCheckpoints = checkpoints;
+		if (binding.harnessCheckpointed) return;
+		binding.harnessCheckpointed = true;
+		if (binding.piSessionId) this.sessionStore?.remove(binding.piSessionId);
+		writer.text(
+			"\n\n⚠️ Antigravity replaced this conversation's history with its own summary. " +
+				"Pi's context replaces it in a fresh Antigravity session from the next step.\n\n",
+		);
+	}
+
 	private noteBackendStall(binding: Binding | undefined, info: { busy: boolean; silentMs: number; abortInMs?: number }): void {
 		const writer = binding?.writer;
 		if (!writer || writer.finished) return;
@@ -1103,9 +1137,11 @@ export class AntigravityRuntime {
 				else if (activity.type === "thought") writer.thinking(activity.delta);
 				else if (activity.type === "plan") writer.thinking(activity.text);
 				else if (activity.type === "usage") {
-					binding.contextTokens = activity.used;
-					this.metrics.recordContext(activity.used, activity.size);
-					writer.message.usage = contextUsage(activity.used);
+					const used = await contextTokensInUse(notification.sessionId, activity.used);
+					this.noteHarnessCheckpoint(binding, writer, transcriptCheckpoints(notification.sessionId));
+					binding.contextTokens = used;
+					this.metrics.recordContext(used, activity.size);
+					writer.message.usage = contextUsage(used);
 				} else if (activity.type === "config") {
 					// The server changed the selection itself, e.g. it replaced a model
 					// that is no longer offered. The connection already recorded the new
@@ -1277,6 +1313,15 @@ function findPermissionResult(context: Context, requestId: string): PermissionTo
 		};
 	}
 	return undefined;
+}
+
+/** True when `context` no longer extends what this binding's prompt was sent.
+ * Changed instructions also rewrite the collapsed prefix; those finish the
+ * prompt and rebuild afterwards (see noteContinuationInstructions). */
+function contextDiverged(binding: Binding, context: Context): boolean {
+	if (binding.instructionsFingerprint !== instructionFingerprint(context)) return false;
+	return context.messages.length < binding.pendingContextCount ||
+		messagesFingerprint(context.messages.slice(0, binding.pendingContextCount)) !== binding.pendingContextFingerprint;
 }
 
 function messagesFingerprint(messages: Context["messages"]): string {

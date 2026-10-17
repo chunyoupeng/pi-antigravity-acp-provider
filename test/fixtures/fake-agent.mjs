@@ -12,6 +12,8 @@ const scenario = process.argv[2];
 const thinkingLevels = scenario === "thinking-levels";
 const modern = scenario?.startsWith("config-options") || thinkingLevels;
 const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
+// A UUID here lets the provider find a transcript a test writes for it.
+const SESSION_ID = process.env.FAKE_SESSION_ID ?? "fake-session";
 let model = thinkingLevels ? "gemini-flash-high" : "auto";
 let mode = "default";
 let permissionPromptId;
@@ -64,7 +66,7 @@ for await (const line of rl) {
 			jsonrpc: "2.0",
 			method: "session/update",
 			params: {
-				sessionId: "fake-session",
+				sessionId: SESSION_ID,
 				update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `Decision: ${decision}` } },
 			},
 		});
@@ -153,7 +155,7 @@ for await (const line of rl) {
 			jsonrpc: "2.0",
 			id,
 			result: thinkingLevels ? {
-				sessionId: "fake-session",
+				sessionId: SESSION_ID,
 				configOptions: sessionConfigOptions(),
 				models: {
 					currentModelId: model,
@@ -162,8 +164,8 @@ for await (const line of rl) {
 						name: `Gemini Flash (${level[0].toUpperCase()}${level.slice(1)})`,
 					})),
 				},
-			} : modern ? { sessionId: "fake-session", configOptions: sessionConfigOptions() } : {
-				sessionId: "fake-session",
+			} : modern ? { sessionId: SESSION_ID, configOptions: sessionConfigOptions() } : {
+				sessionId: SESSION_ID,
 				modes: sessionModes(),
 				models: {
 					currentModelId: model,

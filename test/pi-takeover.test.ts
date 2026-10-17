@@ -103,6 +103,45 @@ describe("Pi takeover of Antigravity capabilities", () => {
 		}
 	});
 
+	it("rebuilds from Pi's context after the harness replaces history with its own summary", async () => {
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "harness-checkpoint-"));
+		directories.push(home);
+		const acpSessionId = "0aba03aa-84de-4119-976a-b7ef85cc4727";
+		const logs = path.join(home, "antigravity-acp", "brain", acpSessionId, ".system_generated", "logs");
+		fs.mkdirSync(logs, { recursive: true });
+		const transcript = path.join(logs, "transcript_full.jsonl");
+		const planner = JSON.stringify({ step_index: 1, type: "PLANNER_RESPONSE", input_tokens: 1234, cache_read_tokens: 0, output_tokens: 0 });
+		fs.writeFileSync(transcript, `${planner}\n`);
+		const saved = { home: process.env.GEMINI_HOME, id: process.env.FAKE_SESSION_ID };
+		process.env.GEMINI_HOME = home;
+		process.env.FAKE_SESSION_ID = acpSessionId;
+		const runtime = runtimeFor("default");
+		const text = (message: { content: Array<{ type: string; text?: string }> }) => message.content.map((block) => block.text ?? "").join("");
+		try {
+			const history: Message[] = [];
+			const turn = async (prompt: string) => {
+				const timestamp = history.length + 1;
+				const { message } = await ask(runtime, prompt, "harness-checkpoint", history);
+				history.push({ role: "user", content: prompt, timestamp }, message);
+				return message;
+			};
+			expect(text(await turn("report usage"))).not.toContain("own summary");
+			fs.appendFileSync(transcript, `${JSON.stringify({ step_index: 2, type: "CHECKPOINT", content: "harness summary" })}\n${planner}\n`);
+			expect(text(await turn("report usage"))).toContain("Antigravity replaced this conversation's history with its own summary");
+			const generation = (await runtime.snapshot()).processes[0]?.generation;
+			const rebuilt = text(await turn("inspect context"));
+			expect(rebuilt).toContain("# Prior conversation");
+			expect(rebuilt).toContain("counted");
+			expect((await runtime.snapshot()).processes[0]?.generation).not.toBe(generation);
+		} finally {
+			await runtime.close();
+			if (saved.home === undefined) delete process.env.GEMINI_HOME;
+			else process.env.GEMINI_HOME = saved.home;
+			if (saved.id === undefined) delete process.env.FAKE_SESSION_ID;
+			else process.env.FAKE_SESSION_ID = saved.id;
+		}
+	});
+
 	it("discovers thinking levels and selects them through the family and thinking_level selectors", async () => {
 		const runtime = runtimeFor("thinking-levels");
 		try {

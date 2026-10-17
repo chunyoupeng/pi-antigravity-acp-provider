@@ -1,10 +1,12 @@
 import type { AssistantMessage, Context, ToolResultMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 
-import { buildPromptParts, MAX_RECONSTRUCTION_CHARS } from "../src/stream/context.js";
+import type { ContentBlock } from "@agentclientprotocol/sdk";
+
+import { buildPromptParts, MAX_PROMPT_BYTES } from "../src/stream/context.js";
 import { usageFromPrompt } from "../src/stream/usage.js";
 
-const LIMIT = MAX_RECONSTRUCTION_CHARS;
+const LIMIT = MAX_PROMPT_BYTES;
 const OVER_LIMIT = LIMIT + 8_000;
 const IMAGE = { type: "image" as const, data: "aGVsbG8=", mimeType: "image/png" };
 function assistant(content: AssistantMessage["content"]): AssistantMessage {
@@ -21,6 +23,10 @@ function toolContext(body: string): Context {
 		result(body),
 	] };
 }
+/** What Antigravity receives as one user input, in UTF-8 bytes. */
+function promptBytes(prompt: ContentBlock[]): number {
+	return prompt.reduce((total, block) => total + Buffer.byteLength(block.type === "text" ? block.text : block.type === "resource" ? resourceText(block) : "", "utf8"), 0);
+}
 function resourceText(block: unknown): string {
 	const resource = (block as { resource?: { text?: string } }).resource;
 	if (typeof resource?.text !== "string") throw new Error("expected text resource");
@@ -31,7 +37,7 @@ describe("bounded context reconstruction", () => {
 	it("delivers the active request and images explicitly despite an oversized tool result", () => {
 		const { prompt } = buildPromptParts(toolContext("x".repeat(OVER_LIMIT) + "RESULT_TAIL"), true);
 		const history = resourceText(prompt[0]);
-		expect(history.length).toBeLessThanOrEqual(LIMIT);
+		expect(promptBytes(prompt)).toBeLessThanOrEqual(LIMIT);
 		expect(history).toContain("[truncated older context]");
 		expect(history).toContain("[tool call read id=call-1]");
 		expect(history).toContain("## Tool result (read id=call-1) [truncated]");
@@ -48,14 +54,14 @@ describe("bounded context reconstruction", () => {
 		const instructions = "  PRESERVE_SPACES  " + "π".repeat(20_000);
 		context.messages.unshift({ role: "system", content: instructions, sections: { rule: "old", removed: "obsolete" }, timestamp: 0 });
 		context.messages.push({ role: "system", content: "ADDITIONAL_RULE", sections: { rule: "NEW_RULE", removed: null }, timestamp: 4 });
-		const text = resourceText(buildPromptParts(context, true).prompt[0]);
+		const { prompt } = buildPromptParts(context, true);
+		const text = resourceText(prompt[0]);
 		expect(text).toContain(instructions);
 		expect(text).toContain("ADDITIONAL_RULE");
 		expect(text).toContain("NEW_RULE");
 		expect(text).not.toContain("obsolete");
 		expect(text).not.toContain("Tool result (undefined");
-		const history = text.slice(text.indexOf("# Prior conversation"));
-		expect(history.length).toBeLessThanOrEqual(LIMIT);
+		expect(promptBytes(prompt)).toBeLessThanOrEqual(LIMIT);
 	});
 
 	it("never truncates the explicit current request", () => {
@@ -68,8 +74,9 @@ describe("bounded context reconstruction", () => {
 	it("keeps a small tool result whole even when call arguments are huge", () => {
 		const context = toolContext("RESULT_OK");
 		context.messages[1] = assistant([{ type: "toolCall", id: "call-1", name: "read", arguments: { text: "x".repeat(OVER_LIMIT) + "ARGS_TAIL" } }]);
-		const text = resourceText(buildPromptParts(context, true).prompt[0]);
-		expect(text.length).toBeLessThanOrEqual(LIMIT);
+		const { prompt } = buildPromptParts(context, true);
+		const text = resourceText(prompt[0]);
+		expect(promptBytes(prompt)).toBeLessThanOrEqual(LIMIT);
 		expect(text).toContain("[tool call read id=call-1] [truncated]");
 		expect(text).toContain("ARGS_TAIL");
 		expect(text).toContain("## Tool result (read id=call-1)\n```\nRESULT_OK\n```");
@@ -83,8 +90,9 @@ describe("bounded context reconstruction", () => {
 			{ type: "toolCall", id: "call-2", name: "write", arguments: {} },
 		]);
 		context.messages.push(result("x".repeat(OVER_LIMIT) + "SECOND_TAIL", "call-2", "write"));
-		const text = resourceText(buildPromptParts(context, true).prompt[0]);
-		expect(text.length).toBeLessThanOrEqual(LIMIT);
+		const { prompt } = buildPromptParts(context, true);
+		const text = resourceText(prompt[0]);
+		expect(promptBytes(prompt)).toBeLessThanOrEqual(LIMIT);
 		for (const label of ["[tool call read id=call-1]", "[tool call write id=call-2]", "## Tool result (read id=call-1)", "## Tool result (write id=call-2)"]) expect(text).toContain(label);
 		expect(text).not.toContain("OLD_CANARY");
 		expect(text).toContain("SECOND_TAIL");
@@ -114,16 +122,24 @@ describe("bounded context reconstruction", () => {
 	});
 
 	it("does not split surrogate pairs or lose truncation fences", () => {
-		const pairs = Math.floor(LIMIT / 2) + 4_000;
+		const pairs = Math.floor(LIMIT / 4) + 4_000;
 		for (const name of ["read", "reads"]) {
 			const context = toolContext("😀".repeat(pairs) + "END");
 			context.messages[2] = result("😀".repeat(pairs) + "END", "call-1", name);
-			const text = resourceText(buildPromptParts(context, true).prompt[0]);
-			expect(text.length).toBeLessThanOrEqual(LIMIT);
+			const { prompt } = buildPromptParts(context, true);
+			const text = resourceText(prompt[0]);
+			expect(promptBytes(prompt)).toBeLessThanOrEqual(LIMIT);
 			expect(text).toContain("😀END");
 			expect(text).not.toMatch(/[\uD800-\uDFFF]/u);
 			expect(text.endsWith("\n```")).toBe(true);
 		}
+	});
+
+	it("budgets Chinese history by its UTF-8 bytes, keeping the newest text", () => {
+		const { prompt } = buildPromptParts(toolContext("汉".repeat(60_000) + "最新结果"), true);
+		expect(promptBytes(prompt)).toBeLessThanOrEqual(LIMIT);
+		expect(resourceText(prompt[0])).toContain("汉最新结果");
+		expect(resourceText(prompt[0])).not.toContain("�");
 	});
 
 	it("records omitted images in tool-result history", () => {
@@ -136,7 +152,7 @@ describe("bounded context reconstruction", () => {
 		const context = toolContext("x".repeat(OVER_LIMIT) + "RESULT_TAIL");
 		const { prompt } = buildPromptParts(context, false, 0);
 		const text = resourceText(prompt[0]);
-		expect(text.length).toBeLessThanOrEqual(LIMIT);
+		expect(promptBytes(prompt)).toBeLessThanOrEqual(LIMIT);
 		expect(text).toContain("# Context added outside the warm Antigravity session");
 		expect(text).toContain("[tool call read id=call-1]");
 		expect(text).not.toContain("ACTIVE_REQUEST");

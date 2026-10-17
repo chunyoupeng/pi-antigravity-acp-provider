@@ -2,6 +2,8 @@
 
 The provider installs Google Antigravity ACP separately from the npm package. Managed installations default to automatic runtime updates and check at most once every 24 hours when Antigravity is first used. External executables selected through `AGY_ACP_BIN`, `~/.local/bin`, or `PATH` are never replaced.
 
+A new server version can silently change how Antigravity counts, truncates and stores context, which decides whether Pi still manages compaction. After an update, re-check the measured values listed in [CONTEXT-COMPACTION.md](CONTEXT-COMPACTION.md#acp-更新时要检查什么) (usage double count, byte ratio, checkpoint threshold, user-input cap, transcript format).
+
 ## Trust model
 
 The official ACP registry identifies Google's current release and download URLs, but it does not publish checksums. The provider therefore does not execute a registry artifact based on the registry URL alone.

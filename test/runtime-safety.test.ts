@@ -10,6 +10,7 @@ import { AcpSessionStore } from "../src/acp/session-store.js";
 import { AntigravityRuntime, PERMISSION_TOOL_NAME, PERMISSION_RESULT_KIND } from "../src/runtime.js";
 import type { PermissionMode } from "../src/config.js";
 import type { PiEventWriter } from "../src/stream/pi-events.js";
+import { MAX_PROMPT_BYTES } from "../src/stream/context.js";
 import { piToolFingerprint, PiMcpBridge } from "../src/mcp/bridge.js";
 
 const fakeAgent = fileURLToPath(new URL("./fixtures/fake-agent.mjs", import.meta.url));
@@ -290,7 +291,8 @@ describe("context handoff transport", () => {
 		expect(reconstruction).toContain("[tool call read id=external-call]");
 		expect(reconstruction).toContain("## Tool result (read id=external-call)");
 		expect(reconstruction).toContain("RESULT_TAIL");
-		expect(reconstruction.slice(reconstruction.indexOf("# Prior conversation")).length).toBeLessThanOrEqual(600_000);
+		const bytes = prompt.reduce((total, block) => total + Buffer.byteLength(block.text ?? block.resource?.text ?? "", "utf8"), 0);
+		expect(bytes).toBeLessThanOrEqual(MAX_PROMPT_BYTES);
 	});
 });
 

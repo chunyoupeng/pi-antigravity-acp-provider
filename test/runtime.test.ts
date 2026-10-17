@@ -456,6 +456,57 @@ describe("AntigravityRuntime", () => {
 		}
 	});
 
+	it("restarts from Pi's compacted context when Pi compacts during a tool loop", async () => {
+		const runtime = new AntigravityRuntime(
+			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent] }),
+		);
+		try {
+			const tools = [
+				{ name: "echo", description: "Echo text", parameters: Type.Object({ text: Type.String() }) },
+			];
+			const firstContext: Context = {
+				tools,
+				messages: [
+					{ role: "user", content: "earlier work", timestamp: 1 },
+					{ role: "user", content: "use bridge", timestamp: 2 },
+				],
+			};
+			const firstWriter = runtime.stream(model, firstContext, { sessionId: "compacting-session", apiKey: "test-key" });
+			const firstEvents = [];
+			for await (const event of firstWriter.stream) firstEvents.push(event);
+			const firstDone = firstEvents.at(-1);
+			if (firstDone?.type !== "done" || firstDone.reason !== "toolUse") throw new Error("missing bridged tool turn");
+			const call = firstDone.message.content.find((block) => block.type === "toolCall");
+			if (!call || call.type !== "toolCall") throw new Error("missing bridged tool call");
+			const firstGeneration = (await runtime.snapshot()).processes[0]?.generation;
+
+			// Pi replaced the earlier history with a summary before returning the result.
+			const secondWriter = runtime.stream(
+				model,
+				{
+					tools,
+					messages: [
+						{ role: "user", content: "COMPACTION SUMMARY of earlier work", timestamp: 1 },
+						{ role: "user", content: "use bridge", timestamp: 2 },
+						firstDone.message,
+						{ role: "toolResult", toolCallId: call.id, toolName: call.name, content: [{ type: "text", text: "echo result" }], isError: false, timestamp: 3 },
+					],
+				},
+				{ sessionId: "compacting-session", apiKey: "test-key" },
+			);
+			const secondEvents = [];
+			for await (const event of secondWriter.stream) secondEvents.push(event);
+			expect(secondEvents.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+			const text = secondWriter.message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+			expect(text).toContain("COMPACTION SUMMARY of earlier work");
+			expect(text).toContain("echo result");
+			expect(text).not.toMatch(/^earlier work$/mu);
+			expect((await runtime.snapshot()).processes[0]?.generation).not.toBe(firstGeneration);
+		} finally {
+			await runtime.close();
+		}
+	});
+
 	/** Runs one bridged Pi tool call and returns what the agent received over MCP. */
 	async function relayToolResult(content: ToolResultMessage["content"]): Promise<string> {
 		const runtime = new AntigravityRuntime(
