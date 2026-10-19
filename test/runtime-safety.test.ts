@@ -7,6 +7,7 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AntigravityAcpConnection } from "../src/acp/connection.js";
 import { AcpSessionStore } from "../src/acp/session-store.js";
+import { DecisionLog } from "../src/acp/decision-log.js";
 import { AntigravityRuntime, PERMISSION_TOOL_NAME, PERMISSION_RESULT_KIND } from "../src/runtime.js";
 import type { PermissionMode } from "../src/config.js";
 import type { PiEventWriter } from "../src/stream/pi-events.js";
@@ -23,7 +24,7 @@ afterEach(async () => {
 	for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-function setup(scenario?: string, mode: PermissionMode = "yolo", store?: AcpSessionStore) {
+function setup(scenario?: string, mode: PermissionMode = "yolo", store?: AcpSessionStore, decisions?: DecisionLog) {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-runtime-safety-")); roots.push(root);
 	const log = path.join(root, "calls.jsonl"); fs.writeFileSync(log, "");
 	const connections: AntigravityAcpConnection[] = [];
@@ -31,7 +32,7 @@ function setup(scenario?: string, mode: PermissionMode = "yolo", store?: AcpSess
 		const connection = new AntigravityAcpConnection({ ...options, command: process.execPath,
 			args: [fakeAgent, ...(scenario ? [scenario] : [])], env: { ...process.env, FAKE_AGENT_LOG_FILE: log } });
 		connections.push(connection); return connection;
-	}, mode, store);
+	}, mode, store, undefined, "pi", undefined, decisions);
 	runtimes.push(runtime);
 	const entries = () => fs.readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as { method: string; prompt?: unknown; mode?: string });
 	return { root, runtime, connections, entries };
@@ -165,6 +166,33 @@ describe("abort cleanup", () => {
 		await new Promise((resolve) => setTimeout(resolve, 50));
 		expect((await runtime.snapshot()).processes[0]?.alive).toBe(true);
 		const next = await turn(runtime, [user("hello")], "abort"); expect(next.stopReason).toBe("stop");
+	});
+
+	it("starts a fresh session instead of replaying history into one whose turn died", async () => {
+		const fixture = setup();
+		const store = new AcpSessionStore(path.join(fixture.root, "sessions.json"));
+		const decisionFile = path.join(fixture.root, "bindings.jsonl");
+		const { runtime, connections, entries } = setup(undefined, "yolo", store, new DecisionLog(decisionFile));
+		const first = await turn(runtime, [user("hello")], "died");
+		expect(store.get("died")).toBeDefined();
+		const stuck = turn(runtime, [user("hello"), first, user("native stuck", 2)], "died");
+		await vi.waitFor(() => expect(entries().filter((entry) => entry.method === "session/prompt")).toHaveLength(2));
+		expect(store.get("died")).toBeUndefined();
+		await connections[0]?.close();
+		expect((await stuck).stopReason).toBe("error");
+		const next = await turn(runtime, [user("hello"), first, user("native stuck", 2), user("go on", 3)], "died");
+		expect(next.stopReason).toBe("stop");
+		const methods = entries().map((entry) => entry.method);
+		expect(methods.filter((method) => method === "session/new")).toHaveLength(2);
+		expect(methods.some((method) => method === "session/resume" || method === "session/load")).toBe(false);
+		expect(store.get("died")).toBeDefined();
+		const decisions = fs.readFileSync(decisionFile, "utf8").trim().split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		// The prompt's failure and the process exit race; only their content is fixed.
+		expect(decisions.filter((entry) => entry.event === "bind").map((entry) => entry.how)).toEqual(["new", "new"]);
+		expect(decisions.filter((entry) => entry.event === "prompt").map((entry) => entry.fresh)).toEqual([true, false, true]);
+		expect(decisions.filter((entry) => entry.event === "end").map((entry) => entry.stop ?? "error")).toEqual(["end_turn", "error", "end_turn"]);
+		expect(decisions.some((entry) => entry.event === "exit" && entry.acp === decisions[0]?.acp)).toBe(true);
 	});
 
 	it("cancels a parked turn before applying a new permission policy", async () => {

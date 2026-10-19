@@ -35,6 +35,7 @@ import {
 	type AntigravityConnectionOptions,
 	type SessionMeta,
 } from "./acp/connection.js";
+import { DecisionLog, type DecisionFields } from "./acp/decision-log.js";
 import { abortError, AntigravityAcpError, errorMessage } from "./acp/errors.js";
 import { AcpSessionStore } from "./acp/session-store.js";
 import { contextTokensInUse, transcriptCheckpoints } from "./acp/transcript-usage.js";
@@ -219,6 +220,7 @@ export class AntigravityRuntime {
 	private readonly connectionFactory: AntigravityConnectionFactory;
 	private readonly ensureAgent: boolean;
 	private readonly sessionStore: AcpSessionStore | undefined;
+	private readonly decisions: DecisionLog | undefined;
 	private readonly metrics = new RuntimeMetrics();
 	private permissionMode: PermissionMode;
 	private toolOwner: ToolOwner;
@@ -230,12 +232,14 @@ export class AntigravityRuntime {
 		private readonly onToolActivity?: (activity: AcpToolActivity) => void,
 		toolOwner: ToolOwner = "pi",
 		private readonly toolHandoffMs = TOOL_HANDOFF_MS,
+		decisionLog?: DecisionLog,
 	) {
 		this.toolOwner = toolOwner;
 		this.connectionFactory = connectionFactory ?? ((options) => new AntigravityAcpConnection(options));
 		this.ensureAgent = connectionFactory === undefined;
 		this.permissionMode = permissionMode;
 		this.sessionStore = sessionStore ?? (this.ensureAgent ? new AcpSessionStore() : undefined);
+		this.decisions = decisionLog ?? (this.ensureAgent ? new DecisionLog() : undefined);
 	}
 
 	stream(model: AntigravityModel, context: Context, options: SimpleStreamOptions = {}): PiEventWriter {
@@ -435,7 +439,7 @@ export class AntigravityRuntime {
 			if (binding.turnCompletion || binding.permission || binding.pendingTools.size > 0) {
 				throw new AntigravityAcpError("invalid_input", "Wait for the current Antigravity turn to finish first");
 			}
-			await this.dropBinding(key, binding);
+			await this.dropBinding(key, binding, "attached another session");
 		}
 		this.sessionStore.save({
 			piSessionId,
@@ -461,7 +465,7 @@ export class AntigravityRuntime {
 						if (this.confirmedMode(binding) === mode) { binding.mode = mode; return; }
 					} catch { /* Close below; the next turn must negotiate again. */ }
 				}
-				await this.invalidateBinding(binding);
+				await this.invalidateBinding(binding, "permission mode changed");
 			}));
 		});
 		this.modeChanges = change.catch(() => undefined);
@@ -567,7 +571,7 @@ export class AntigravityRuntime {
 		// Check before continuation early returns as well as before fresh prompts.
 		if (binding.mode !== this.permissionMode || this.confirmedMode(binding) !== this.permissionMode ||
 			binding.toolFingerprint !== piToolFingerprint(tools)) {
-			await this.invalidateBinding(binding);
+			await this.invalidateBinding(binding, "permission mode or tools changed");
 			binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 		}
 
@@ -585,7 +589,7 @@ export class AntigravityRuntime {
 			const result = findPermissionResult(context, pending.id);
 			if (!result || diverged) {
 				cancelPermission(binding);
-				await this.dropBinding(key, binding, diverged);
+				await this.dropBinding(key, binding, diverged ? "history diverged" : "permission left unanswered", diverged);
 				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 			} else {
 				attachWriter(binding, writer);
@@ -617,7 +621,7 @@ export class AntigravityRuntime {
 				cancelPiTools(binding, diverged
 					? "Antigravity restarts from Pi's context"
 					: "Pi continued without returning every requested tool result");
-				await this.dropBinding(key, binding, diverged);
+				await this.dropBinding(key, binding, diverged ? "history diverged" : "tool results missing", diverged);
 				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 			} else {
 				attachWriter(binding, writer);
@@ -648,21 +652,15 @@ export class AntigravityRuntime {
 			this.assertEpoch(epoch);
 			// A queued caller may hold an obsolete binding after shutdown/mode changes.
 			binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
-			if (
-				binding.needsReconstruction || binding.harnessCheckpointed || binding.mode !== this.permissionMode ||
-				this.confirmedMode(binding) !== this.permissionMode ||
-				binding.toolFingerprint !== piToolFingerprint(tools) ||
-				context.messages.length < binding.messageCount ||
-				messagesFingerprint(context.messages.slice(0, binding.messageCount)) !==
-					binding.historyFingerprint
-			) {
-				await this.dropBinding(key, binding, true);
+			const stale = this.staleReason(binding, context, tools);
+			if (stale) {
+				await this.dropBinding(key, binding, stale, true);
 				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 			}
 			// A tool-owner switch keeps the ACP session; the next binding resumes it
 			// with the new tool filter.
 			if (binding.toolOwner !== this.toolOwner) {
-				await this.dropBinding(key, binding);
+				await this.dropBinding(key, binding, "tool owner changed");
 				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 			}
 			if (binding.modelId !== acpModelId) {
@@ -688,7 +686,7 @@ export class AntigravityRuntime {
 			await this.modeChanges;
 			this.assertEpoch(epoch);
 			if (binding.mode !== this.permissionMode || this.confirmedMode(binding) !== this.permissionMode || !binding.connection.process.alive) {
-				await this.invalidateBinding(binding);
+				await this.invalidateBinding(binding, "permission mode changed or process exited before prompting");
 				throw new AntigravityAcpError("protocol", "Permission mode changed before prompting; retry the turn");
 			}
 			binding.instructionsFingerprint = instructionFingerprint(context);
@@ -707,6 +705,16 @@ export class AntigravityRuntime {
 			binding.toolTracker.clear();
 			binding.lateResults = [];
 			binding.updateQueue = Promise.resolve();
+			// The saved record describes the session only between prompts. A turn that
+			// dies midway leaves steps in Antigravity that Pi's history repeats, so the
+			// next binding must start fresh rather than resume and replay it.
+			if (binding.piSessionId) this.sessionStore?.remove(binding.piSessionId);
+			this.decide(binding, "prompt", {
+				fresh,
+				from: fresh ? 0 : unseenStart,
+				to: context.messages.length,
+				bytes: Buffer.byteLength(JSON.stringify(parts.prompt), "utf8"),
+			});
 			let response = await binding.connection.prompt(
 				{ sessionId: binding.session.sessionId, prompt: parts.prompt },
 				options.signal,
@@ -718,6 +726,7 @@ export class AntigravityRuntime {
 				await binding.updateQueue;
 				if (response.stopReason !== "end_turn" || binding.abortRequested || binding.lateResults.length === 0) break;
 				this.metrics.record(response, usageFromPrompt(response));
+				this.decide(binding, "prompt", { lateResults: binding.lateResults.length });
 				response = await binding.connection.prompt(
 					{
 						sessionId: binding.session.sessionId,
@@ -737,6 +746,7 @@ export class AntigravityRuntime {
 			binding.historyFingerprint = binding.pendingContextFingerprint;
 			binding.expectedAssistantFingerprint = messageFingerprint(activeWriter.message);
 			this.persistBinding(binding);
+			this.decide(binding, "end", { stop: response.stopReason, tokens: activeWriter.message.usage.totalTokens });
 			switch (response.stopReason) {
 				case "cancelled":
 					throw abortError();
@@ -750,7 +760,8 @@ export class AntigravityRuntime {
 		} catch (error) {
 			binding.writer?.fail(error, isAbort(error));
 			if (isAbort(error) || binding.abortRequested) abortTurn(binding);
-			if (!binding.connection.process.alive) await this.dropBinding(key, binding);
+			this.decide(binding, "end", { error: errorMessage(error), aborted: isAbort(error) || binding.abortRequested });
+			if (!binding.connection.process.alive) await this.dropBinding(key, binding, "process exited");
 			throw error;
 		} finally {
 			if (onTurnAbort) options.signal?.removeEventListener("abort", onTurnAbort);
@@ -764,7 +775,7 @@ export class AntigravityRuntime {
 			binding.writer = undefined;
 			release();
 			if (this.queues.get(key) === queue) this.queues.delete(key);
-			if (!persistent) await this.dropBinding(key, binding);
+			if (!persistent) await this.dropBinding(key, binding, "ephemeral turn finished");
 		}
 	}
 
@@ -900,12 +911,14 @@ export class AntigravityRuntime {
 			const saved = piSessionId ? this.sessionStore?.get(piSessionId) : undefined;
 			let session: AcpNewSessionResponse | undefined;
 			let restored = false;
+			let how = "new";
 			if (saved?.cwd === cwd) {
 				if (initialize.agentCapabilities?.sessionCapabilities?.resume) {
 					try {
 						const resumed = await connection.resumeSession(saved.acpSessionId, cwd, mcpServers, signal, meta);
 						session = { sessionId: saved.acpSessionId, ...resumed };
 						restored = true;
+						how = "resume";
 					} catch {
 						// Some Antigravity builds advertise the draft method before implementing it.
 					}
@@ -915,6 +928,7 @@ export class AntigravityRuntime {
 						const loaded = await connection.loadSession(saved.acpSessionId, cwd, mcpServers, signal, meta);
 						session = { sessionId: saved.acpSessionId, ...loaded };
 						restored = true;
+						how = "load";
 					} catch {
 						this.sessionStore?.remove(saved.piSessionId);
 					}
@@ -971,9 +985,16 @@ export class AntigravityRuntime {
 				harnessCheckpointed: false,
 			};
 			binding = createdBinding;
+			this.decide(createdBinding, "bind", {
+				how,
+				messageCount: createdBinding.messageCount,
+				savedAcp: saved && !restored ? saved.acpSessionId : undefined,
+				model: acpModelId,
+			});
 			this.persistBinding(createdBinding);
 			this.resolvedBindings.add(createdBinding);
-			void connection.process.exited.then(() => {
+			void connection.process.exited.then((exit) => {
+				this.decide(createdBinding, "exit", { code: exit.code ?? undefined, signal: exit.signal ?? undefined });
 				cancelPermission(createdBinding);
 				cancelPiTools(createdBinding, "Antigravity process exited before Pi returned the tool result");
 				this.resolvedBindings.delete(createdBinding);
@@ -1097,6 +1118,7 @@ export class AntigravityRuntime {
 			return;
 		}
 		binding.harnessCheckpoints = checkpoints;
+		this.decide(binding, "checkpoint", { checkpoints });
 		if (binding.harnessCheckpointed) return;
 		binding.harnessCheckpointed = true;
 		if (binding.piSessionId) this.sessionStore?.remove(binding.piSessionId);
@@ -1125,7 +1147,7 @@ export class AntigravityRuntime {
 		if ((notification.update.sessionUpdate === "config_option_update" || notification.update.sessionUpdate === "current_mode_update") &&
 			this.confirmedMode(binding) !== this.permissionMode) {
 			binding.writer?.fail(new AntigravityAcpError("protocol", "Antigravity changed the permission mode unexpectedly; session closed"), false);
-			void this.invalidateBinding(binding).catch(() => undefined);
+			void this.invalidateBinding(binding, "server changed permission mode").catch(() => undefined);
 			return;
 		}
 		if (!binding.writer) return;
@@ -1170,7 +1192,8 @@ export class AntigravityRuntime {
 		await binding.updateQueue;
 	}
 
-	private async dropBinding(key: string, binding: Binding, removeSaved = false): Promise<void> {
+	private async dropBinding(key: string, binding: Binding, reason: string, removeSaved = false): Promise<void> {
+		this.decide(binding, "drop", { reason, removeSaved });
 		const current = this.bindings.get(key);
 		if (current && (await current) === binding && this.bindings.get(key) === current) {
 			if (removeSaved && binding.piSessionId) this.sessionStore?.remove(binding.piSessionId);
@@ -1195,9 +1218,30 @@ export class AntigravityRuntime {
 		}
 	}
 
-	private async invalidateBinding(binding: Binding): Promise<void> {
+	private async invalidateBinding(binding: Binding, reason: string): Promise<void> {
 		if (binding.turnCompletion) abortTurn(binding);
-		await this.dropBinding(binding.key, binding, true);
+		await this.dropBinding(binding.key, binding, reason, true);
+	}
+
+	/** Why this binding cannot carry the next prompt, if it cannot. */
+	private staleReason(binding: Binding, context: Context, tools: NonNullable<Context["tools"]>): string | undefined {
+		if (binding.needsReconstruction) return "instructions changed";
+		if (binding.harnessCheckpointed) return "harness checkpointed";
+		if (binding.mode !== this.permissionMode || this.confirmedMode(binding) !== this.permissionMode) {
+			return "permission mode changed";
+		}
+		if (binding.toolFingerprint !== piToolFingerprint(tools)) return "tools changed";
+		if (
+			context.messages.length < binding.messageCount ||
+			messagesFingerprint(context.messages.slice(0, binding.messageCount)) !== binding.historyFingerprint
+		) {
+			return "history rewritten";
+		}
+		return undefined;
+	}
+
+	private decide(binding: Binding, event: string, fields: DecisionFields = {}): void {
+		this.decisions?.write(event, { pi: binding.piSessionId ?? binding.key, acp: binding.session.sessionId, ...fields });
 	}
 
 	private createConnection(options: AntigravityConnectionOptions): AntigravityAcpConnection {

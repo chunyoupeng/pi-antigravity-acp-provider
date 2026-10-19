@@ -106,6 +106,8 @@ On macOS the Antigravity server prefers the login keychain (service `gemini`, ac
 
 The server's stderr is appended, redacted and tagged with its pid, to `$PI_CODING_AGENT_DIR/antigravity-acp-provider/logs/acp-server.log` (rotated once to `.1` past 5 MB). Search it for `Launching browser login flow`, `Failed to refresh token` or `Wiping credentials` when a saved login stops being reused.
 
+The provider's own session decisions go to `logs/bindings.jsonl` in the same directory (also rotated past 5 MB): one line each time a Pi session binds to an Antigravity session (new, resume or load), sends a prompt (fresh history or delta, message range, bytes), ends a turn, drops a binding (with the reason) or sees the server process exit. From a checkout, `node scripts/diagnose-session.mjs [session.jsonl | session id | cwd]` lines a Pi session up with that log and the Antigravity transcripts it used, in local time, and flags context jumps, Pi history replayed into a non-empty session, harness checkpoints and backend errors.
+
 ## Commands
 
 ```text
