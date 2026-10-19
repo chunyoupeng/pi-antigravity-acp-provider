@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import https from "node:https";
 import os from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
@@ -10,7 +11,7 @@ import { Open, type File as ZipFile } from "unzipper";
 import { loadConfig, type RuntimeUpdateMode } from "../config.js";
 import { resolveAntigravityAcpDirectory, resolveAntigravityAcpLaunch, type AntigravityLaunch } from "./antigravity.js";
 import { AntigravityAcpConnection } from "./connection.js";
-import { AntigravityAcpError } from "./errors.js";
+import { abortError, AntigravityAcpError } from "./errors.js";
 import {
 	compareRuntimeVersions,
 	latestManifestRelease,
@@ -30,7 +31,10 @@ const VALIDATION_TIMEOUT_MS = 90_000;
 const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60_000;
 const LOCK_POLL_MS = 250;
 const LOCK_STALE_MS = INSTALL_TIMEOUT_MS + 5 * 60_000;
+const PARALLEL_RANGE_BYTES = 4 * 1024 * 1024;
+const PARALLEL_RANGE_CONCURRENCY = 8;
 let inFlight: Promise<void> | undefined;
+let backgroundUpdate: Promise<void> | undefined;
 
 interface RegistryEntry {
 	archive: string;
@@ -114,11 +118,15 @@ export function inspectRuntimeSetup(): RuntimeSetupStatus {
 	};
 }
 
-export function ensureAntigravityAcpReady(onProgress?: (message: string) => void): Promise<void> {
+export function ensureAntigravityAcpReady(
+	onProgress?: (message: string) => void,
+	signal?: AbortSignal,
+): Promise<void> {
+	if (signal?.aborted) return Promise.reject(abortError());
 	inFlight ??= ensureOnce(onProgress).finally(() => {
 		inFlight = undefined;
 	});
-	return inFlight;
+	return raceSignal(inFlight, signal);
 }
 
 export async function checkAntigravityAcpUpdate(force = false): Promise<RuntimeUpdateStatus> {
@@ -174,21 +182,56 @@ async function ensureOnce(onProgress?: (message: string) => void): Promise<void>
 	}
 
 	if (launch && launch.source !== "managed") return;
-	if (launch) repairRuntimeExecutablePermissions(path.dirname(launch.command));
-	if (launch && loadConfig().runtimeUpdates !== "automatic") return;
-
-	let resolved: Awaited<ReturnType<typeof resolveLatestRelease>>;
-	try {
-		resolved = await resolveLatestRelease(platformKey(), false);
-	} catch (error) {
-		// Registry or manifest outages must not disable a working managed runtime.
-		if (launch) return;
-		throw error;
+	if (launch) {
+		repairRuntimeExecutablePermissions(path.dirname(launch.command));
+		if (loadConfig().runtimeUpdates === "automatic") {
+			startBackgroundUpdate(launch);
+		}
+		return;
 	}
-	const { release } = resolved;
-	const installedVersion = launch ? readInstallRecord(path.dirname(launch.command))?.version : undefined;
-	if (installedVersion && compareRuntimeVersions(installedVersion, release.version) >= 0) return;
+
+	const { release } = await resolveLatestRelease(platformKey(), false);
 	await installRuntime(release, onProgress);
+}
+
+function startBackgroundUpdate(launch: AntigravityLaunch): void {
+	backgroundUpdate ??= (async () => {
+		const { release } = await resolveLatestRelease(platformKey(), false);
+		const installedVersion = readInstallRecord(path.dirname(launch.command))?.version;
+		if (installedVersion && compareRuntimeVersions(installedVersion, release.version) >= 0) return;
+		await installRuntime(release);
+	})()
+		.catch(() => {
+			// Background update failures must never surface as unhandled rejections
+			// or disrupt a working installed runtime.
+		})
+		.finally(() => {
+			backgroundUpdate = undefined;
+		});
+}
+
+function raceSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return promise;
+	if (signal.aborted) {
+		void promise.catch(() => undefined);
+		return Promise.reject(abortError());
+	}
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => {
+			reject(abortError());
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(
+			(value) => {
+				signal.removeEventListener("abort", onAbort);
+				resolve(value);
+			},
+			(error) => {
+				signal.removeEventListener("abort", onAbort);
+				reject(error);
+			},
+		);
+	});
 }
 
 async function resolveLatestRelease(
@@ -316,6 +359,7 @@ async function installRelease(
 ): Promise<void> {
 	const versions = path.dirname(destination);
 	fs.mkdirSync(versions, { recursive: true, mode: 0o700 });
+	cleanStaleStaging(versions);
 	const staging = fs.mkdtempSync(path.join(versions, ".install-"));
 	const archive = path.join(staging, "download.zip");
 	const runtime = path.join(staging, "runtime");
@@ -362,6 +406,18 @@ async function installRelease(
 		}
 	} finally {
 		fs.rmSync(staging, { recursive: true, force: true });
+	}
+}
+
+function cleanStaleStaging(versions: string): void {
+	try {
+		for (const entry of fs.readdirSync(versions)) {
+			if (entry.startsWith(".install-")) {
+				fs.rmSync(path.join(versions, entry), { recursive: true, force: true });
+			}
+		}
+	} catch {
+		// Best-effort cleanup while holding the exclusive install lock.
 	}
 }
 
@@ -448,6 +504,135 @@ async function validateRuntime(directory: string, release: ResolvedRuntimeReleas
 }
 
 async function download(
+	release: ResolvedRuntimeRelease,
+	destination: string,
+	onProgress?: (message: string) => void,
+): Promise<string> {
+	if (canUseDirectRangeDownload(release)) {
+		try {
+			return await downloadDirectParallel(release, destination, onProgress);
+		} catch {
+			fs.rmSync(destination, { force: true });
+		}
+	}
+	return downloadViaFetch(release, destination, onProgress);
+}
+
+function canUseDirectRangeDownload(release: ResolvedRuntimeRelease): boolean {
+	return (
+		release.archive.startsWith("https://dl.google.com/") &&
+		release.archiveBytes > PARALLEL_RANGE_BYTES &&
+		!("mock" in globalThis.fetch)
+	);
+}
+
+async function downloadDirectParallel(
+	release: ResolvedRuntimeRelease,
+	destination: string,
+	onProgress?: (message: string) => void,
+): Promise<string> {
+	const totalBytes = release.archiveBytes;
+	const ranges: Array<{ start: number; end: number }> = [];
+	for (let start = 0; start < totalBytes; start += PARALLEL_RANGE_BYTES) {
+		ranges.push({ start, end: Math.min(start + PARALLEL_RANGE_BYTES, totalBytes) - 1 });
+	}
+	const fd = fs.openSync(destination, "w", 0o600);
+	const agent = new https.Agent({ keepAlive: true, maxSockets: PARALLEL_RANGE_CONCURRENCY });
+	let received = 0;
+	let lastReported = 0;
+	try {
+		fs.ftruncateSync(fd, totalBytes);
+		let nextIndex = 0;
+		const workerCount = Math.min(PARALLEL_RANGE_CONCURRENCY, ranges.length);
+		await Promise.all(
+			Array.from({ length: workerCount }, async () => {
+				while (nextIndex < ranges.length) {
+					const range = ranges[nextIndex++]!;
+					const buffer = await fetchRangeDirect(release.archive, range.start, range.end, agent, (delta) => {
+						received += delta;
+						const percent = Math.floor((received / totalBytes) * 100);
+						if (percent >= lastReported + 10) {
+							lastReported = percent;
+							onProgress?.(`Downloading Antigravity ACP: ${percent}%`);
+						}
+					});
+					fs.writeSync(fd, buffer, 0, buffer.length, range.start);
+				}
+			}),
+		);
+	} finally {
+		agent.destroy();
+		fs.closeSync(fd);
+	}
+	if (received !== totalBytes) throw new Error("ACP server download size did not match its signed manifest");
+	const hash = createHash("sha256");
+	await pipeline(fs.createReadStream(destination), hash);
+	return hash.digest("hex");
+}
+
+function fetchRangeDirect(
+	url: string,
+	start: number,
+	end: number,
+	agent: https.Agent,
+	onDelta: (bytes: number) => void,
+	attempt = 1,
+): Promise<Buffer> {
+	const expectedLength = end - start + 1;
+	return new Promise<Buffer>((resolve, reject) => {
+		let chunkBytes = 0;
+		const req = https.get(
+			url,
+			{
+				agent,
+				family: 4,
+				headers: { Range: `bytes=${start}-${end}` },
+				timeout: 20_000,
+			},
+			(res) => {
+				if (res.statusCode !== 206) {
+					res.resume();
+					reject(new Error(`Direct range request returned HTTP ${res.statusCode ?? "unknown"}`));
+					return;
+				}
+				const chunks: Buffer[] = [];
+				res.on("data", (chunk: Buffer) => {
+					chunkBytes += chunk.length;
+					if (chunkBytes > expectedLength) {
+						req.destroy(new Error("Range chunk exceeded requested length"));
+						return;
+					}
+					chunks.push(chunk);
+					onDelta(chunk.length);
+				});
+				res.on("end", () => {
+					if (chunkBytes !== expectedLength) {
+						onDelta(-chunkBytes);
+						reject(new Error("Range chunk was truncated"));
+						return;
+					}
+					resolve(Buffer.concat(chunks));
+				});
+				res.on("error", (error) => {
+					onDelta(-chunkBytes);
+					reject(error);
+				});
+			},
+		);
+		req.on("timeout", () => {
+			req.destroy(new Error("Direct range request timed out"));
+		});
+		req.on("error", (error) => {
+			onDelta(-chunkBytes);
+			reject(error);
+		});
+	}).catch((error) => {
+		if (attempt < 3) return fetchRangeDirect(url, start, end, agent, onDelta, attempt + 1);
+		throw error;
+	});
+}
+
+async function downloadViaFetch(
 	release: ResolvedRuntimeRelease,
 	destination: string,
 	onProgress?: (message: string) => void,

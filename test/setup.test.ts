@@ -199,6 +199,10 @@ describe("default auth profile", () => {
 			auth: { type: "gemini-api-key" },
 		});
 	});
+
+	it("rejects immediately when called with an aborted signal", async () => {
+		await expect(ensureAntigravityAcpReady(undefined, AbortSignal.abort())).rejects.toThrow(/cancel|abort/i);
+	});
 });
 
 function temporaryDirectory(): string {

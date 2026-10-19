@@ -263,7 +263,7 @@ export class AntigravityRuntime {
 		this.assertActive();
 		const epoch = this.bindingEpoch;
 		if (signal?.aborted) throw abortError();
-		if (this.ensureAgent) await ensureAntigravityAcpReady();
+		if (this.ensureAgent) await ensureAntigravityAcpReady(undefined, signal);
 		if (signal?.aborted) throw abortError();
 		this.assertEpoch(epoch);
 		const connection = this.createConnection({ cwd: process.cwd() });
@@ -289,7 +289,7 @@ export class AntigravityRuntime {
 	): Promise<void> {
 		this.assertActive();
 		const epoch = this.bindingEpoch;
-		if (this.ensureAgent) await ensureAntigravityAcpReady(onProgress);
+		if (this.ensureAgent) await ensureAntigravityAcpReady(onProgress, signal);
 		this.assertEpoch(epoch);
 		const useManualOAuth = manualInteraction !== undefined && shouldUseHeadlessOAuth();
 		const relay = useManualOAuth ? new HeadlessOAuthRelay() : undefined;
@@ -298,7 +298,7 @@ export class AntigravityRuntime {
 			...(relay ? { env: relay.env } : {}),
 		});
 		try {
-			const initialize = await connection.initialize();
+			const initialize = await connection.initialize(signal);
 			this.assertEpoch(epoch);
 			const method = initialize.authMethods?.find((candidate) =>
 				/log\s*in\s+with\s+google|google\s+account|oauth-personal/iu.test(
@@ -355,11 +355,11 @@ export class AntigravityRuntime {
 	): Promise<void> {
 		this.assertActive();
 		const epoch = this.bindingEpoch;
-		if (this.ensureAgent) await ensureAntigravityAcpReady(onProgress);
+		if (this.ensureAgent) await ensureAntigravityAcpReady(onProgress, signal);
 		this.assertEpoch(epoch);
 		const connection = this.createConnection({ cwd: process.cwd() });
 		try {
-			const initialize = await connection.initialize();
+			const initialize = await connection.initialize(signal);
 			this.assertEpoch(epoch);
 			await authenticateForCredential(connection, initialize, apiKey, signal);
 			this.assertEpoch(epoch);
@@ -411,7 +411,7 @@ export class AntigravityRuntime {
 
 	async listSessions(cwd = process.cwd(), signal?: AbortSignal): Promise<SessionInfo[]> {
 		this.assertActive();
-		if (this.ensureAgent) await ensureAntigravityAcpReady();
+		if (this.ensureAgent) await ensureAntigravityAcpReady(undefined, signal);
 		const connection = this.createConnection({ cwd });
 		try {
 			const initialize = await connection.initialize(signal);
@@ -552,7 +552,7 @@ export class AntigravityRuntime {
 	): Promise<void> {
 		this.assertActive();
 		const epoch = this.bindingEpoch;
-		if (this.ensureAgent) await ensureAntigravityAcpReady();
+		if (this.ensureAgent) await ensureAntigravityAcpReady(undefined, options.signal);
 		await this.modeChanges;
 		this.assertEpoch(epoch);
 		const persistent = Boolean(options.sessionId);
@@ -865,7 +865,7 @@ export class AntigravityRuntime {
 			},
 		});
 		try {
-			const initialize = await connection.initialize();
+			const initialize = await connection.initialize(signal);
 			this.assertEpoch(epoch);
 			await authenticateForCredential(connection, initialize, apiKey, signal);
 			this.assertEpoch(epoch);
