@@ -185,4 +185,19 @@ describe("bounded context reconstruction", () => {
 		expect(buildPromptParts(context, true).prompt.at(-1)).toEqual({ type: "text", text: "REQUEST" });
 		expect(buildPromptParts(context, false, 0).prompt).toEqual([{ type: "text", text: "REQUEST" }]);
 	});
+
+	it("preserves prior user requests when a short follow-up like 'continue' follows oversized tool output", () => {
+		const context: Context = { messages: [
+			{ role: "user", content: "ORIGINAL_TASK_DESCRIPTION", timestamp: 1 },
+			assistant([{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "python3 edit.py" } }]),
+			result("x".repeat(OVER_LIMIT) + "RECENT_TOOL_TAIL", "call-1", "bash"),
+			{ role: "user", content: "continue", timestamp: 4 },
+		] };
+		const { prompt } = buildPromptParts(context, true);
+		const text = resourceText(prompt[0]);
+		expect(promptBytes(prompt)).toBeLessThanOrEqual(LIMIT);
+		expect(text).toContain("## User\n```\nORIGINAL_TASK_DESCRIPTION\n```");
+		expect(text).toContain("RECENT_TOOL_TAIL");
+		expect(prompt.at(-1)).toEqual({ type: "text", text: "continue" });
+	});
 });

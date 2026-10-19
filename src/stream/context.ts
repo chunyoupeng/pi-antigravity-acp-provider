@@ -12,6 +12,8 @@ export const MAX_PROMPT_BYTES = 160 * 1024;
 /** History keeps room for the active tool loop's labels beside an oversized
  * request, which is never truncated. */
 const MIN_HISTORY_BYTES = 16 * 1024;
+/** Room reserved so prior user prompts survive even when old tool output is cut. */
+const MAX_OLDER_USER_BYTES = 16 * 1024;
 const MAX_INSTRUCTION_BYTES = 256 * 1024;
 const ENTRY_SEPARATOR = "\n\n";
 const HISTORY_HEADING =
@@ -45,6 +47,7 @@ interface HistoryEntry {
 	/** Active tool-loop identities survive even when their bodies cannot. */
 	pinned?: boolean;
 	toolResult?: boolean;
+	user?: boolean;
 }
 
 export function buildPromptParts(
@@ -260,23 +263,53 @@ function boundedSection(heading: string, entries: HistoryEntry[], available: num
 		if (pinned[index]!.toolResult) remaining -= grow(index, remaining);
 	}
 
-	const older: string[] = [];
+	const keptOlder = new Array<string | undefined>(pinnedStart);
+	let userAllowance = Math.min(MAX_OLDER_USER_BYTES, Math.floor(remaining / 4));
+	for (let index = pinnedStart - 1; index >= 0 && userAllowance > 0; index--) {
+		const entry = entries[index]!;
+		if (!entry.user) continue;
+		const whole = renderEntry(entry);
+		const size = utf8Bytes(whole);
+		if (size + ENTRY_SEPARATOR.length <= userAllowance) {
+			keptOlder[index] = whole;
+			userAllowance -= size + ENTRY_SEPARATOR.length;
+			remaining -= size + ENTRY_SEPARATOR.length;
+			continue;
+		}
+		if (entry.body !== undefined) {
+			const shell = renderEntry(entry, "");
+			const room = userAllowance - ENTRY_SEPARATOR.length - utf8Bytes(shell);
+			const kept = tailBytes(entry.body, room);
+			if (kept) {
+				const text = renderEntry(entry, kept);
+				keptOlder[index] = text;
+				userAllowance = 0;
+				remaining -= utf8Bytes(text) + ENTRY_SEPARATOR.length;
+			}
+		}
+		break;
+	}
+
+	let filledSuffix = false;
 	for (let index = pinnedStart - 1; index >= 0; index--) {
+		if (keptOlder[index] !== undefined) continue;
 		const entry = entries[index]!;
 		const whole = renderEntry(entry);
 		const size = utf8Bytes(whole);
 		if (size + ENTRY_SEPARATOR.length <= remaining) {
-			older.unshift(whole);
+			keptOlder[index] = whole;
+			filledSuffix = true;
 			remaining -= size + ENTRY_SEPARATOR.length;
 			continue;
 		}
-		if (older.length === 0 && entry.body !== undefined) {
+		if (!filledSuffix && entry.body !== undefined) {
 			const room = remaining - ENTRY_SEPARATOR.length - utf8Bytes(renderEntry(entry, ""));
 			const kept = tailBytes(entry.body, room);
-			if (kept) older.unshift(renderEntry(entry, kept));
+			if (kept) keptOlder[index] = renderEntry(entry, kept);
 		}
 		break;
 	}
+	const older = keptOlder.filter((text): text is string => text !== undefined);
 	return [prefix, ...older, ...rendered].join(ENTRY_SEPARATOR);
 }
 
@@ -335,7 +368,7 @@ function findLatestUserIndex(messages: Message[]): number {
 function formatMessage(message: Message): HistoryEntry[] {
 	// System content/sections are replayed separately as trusted instructions.
 	if (message.role === "system") return [];
-	if (message.role === "user") return [{ label: "## User", body: contentText(message.content) }];
+	if (message.role === "user") return [{ label: "## User", body: contentText(message.content), user: true }];
 	if (message.role === "assistant") {
 		const texts: string[] = [];
 		const calls: HistoryEntry[] = [];

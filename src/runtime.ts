@@ -1227,6 +1227,7 @@ export class AntigravityRuntime {
 	private staleReason(binding: Binding, context: Context, tools: NonNullable<Context["tools"]>): string | undefined {
 		if (binding.needsReconstruction) return "instructions changed";
 		if (binding.harnessCheckpointed) return "harness checkpointed";
+		if (binding.pendingContextCount > binding.messageCount) return "prompt incomplete";
 		if (binding.mode !== this.permissionMode || this.confirmedMode(binding) !== this.permissionMode) {
 			return "permission mode changed";
 		}

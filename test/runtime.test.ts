@@ -806,6 +806,18 @@ describe("AntigravityRuntime", () => {
 			const snapshot = await runtime.snapshot();
 			expect(snapshot.bindings).toBe(1);
 			expect(snapshot.processes[0]?.alive).toBe(true);
+			const firstGeneration = snapshot.processes[0]?.generation;
+
+			// Next prompt replaces the aborted in-memory binding so the fresh rebuild
+			// does not stack a second USER_INPUT onto the same ACP session.
+			const next = runtime.stream(
+				model,
+				{ messages: [{ role: "user", content: "continue", timestamp: 2 }] },
+				{ sessionId: "abort-session", apiKey: "test-key" },
+			);
+			for await (const _event of next.stream) void _event;
+			expect(next.message.stopReason).toBe("stop");
+			expect((await runtime.snapshot()).processes[0]?.generation).not.toBe(firstGeneration);
 		} finally {
 			await runtime.close();
 		}
