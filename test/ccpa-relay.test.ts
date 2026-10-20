@@ -126,7 +126,28 @@ describe("CCPA Keep-Alive and Retry Relay", () => {
 		expect(attempts).toBe(3);
 		expect(logs).toHaveLength(2);
 		expect(logs[0]).toContain("transient HTTP 500");
-		expect(logs[1]).toContain("transient HTTP 503");
+		expect(logs[1]).toContain("transient HTTP 503 (The model is currently unreachable)");
+	});
+
+	it.each([false, true])("logs a safe capacity reason even when retries are exhausted (SSE=%s)", async (sse) => {
+		const logs: string[] = [];
+		const upstream = http.createServer((_req, res) => {
+			res.writeHead(sse ? 200 : 503, { "content-type": sse ? "text/event-stream" : "application/json" });
+			const body = JSON.stringify({ error: { code: 503,
+				message: "No capacity available for model gemini-test on the server api_key=SECRET user@example.invalid" } });
+			res.end(sse ? `data: ${body}\n\n` : body);
+		});
+		const { port } = await listenServer(upstream);
+		const relay = await startCcpaRelay({ upstreamUrl: `http://127.0.0.1:${port}`,
+			maxRetries: 0, onLog: (msg) => logs.push(msg) });
+		relays.push(relay);
+		const response = await fetch(`${relay.baseUrl}/v1internal:streamGenerateContent?alt=sse`, { method: "POST", body: "{}" });
+		expect(response.status).toBe(503);
+		await response.text();
+		expect(logs).toHaveLength(1);
+		expect(logs[0]).toContain("failed HTTP 503 (No capacity available)");
+		expect(logs[0]).toContain("attempt 1/1");
+		expect(logs[0]).not.toMatch(/SECRET|user@example|gemini-test/u);
 	});
 
 	it("returns the upstream 500 response when all retries are exhausted and does not retry 4xx errors", async () => {

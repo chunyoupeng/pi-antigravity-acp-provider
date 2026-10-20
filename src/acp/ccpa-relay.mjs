@@ -454,6 +454,23 @@ function isRetryableSseErrorChunk(chunk) {
 	return undefined;
 }
 
+/** Only fixed, recognized error reasons may enter diagnostics. Never log an
+ * arbitrary response body: it may contain request text or credentials. */
+function upstreamErrorHint(body) {
+	if (!body) return "";
+	try {
+		const text = body.toString("utf8").trim().replace(/^data:\s*/, "");
+		const parsed = JSON.parse(text);
+		const message = parsed?.error?.message ?? parsed?.response?.error?.message;
+		if (typeof message !== "string") return "";
+		if (/No capacity available/i.test(message)) return " (No capacity available)";
+		if (/The model is currently unreachable/i.test(message)) return " (The model is currently unreachable)";
+	} catch {
+		// Unknown/non-JSON error bodies leave the actual HTTP status intact.
+	}
+	return "";
+}
+
 function sanitizeRequestHeaders(headers, upstreamHost, bodyLength) {
 	const out = {};
 	for (const [key, value] of Object.entries(headers)) {
@@ -809,12 +826,11 @@ export async function startCcpaRelay(options = {}) {
 				continue;
 			}
 
+			const reason = outcome.kind === "http_error"
+				? `HTTP ${outcome.statusCode}${upstreamErrorHint(outcome.body)}`
+				: `network error (${outcome.error?.message ?? "unknown"})`;
 			if (attempt <= maxRetries) {
 				const delayMs = baseDelayMs * 2 ** (attempt - 1);
-				const reason =
-					outcome.kind === "http_error"
-						? `HTTP ${outcome.statusCode}`
-						: `network error (${outcome.error?.message ?? "unknown"})`;
 				log(
 					`Antigravity CCPA relay: transient ${reason} on ${clientReq.method ?? "POST"} ${targetPath} ` +
 						`(attempt ${attempt}/${maxRetries + 1}); retrying in ${delayMs}ms`,
@@ -827,6 +843,7 @@ export async function startCcpaRelay(options = {}) {
 				continue;
 			}
 
+			log(`Antigravity CCPA relay: failed ${reason} on ${method} ${targetPath} (attempt ${attempt}/${maxRetries + 1}); retries exhausted`);
 			if (!clientRes.headersSent && !clientClosed) {
 				if (outcome.kind === "http_error") {
 					const outHeaders = sanitizeResponseHeaders(outcome.headers ?? {});

@@ -33,9 +33,11 @@ import { clientFileRoots, readClientTextFile, writeClientTextFile } from "./acp/
 import {
 	AntigravityAcpConnection,
 	type AntigravityConnectionOptions,
+	type PromptStallInfo,
 	type SessionMeta,
 } from "./acp/connection.js";
 import { DecisionLog, type DecisionFields } from "./acp/decision-log.js";
+import { describeBackendSilence } from "./acp/backend-diagnostics.js";
 import { abortError, AntigravityAcpError, errorMessage } from "./acp/errors.js";
 import { AcpSessionStore } from "./acp/session-store.js";
 import { contextTokensInUse, transcriptCheckpoints } from "./acp/transcript-usage.js";
@@ -1292,7 +1294,7 @@ export class AntigravityRuntime {
 		);
 	}
 
-	private noteBackendStall(binding: Binding | undefined, info: { busy: boolean; silentMs: number; abortInMs?: number }): void {
+	private noteBackendStall(binding: Binding | undefined, info: PromptStallInfo): void {
 		const writer = binding?.writer;
 		if (!writer || writer.finished) return;
 		const seconds = Math.max(1, Math.round(info.silentMs / 1000));
@@ -1301,8 +1303,8 @@ export class AntigravityRuntime {
 			? "The turn keeps waiting; Esc aborts it."
 			: `It will abort itself in ${Math.max(1, Math.round(info.abortInMs / 1000))}s if there is still no response; Esc aborts it now.`;
 		writer.text(
-			`\n\n⚠️ No response from Antigravity for ${seconds}s${work}. The model backend is likely ` +
-			`unreachable (for example repeated 502s) and silently retrying. ${abort} After it fails, retry later or switch models.\n\n`,
+			`\n\n⚠️ No response from Antigravity for ${seconds}s${work}. ${describeBackendSilence(info.upstreamError)} ` +
+			`${abort} After it fails, retry later or switch models.\n\n`,
 		);
 	}
 

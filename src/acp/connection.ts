@@ -19,6 +19,7 @@ import {
 
 import { PACKAGE_VERSION } from "../constants.js";
 import { boundedNdjsonStream } from "./bounded-stream.js";
+import { BackendDiagnostics, describeBackendSilence } from "./backend-diagnostics.js";
 import { abortError, AntigravityAcpError, redact } from "./errors.js";
 import { AntigravityProcess, type AntigravityProcessOptions } from "./process.js";
 import { PromptWatchdog } from "./prompt-watchdog.js";
@@ -32,10 +33,17 @@ import {
 
 const DEFAULT_OPERATION_TIMEOUT_MS = 120_000;
 
+export interface PromptStallInfo {
+	busy: boolean;
+	silentMs: number;
+	abortInMs?: number;
+	upstreamError?: string;
+}
+
 export interface AntigravityConnectionHandlers {
 	onUpdate?: (notification: SessionNotification) => void | Promise<void>;
 	/** Fires once per silence streak while a prompt waits on a mute backend. abortInMs is set when the idle prompt will abort itself afterwards. */
-	onStall?: (info: { busy: boolean; silentMs: number; abortInMs?: number }) => void;
+	onStall?: (info: PromptStallInfo) => void;
 	onPermission?: (request: RequestPermissionRequest) => Promise<RequestPermissionResponse>;
 	onReadTextFile?: (request: ReadTextFileRequest) => Promise<ReadTextFileResponse>;
 	onWriteTextFile?: (request: WriteTextFileRequest) => Promise<WriteTextFileResponse>;
@@ -452,15 +460,22 @@ export class AntigravityAcpConnection {
 		if (this.watchdogs.has(request.sessionId)) {
 			throw new AntigravityAcpError("invalid_input", "An ACP prompt is already running for this session");
 		}
+		// Listen only during this prompt: old errors in stderrTail must not be
+		// blamed for a later turn. This connection owns one runtime binding.
+		const diagnostics = new BackendDiagnostics();
+		const onStderr = (chunk: string) => diagnostics.write(chunk);
+		this.process.child.stderr.on("data", onStderr);
 		let rejectStall!: (error: Error) => void;
 		const stalled = new Promise<never>((_resolve, reject) => { rejectStall = reject; });
 		const watchdog = new PromptWatchdog(this.promptIdleTimeoutMs, this.promptWorkIdleTimeoutMs, (busy, ms) => {
 			rejectStall(new AntigravityAcpError("timeout",
 				`Antigravity ACP session/prompt timed out: no ${busy ? "tool/permission " : ""}progress for ${ms}ms; ` +
-				"the backend went silent, which usually indicates a model-serving outage (for example repeated 502s) — retry the turn later or switch models"));
+				describeBackendSilence(diagnostics.error) + " Retry the turn later or switch models."));
 			void this.close().catch(() => undefined);
 		}, this.promptStallWarnMs, (busy, silentMs, abortInMs) => {
-			this.handlers.onStall?.({ busy, silentMs, ...(abortInMs === undefined ? {} : { abortInMs }) });
+			const upstreamError = diagnostics.error;
+			this.handlers.onStall?.({ busy, silentMs, ...(abortInMs === undefined ? {} : { abortInMs }),
+				...(upstreamError ? { upstreamError } : {}) });
 		}, this.promptStallAbortMs);
 		this.watchdogs.set(request.sessionId, watchdog);
 		watchdog.arm();
@@ -471,6 +486,7 @@ export class AntigravityAcpConnection {
 			]);
 		} finally {
 			watchdog.dispose();
+			this.process.child.stderr.off("data", onStderr);
 			this.watchdogs.delete(request.sessionId);
 		}
 	}
