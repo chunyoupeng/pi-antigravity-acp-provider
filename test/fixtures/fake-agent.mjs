@@ -292,6 +292,43 @@ for await (const line of rl) {
 			send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
 			continue;
 		}
+		if (text.includes("poisoned turn")) {
+			const sessionNewCount = process.env.FAKE_AGENT_LOG_FILE
+				? fs.readFileSync(process.env.FAKE_AGENT_LOG_FILE, "utf8").split("\n").filter((l) => l.includes('"session/new"')).length
+				: 1;
+			if (scenario === "execution-error-once" && sessionNewCount >= 2) {
+				reply(params.sessionId, id, "Recovered on fresh session");
+				continue;
+			}
+			if (scenario === "execution-error-midstream") {
+				send({
+					jsonrpc: "2.0",
+					method: "session/update",
+					params: {
+						sessionId: params.sessionId,
+						update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Partial reply" } },
+					},
+				});
+			}
+			send({
+				jsonrpc: "2.0",
+				method: "session/update",
+				params: {
+					sessionId: params.sessionId,
+					update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Internal error encountered." } },
+				},
+			});
+			send({
+				jsonrpc: "2.0",
+				method: "session/update",
+				params: {
+					sessionId: params.sessionId,
+					update: { sessionUpdate: "usage_update", used: 500, size: 100000 },
+				},
+			});
+			send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+			continue;
+		}
 		if (text.includes("list bridge tools") && mcpServer) {
 			void listMcpTools(mcpServer).then((tools) => reply(params.sessionId, id, JSON.stringify(tools)));
 			continue;

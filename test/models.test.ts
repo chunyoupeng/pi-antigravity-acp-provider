@@ -122,6 +122,28 @@ describe("projectModels", () => {
 			expect(persistedModels).toMatchObject({
 				models: [expect.objectContaining({ id: "gemini-4-argon", provider: "antigravity-acp" })],
 			});
+
+			let discoverCalls = 0;
+			let prewarmCalls = 0;
+			runtime.discoverModels = async () => {
+				discoverCalls += 1;
+				return [{ modelId: "gemini-4-argon-high", name: "Gemini 4 Argon (High)" }];
+			};
+			runtime.prewarm = async () => {
+				prewarmCalls += 1;
+			};
+			await provider.refreshModels?.({
+				allowNetwork: true,
+				signal: new AbortController().signal,
+				credential: { type: "oauth", refresh: "r", access: "a", expires: 999999 },
+				stored: { models: [storedModel], checkedAt: Date.now() },
+				publish: async ({ update }) => {
+					update?.();
+					return true;
+				},
+			});
+			expect(discoverCalls).toBe(0);
+			expect(prewarmCalls).toBe(1);
 		} finally {
 			await runtime.close();
 		}

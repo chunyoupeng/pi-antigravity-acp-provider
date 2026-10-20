@@ -24,7 +24,13 @@ afterEach(async () => {
 	for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-function setup(scenario?: string, mode: PermissionMode = "yolo", store?: AcpSessionStore, decisions?: DecisionLog) {
+function setup(
+	scenario?: string,
+	mode: PermissionMode = "yolo",
+	store?: AcpSessionStore,
+	decisions?: DecisionLog,
+	idleTimeoutMs?: number,
+) {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-runtime-safety-")); roots.push(root);
 	const log = path.join(root, "calls.jsonl"); fs.writeFileSync(log, "");
 	const connections: AntigravityAcpConnection[] = [];
@@ -32,7 +38,7 @@ function setup(scenario?: string, mode: PermissionMode = "yolo", store?: AcpSess
 		const connection = new AntigravityAcpConnection({ ...options, command: process.execPath,
 			args: [fakeAgent, ...(scenario ? [scenario] : [])], env: { ...process.env, FAKE_AGENT_LOG_FILE: log } });
 		connections.push(connection); return connection;
-	}, mode, store, undefined, "pi", undefined, decisions);
+	}, mode, store, undefined, "pi", undefined, decisions, idleTimeoutMs);
 	runtimes.push(runtime);
 	const entries = () => fs.readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as { method: string; prompt?: unknown; mode?: string });
 	return { root, runtime, connections, entries };
@@ -354,5 +360,97 @@ describe("tool projection diagnostics", () => {
 		expect(bridge.omissions.map((entry) => entry.name)).toEqual(["t64", "t65", "t66"]);
 		expect(piToolFingerprint(tools)).not.toBe(piToolFingerprint([{ ...tools[0]!, description: "changed" }]));
 		expect(piToolFingerprint(tools)).not.toBe(piToolFingerprint([...tools, { name: "bad", description: "bad", parameters: Type.String() }]));
+	});
+});
+
+describe("execution error self-healing", () => {
+	it("drops a poisoned ACP session and automatically retries once on a fresh session when 'Internal error encountered.' arrives before content", async () => {
+		const fixture = setup();
+		const store = new AcpSessionStore(path.join(fixture.root, "sessions.json"));
+		const decisionFile = path.join(fixture.root, "bindings.jsonl");
+		const { runtime, connections, entries } = setup("execution-error-once", "yolo", store, new DecisionLog(decisionFile));
+		const first = await turn(runtime, [user("hello")], "heal");
+		expect(first.stopReason).toBe("stop");
+		expect(store.get("heal")).toBeDefined();
+
+		const recovered = await turn(runtime, [user("hello"), first, user("poisoned turn", 2)], "heal");
+		expect(recovered.stopReason).toBe("stop");
+		expect(recovered.content).toEqual([{ type: "text", text: "Recovered on fresh session" }]);
+		expect(connections).toHaveLength(2);
+		expect(entries().filter((entry) => entry.method === "session/new")).toHaveLength(2);
+		expect(store.get("heal")).toBeDefined();
+	});
+
+	it("fails the turn and removes the saved binding when 'Internal error encountered.' persists after retry", async () => {
+		const fixture = setup();
+		const store = new AcpSessionStore(path.join(fixture.root, "sessions.json"));
+		const { runtime, connections, entries } = setup("execution-error-always", "yolo", store);
+		const first = await turn(runtime, [user("hello")], "poisoned-persist");
+		expect(first.stopReason).toBe("stop");
+		expect(store.get("poisoned-persist")).toBeDefined();
+
+		const failed = await turn(runtime, [user("hello"), first, user("poisoned turn", 2)], "poisoned-persist");
+		expect(failed.stopReason).toBe("error");
+		expect(failed.errorMessage).toContain("Internal error encountered.");
+		expect(failed.content).toEqual([]);
+		expect(connections).toHaveLength(2);
+		expect(entries().filter((entry) => entry.method === "session/new")).toHaveLength(2);
+		expect(store.get("poisoned-persist")).toBeUndefined();
+	});
+
+	it("drops the poisoned session without retrying when partial text was already streamed before 'Internal error encountered.'", async () => {
+		const fixture = setup();
+		const store = new AcpSessionStore(path.join(fixture.root, "sessions.json"));
+		const { runtime, connections } = setup("execution-error-midstream", "yolo", store);
+		const failed = await turn(runtime, [user("poisoned turn")], "midstream");
+		expect(failed.stopReason).toBe("error");
+		expect(failed.errorMessage).toContain("Internal error encountered.");
+		expect(failed.content).toEqual([{ type: "text", text: "Partial reply" }]);
+		expect(connections).toHaveLength(1);
+		expect(store.get("midstream")).toBeUndefined();
+	});
+});
+
+describe("warm connection pool and idle binding hibernation", () => {
+	it("reuses the connection from discoverModels or prewarm instead of spawning a second ACP process on the first turn", async () => {
+		const { runtime, connections } = setup();
+		const models = await runtime.discoverModels("test-key");
+		expect(models.length).toBeGreaterThan(0);
+		expect(connections).toHaveLength(1);
+
+		const response = await turn(runtime, [user("hello")], "warm-discover");
+		expect(response.stopReason).toBe("stop");
+		expect(connections).toHaveLength(1);
+
+		// Also verify explicit prewarm() before a second session's first turn.
+		await runtime.prewarm("test-key");
+		expect(connections).toHaveLength(2);
+		const second = await turn(runtime, [user("hello")], "warm-prewarm");
+		expect(second.stopReason).toBe("stop");
+		expect(connections).toHaveLength(2);
+	});
+
+	it("hibernates an idle persistent binding while retaining its saved session record for seamless resume", async () => {
+		const fixture = setup();
+		const store = new AcpSessionStore(path.join(fixture.root, "sessions.json"));
+		const { runtime, connections, entries } = setup(undefined, "yolo", store, undefined, 80);
+
+		const first = await turn(runtime, [user("hello")], "hibernate");
+		expect(first.stopReason).toBe("stop");
+		expect((await runtime.snapshot()).bindings).toBe(1);
+		expect(store.get("hibernate")).toBeDefined();
+
+		await vi.waitFor(async () => {
+			expect((await runtime.snapshot()).bindings).toBe(0);
+			expect(connections[0]?.process.alive).toBe(false);
+		}, { timeout: 2_000 });
+		// Saved session record must remain in AcpSessionStore across hibernation.
+		expect(store.get("hibernate")).toBeDefined();
+
+		const second = await turn(runtime, [user("hello"), first, user("after wake", 2)], "hibernate");
+		expect(second.stopReason).toBe("stop");
+		expect(connections).toHaveLength(2);
+		expect((await runtime.snapshot()).processes[0]?.restored).toBe(true);
+		expect(entries().some((entry) => entry.method === "session/resume")).toBe(true);
 	});
 });

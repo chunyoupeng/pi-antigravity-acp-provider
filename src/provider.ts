@@ -14,12 +14,24 @@ import { hasAntigravityAuth } from "./acp/antigravity.js";
 import { API_ID, CONTEXT_WINDOW, FALLBACK_MODELS, MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, projectModels, PROVIDER_ID } from "./models.js";
 import { AntigravityRuntime, MANAGED_AUTH_MARKER } from "./runtime.js";
 
+export const DEFAULT_MODEL_CATALOG_TTL_MS = 6 * 3_600_000;
+
+function resolveModelCatalogTtlMs(): number {
+	const raw = process.env.PI_ANTIGRAVITY_MODEL_CATALOG_TTL_MS?.trim();
+	if (raw === undefined || raw === "") return DEFAULT_MODEL_CATALOG_TTL_MS;
+	const parsed = Number(raw);
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_MODEL_CATALOG_TTL_MS;
+}
+
 export interface AntigravityProviderBundle {
 	provider: Provider<"antigravity-acp">;
 	runtime: AntigravityRuntime;
 }
 
-export function createAntigravityProvider(runtime = new AntigravityRuntime()): AntigravityProviderBundle {
+export function createAntigravityProvider(
+	runtime = new AntigravityRuntime(),
+	catalogTtlMs = resolveModelCatalogTtlMs(),
+): AntigravityProviderBundle {
 	let models = [...FALLBACK_MODELS];
 	const provider: Provider<"antigravity-acp"> = {
 		id: PROVIDER_ID,
@@ -106,6 +118,7 @@ export function createAntigravityProvider(runtime = new AntigravityRuntime()): A
 		},
 		getModels: () => models,
 		async refreshModels(context: RefreshModelsContext) {
+			let hasFreshStoredCatalog = false;
 			if (context.stored) {
 				const restored = context.stored.models
 					.filter(
@@ -146,6 +159,15 @@ export function createAntigravityProvider(runtime = new AntigravityRuntime()): A
 						},
 					});
 					if (!published) return;
+					const checkedAt = context.stored.checkedAt;
+					if (
+						typeof checkedAt === "number" &&
+						checkedAt > 0 &&
+						catalogTtlMs > 0 &&
+						Date.now() - checkedAt < catalogTtlMs
+					) {
+						hasFreshStoredCatalog = true;
+					}
 				}
 			}
 			if (!context.allowNetwork) return;
@@ -155,6 +177,10 @@ export function createAntigravityProvider(runtime = new AntigravityRuntime()): A
 					: context.credential?.type === "oauth"
 						? MANAGED_AUTH_MARKER
 						: undefined;
+			if (hasFreshStoredCatalog) {
+				void runtime.prewarm?.(key, context.signal).catch(() => undefined);
+				return;
+			}
 			let discovered;
 			try {
 				discovered = projectModels(await runtime.discoverModels(key, context.signal));

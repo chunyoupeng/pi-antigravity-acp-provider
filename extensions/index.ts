@@ -31,6 +31,7 @@ import {
 import { createAntigravityProvider } from "../src/provider.js";
 import {
 	AntigravityRuntime,
+	MANAGED_AUTH_MARKER,
 	PERMISSION_RESULT_KIND,
 	PERMISSION_TOOL_NAME,
 	type PermissionToolResult,
@@ -290,6 +291,15 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 			} catch {
 				// History cleanup is housekeeping and must not interrupt Pi startup.
 			}
+		}
+		try {
+			const auth = inspectAntigravityAuth();
+			if (auth.status === "api-key-env" || auth.status === "oauth-refreshable") {
+				const apiKey = auth.status === "oauth-refreshable" ? MANAGED_AUTH_MARKER : process.env.GEMINI_API_KEY;
+				void runtime.prewarm(apiKey).catch(() => undefined);
+			}
+		} catch {
+			// Background prewarming is best-effort and must not interrupt Pi startup.
 		}
 		if (loadConfig().runtimeUpdates !== "notify") return;
 		try {

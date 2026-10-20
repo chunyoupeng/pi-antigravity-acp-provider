@@ -70,6 +70,17 @@ const TOOL_BATCH_MS = 100;
  * as a failure. A Pi tool still running before then is handed off instead:
  * the model ends its turn and gets the result as the next prompt. */
 const TOOL_HANDOFF_MS = 150_000;
+/** Default idle timeout before an inactive ACP binding hibernates its child
+ * process while preserving its session record in AcpSessionStore for seamless
+ * resume on the next turn. */
+export const DEFAULT_IDLE_TIMEOUT_MS = 20 * 60_000;
+
+function resolveIdleTimeoutMs(): number {
+	const raw = process.env.PI_ANTIGRAVITY_IDLE_TIMEOUT_MS?.trim();
+	if (raw === undefined || raw === "") return DEFAULT_IDLE_TIMEOUT_MS;
+	const parsed = Number(raw);
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_IDLE_TIMEOUT_MS;
+}
 
 /** Antigravity built-ins disabled when Pi owns tool execution. The model then
  * reads, runs commands and changes files only through Pi's bridged tools, so
@@ -159,6 +170,28 @@ interface Binding {
 	harnessCheckpoints: number | undefined;
 	/** The harness replaced this session's history with its own summary. */
 	harnessCheckpointed: boolean;
+	/** Synthetic execution-error chunk emitted by the ACP server before ending a failed turn. */
+	pendingErrorChunk: string | undefined;
+	/** Most recent Pi context seen by this binding (initial prompt or continuation). */
+	latestContext: Context | undefined;
+	/** Timer that hibernates an idle persistent binding while retaining its saved session record. */
+	idleTimer: ReturnType<typeof setTimeout> | undefined;
+}
+
+interface WarmConnection {
+	connection: AntigravityAcpConnection;
+	initialize: InitializeResponse;
+	apiKey: string | undefined;
+	clientFs: boolean;
+	cwd: string;
+	idleTimer: ReturnType<typeof setTimeout> | undefined;
+}
+
+interface PrewarmInFlight {
+	apiKey: string | undefined;
+	clientFs: boolean;
+	cwd: string;
+	promise: Promise<WarmConnection>;
 }
 
 export interface PermissionView {
@@ -224,6 +257,8 @@ export class AntigravityRuntime {
 	private readonly metrics = new RuntimeMetrics();
 	private permissionMode: PermissionMode;
 	private toolOwner: ToolOwner;
+	private warmConnection: WarmConnection | undefined;
+	private prewarmInFlight: PrewarmInFlight | undefined;
 
 	constructor(
 		connectionFactory?: AntigravityConnectionFactory,
@@ -233,6 +268,7 @@ export class AntigravityRuntime {
 		toolOwner: ToolOwner = "pi",
 		private readonly toolHandoffMs = TOOL_HANDOFF_MS,
 		decisionLog?: DecisionLog,
+		private readonly idleTimeoutMs = resolveIdleTimeoutMs(),
 	) {
 		this.toolOwner = toolOwner;
 		this.connectionFactory = connectionFactory ?? ((options) => new AntigravityAcpConnection(options));
@@ -263,24 +299,27 @@ export class AntigravityRuntime {
 		return writer;
 	}
 
+	/** Pre-spawns, initializes, and authenticates a single warm ACP connection
+	 * in the background so the user's first prompt does not pay the cold-start
+	 * process spawn + ACP handshake penalty. */
+	async prewarm(apiKey?: string, signal?: AbortSignal): Promise<void> {
+		const warm = await this.acquireWarmConnection(apiKey, signal);
+		this.scheduleWarmIdleTimer(warm);
+	}
+
 	async discoverModels(apiKey: string | undefined, signal?: AbortSignal): Promise<AcpModelInfo[]> {
-		this.assertActive();
+		const warm = await this.acquireWarmConnection(apiKey, signal);
 		const epoch = this.bindingEpoch;
-		if (signal?.aborted) throw abortError();
-		if (this.ensureAgent) await ensureAntigravityAcpReady(undefined, signal);
-		if (signal?.aborted) throw abortError();
-		this.assertEpoch(epoch);
-		const connection = this.createConnection({ cwd: process.cwd() });
 		try {
-			const initialize = await connection.initialize(signal);
+			const session = await warm.connection.newSession(warm.cwd, signal);
 			this.assertEpoch(epoch);
-			await authenticateForCredential(connection, initialize, apiKey, signal);
-			this.assertEpoch(epoch);
-			const session = await connection.newSession(process.cwd(), signal);
-			this.assertEpoch(epoch);
+			this.scheduleWarmIdleTimer(warm);
 			return sessionModels(session)?.availableModels ?? [];
-		} finally {
-			await connection.close();
+		} catch (error) {
+			if (this.warmConnection === warm) this.warmConnection = undefined;
+			this.clearWarmIdleTimer(warm);
+			await warm.connection.close();
+			throw error;
 		}
 	}
 
@@ -526,9 +565,15 @@ export class AntigravityRuntime {
 
 	private async closeBindings(): Promise<void> {
 		this.bindingEpoch += 1;
+		if (this.warmConnection) {
+			this.clearWarmIdleTimer(this.warmConnection);
+			this.warmConnection = undefined;
+		}
+		this.prewarmInFlight = undefined;
 		const pending = [...this.bindings.values()];
 		this.bindings.clear();
 		for (const binding of this.resolvedBindings) {
+			this.clearBindingIdleTimer(binding);
 			cancelPermission(binding);
 			cancelPiTools(binding, "Provider shut down before Pi returned the tool result");
 		}
@@ -538,6 +583,7 @@ export class AntigravityRuntime {
 		await Promise.allSettled(
 			pending.map(async (binding) => {
 				const value = await binding;
+				this.clearBindingIdleTimer(value);
 				await Promise.allSettled([
 					value.connection.close(),
 					value.bridge?.close() ?? Promise.resolve(),
@@ -594,6 +640,7 @@ export class AntigravityRuntime {
 				this.noteContinuationInstructions(binding, context);
 				binding.pendingContextCount = context.messages.length;
 				binding.pendingContextFingerprint = messagesFingerprint(context.messages);
+				binding.latestContext = context;
 				binding.permission = undefined;
 				clearTimeout(pending.timer);
 				if (
@@ -626,6 +673,7 @@ export class AntigravityRuntime {
 				this.noteContinuationInstructions(binding, context);
 				binding.pendingContextCount = context.messages.length;
 				binding.pendingContextFingerprint = messagesFingerprint(context.messages);
+				binding.latestContext = context;
 				for (const { pending, message } of results) {
 					binding.pendingTools.delete(pending.invocation.id);
 					const result = message as ToolResultMessage;
@@ -677,7 +725,7 @@ export class AntigravityRuntime {
 			) {
 				unseenStart += 1;
 			}
-			const parts = adaptPromptToCapabilities(
+			let parts = adaptPromptToCapabilities(
 				buildPromptParts(context, fresh, unseenStart),
 				binding.initialize,
 			);
@@ -691,6 +739,8 @@ export class AntigravityRuntime {
 			binding.needsReconstruction = false;
 			binding.pendingContextCount = context.messages.length;
 			binding.pendingContextFingerprint = messagesFingerprint(context.messages);
+			binding.latestContext = context;
+			binding.pendingErrorChunk = undefined as string | undefined;
 			binding.turnCompletion = new Promise<void>((resolve) => {
 				completeTurn = resolve;
 			});
@@ -713,6 +763,7 @@ export class AntigravityRuntime {
 				to: context.messages.length,
 				bytes: Buffer.byteLength(JSON.stringify(parts.prompt), "utf8"),
 			});
+			let retriedExecutionError = false;
 			let response = await binding.connection.prompt(
 				{ sessionId: binding.session.sessionId, prompt: parts.prompt },
 				options.signal,
@@ -722,6 +773,85 @@ export class AntigravityRuntime {
 				// Drain ordered async observers before closing the Pi content stream.
 				// Nothing below awaits, so a continuation cannot queue work unseen.
 				await binding.updateQueue;
+				const pendingErrorChunk = binding.pendingErrorChunk;
+				if (pendingErrorChunk !== undefined) {
+					const executionError = pendingErrorChunk.trim();
+					binding.pendingErrorChunk = undefined;
+					const activeWriter = binding.writer ?? writer;
+					const retryContext: Context = binding.latestContext ?? context;
+					const canRetry =
+						!retriedExecutionError &&
+						activeWriter.message.content.length === 0 &&
+						!activeWriter.finished &&
+						!binding.abortRequested &&
+						!options.signal?.aborted;
+					this.decide(binding, "execution_error", { error: executionError, retry: canRetry });
+					if (onTurnAbort) {
+						options.signal?.removeEventListener("abort", onTurnAbort);
+						onTurnAbort = undefined;
+					}
+					const sharedTurnCompletion: Promise<void> | undefined = binding.turnCompletion;
+					await this.dropBinding(key, binding, "agent execution error", true);
+					if (!canRetry) {
+						binding.writer = activeWriter;
+						throw new AntigravityAcpError("protocol", executionError);
+					}
+					retriedExecutionError = true;
+					binding = await this.getBinding(key, model, acpModelId, options.apiKey, activeWriter, tools, options.signal);
+					if (binding.modelId !== acpModelId) {
+						await binding.connection.setModel(
+							binding.session.sessionId,
+							acpModelId,
+							options.signal,
+							resolveAcpThinking(model, acpModelId),
+						);
+						binding.modelId = acpModelId;
+					}
+					attachWriter(binding, activeWriter);
+					parts = adaptPromptToCapabilities(
+						buildPromptParts(retryContext, true, 0),
+						binding.initialize,
+					);
+					await this.modeChanges;
+					this.assertEpoch(epoch);
+					if (
+						binding.mode !== this.permissionMode ||
+						this.confirmedMode(binding) !== this.permissionMode ||
+						!binding.connection.process.alive
+					) {
+						await this.invalidateBinding(binding, "permission mode changed or process exited before prompting");
+						throw new AntigravityAcpError("protocol", "Permission mode changed before prompting; retry the turn");
+					}
+					binding.instructionsFingerprint = instructionFingerprint(retryContext);
+					binding.needsReconstruction = false;
+					binding.pendingContextCount = retryContext.messages.length;
+					binding.pendingContextFingerprint = messagesFingerprint(retryContext.messages);
+					binding.latestContext = retryContext;
+					binding.pendingErrorChunk = undefined;
+					binding.turnCompletion = sharedTurnCompletion;
+					if (options.signal) {
+						const promptBinding = binding;
+						onTurnAbort = () => abortTurn(promptBinding);
+						options.signal.addEventListener("abort", onTurnAbort, { once: true });
+						if (options.signal.aborted) onTurnAbort();
+					}
+					binding.toolTracker.clear();
+					binding.lateResults = [];
+					binding.updateQueue = Promise.resolve();
+					if (binding.piSessionId) this.sessionStore?.remove(binding.piSessionId);
+					this.decide(binding, "prompt", {
+						fresh: true,
+						from: 0,
+						to: retryContext.messages.length,
+						bytes: Buffer.byteLength(JSON.stringify(parts.prompt), "utf8"),
+						retry: true,
+					});
+					response = await binding.connection.prompt(
+						{ sessionId: binding.session.sessionId, prompt: parts.prompt },
+						options.signal,
+					);
+					continue;
+				}
 				if (response.stopReason !== "end_turn" || binding.abortRequested || binding.lateResults.length === 0) break;
 				this.metrics.record(response, usageFromPrompt(response));
 				this.decide(binding, "prompt", { lateResults: binding.lateResults.length });
@@ -773,7 +903,18 @@ export class AntigravityRuntime {
 			binding.writer = undefined;
 			release();
 			if (this.queues.get(key) === queue) this.queues.delete(key);
-			if (!persistent) await this.dropBinding(key, binding, "ephemeral turn finished");
+			if (!persistent) {
+				await this.dropBinding(key, binding, "ephemeral turn finished");
+			} else if (
+				!this.disposed &&
+				this.resolvedBindings.has(binding) &&
+				binding.connection.process.alive &&
+				!binding.permission &&
+				binding.pendingTools.size === 0 &&
+				!this.queues.has(key)
+			) {
+				this.scheduleBindingIdleTimer(binding);
+			}
 		}
 	}
 
@@ -827,7 +968,11 @@ export class AntigravityRuntime {
 	): Promise<Binding> {
 		this.assertActive();
 		const existing = this.bindings.get(key);
-		if (existing) return existing;
+		if (existing) {
+			const resolved = await existing;
+			this.clearBindingIdleTimer(resolved);
+			return resolved;
+		}
 		const created = this.createBinding(key, model, acpModelId, apiKey, writer, tools ?? [], signal).catch((error) => {
 			if (this.bindings.get(key) === created) this.bindings.delete(key);
 			throw error;
@@ -856,28 +1001,41 @@ export class AntigravityRuntime {
 			}
 			return clientFileRoots(binding.cwd);
 		};
-		const connection = this.createConnection({
-			cwd,
-			// With native tools, Antigravity's file reads and writes still go
-			// through the provider. With Pi tools they are disabled instead,
-			// because the client_* fs tools are not covered by the tool filter.
-			clientFs: toolOwner === "native",
-			handlers: {
-				onUpdate: (notification) => this.consumeUpdate(binding, notification),
-				onStall: (info) => this.noteBackendStall(binding, info),
-				onPermission: async (request) => {
-					await binding?.updateQueue;
-					return this.requestPermission(binding, request);
-				},
-				onReadTextFile: (request) => readClientTextFile(request, fileRequest(request.sessionId)),
-				onWriteTextFile: (request) => writeClientTextFile(request, fileRequest(request.sessionId)),
+		const handlers: NonNullable<AntigravityConnectionOptions["handlers"]> = {
+			onUpdate: (notification) => this.consumeUpdate(binding, notification),
+			onStall: (info) => this.noteBackendStall(binding, info),
+			onPermission: async (request) => {
+				await binding?.updateQueue;
+				return this.requestPermission(binding, request);
 			},
-		});
+			onReadTextFile: (request) => readClientTextFile(request, fileRequest(request.sessionId)),
+			onWriteTextFile: (request) => writeClientTextFile(request, fileRequest(request.sessionId)),
+		};
+		const warm = await this.takeWarmConnection(cwd, apiKey, toolOwner === "native");
+		const connection = warm
+			? warm.connection
+			: this.createConnection({
+					cwd,
+					// With native tools, Antigravity's file reads and writes still go
+					// through the provider. With Pi tools they are disabled instead,
+					// because the client_* fs tools are not covered by the tool filter.
+					clientFs: toolOwner === "native",
+					handlers,
+				});
+		if (warm) {
+			connection.setHandlers(handlers);
+		}
 		try {
-			const initialize = await connection.initialize(signal);
-			this.assertEpoch(epoch);
-			await authenticateForCredential(connection, initialize, apiKey, signal);
-			this.assertEpoch(epoch);
+			let initialize: InitializeResponse;
+			if (warm) {
+				initialize = warm.initialize;
+				this.assertEpoch(epoch);
+			} else {
+				initialize = await connection.initialize(signal);
+				this.assertEpoch(epoch);
+				await authenticateForCredential(connection, initialize, apiKey, signal);
+				this.assertEpoch(epoch);
+			}
 			const omittedTools = initialize.agentCapabilities?.mcpCapabilities?.http === true
 				? planToolProjection(tools)
 				: tools.filter((tool) => tool.name !== PERMISSION_TOOL_NAME).map((tool) => ({ name: tool.name, reason: "Agent did not advertise MCP over HTTP" }));
@@ -981,6 +1139,9 @@ export class AntigravityRuntime {
 				contextTokens: undefined,
 				harnessCheckpoints: undefined,
 				harnessCheckpointed: false,
+				pendingErrorChunk: undefined,
+				latestContext: undefined,
+				idleTimer: undefined,
 			};
 			binding = createdBinding;
 			this.decide(createdBinding, "bind", {
@@ -992,6 +1153,7 @@ export class AntigravityRuntime {
 			this.persistBinding(createdBinding);
 			this.resolvedBindings.add(createdBinding);
 			void connection.process.exited.then((exit) => {
+				this.clearBindingIdleTimer(createdBinding);
 				this.decide(createdBinding, "exit", { code: exit.code ?? undefined, signal: exit.signal ?? undefined });
 				cancelPermission(createdBinding);
 				cancelPiTools(createdBinding, "Antigravity process exited before Pi returned the tool result");
@@ -1059,6 +1221,10 @@ export class AntigravityRuntime {
 				abandoned.addEventListener("abort", () => {
 					abandon({ content: [{ type: "text", text: "Antigravity abandoned this call" }], isError: true });
 				}, { once: true });
+				if (binding.pendingErrorChunk) {
+					binding.writer?.text(binding.pendingErrorChunk);
+					binding.pendingErrorChunk = undefined;
+				}
 				binding.writer?.toolCall(invocation.id, invocation.name, invocation.arguments);
 				if (binding.toolBatchTimer) clearTimeout(binding.toolBatchTimer);
 				binding.toolBatchTimer = setTimeout(() => {
@@ -1153,10 +1319,29 @@ export class AntigravityRuntime {
 		binding.updateQueue = binding.updateQueue.then(async () => {
 			await writer.providerEvent(notification);
 			for (const activity of mapSessionUpdate(notification)) {
-				if (activity.type === "text") writer.text(activity.delta);
-				else if (activity.type === "thought") writer.thinking(activity.delta);
-				else if (activity.type === "plan") writer.thinking(activity.text);
-				else if (activity.type === "usage") {
+				if (activity.type === "text") {
+					if (isSyntheticExecutionErrorChunk(activity.delta)) {
+						binding.pendingErrorChunk = (binding.pendingErrorChunk ?? "") + activity.delta;
+					} else {
+						if (binding.pendingErrorChunk) {
+							writer.text(binding.pendingErrorChunk);
+							binding.pendingErrorChunk = undefined;
+						}
+						writer.text(activity.delta);
+					}
+				} else if (activity.type === "thought") {
+					if (binding.pendingErrorChunk) {
+						writer.text(binding.pendingErrorChunk);
+						binding.pendingErrorChunk = undefined;
+					}
+					writer.thinking(activity.delta);
+				} else if (activity.type === "plan") {
+					if (binding.pendingErrorChunk) {
+						writer.text(binding.pendingErrorChunk);
+						binding.pendingErrorChunk = undefined;
+					}
+					writer.thinking(activity.text);
+				} else if (activity.type === "usage") {
 					const used = await contextTokensInUse(notification.sessionId, activity.used);
 					this.noteHarnessCheckpoint(binding, writer, transcriptCheckpoints(notification.sessionId));
 					binding.contextTokens = used;
@@ -1191,6 +1376,7 @@ export class AntigravityRuntime {
 	}
 
 	private async dropBinding(key: string, binding: Binding, reason: string, removeSaved = false): Promise<void> {
+		this.clearBindingIdleTimer(binding);
 		this.decide(binding, "drop", { reason, removeSaved });
 		const current = this.bindings.get(key);
 		if (current && (await current) === binding && this.bindings.get(key) === current) {
@@ -1201,6 +1387,169 @@ export class AntigravityRuntime {
 		cancelPermission(binding);
 		cancelPiTools(binding, "Antigravity session closed before Pi returned the tool result");
 		await Promise.allSettled([binding.connection.close(), binding.bridge?.close() ?? Promise.resolve()]);
+	}
+
+	private async acquireWarmConnection(apiKey: string | undefined, signal?: AbortSignal): Promise<WarmConnection> {
+		this.assertActive();
+		const epoch = this.bindingEpoch;
+		if (signal?.aborted) throw abortError();
+		if (this.ensureAgent) await ensureAntigravityAcpReady(undefined, signal);
+		if (signal?.aborted) throw abortError();
+		this.assertEpoch(epoch);
+		const cwd = process.cwd();
+		const clientFs = this.toolOwner === "native";
+		if (this.warmConnection) {
+			if (
+				this.warmConnection.connection.process.alive &&
+				this.warmConnection.apiKey === apiKey &&
+				this.warmConnection.clientFs === clientFs &&
+				this.warmConnection.cwd === cwd
+			) {
+				this.clearWarmIdleTimer(this.warmConnection);
+				return this.warmConnection;
+			}
+			const staleWarm = this.warmConnection;
+			this.warmConnection = undefined;
+			this.clearWarmIdleTimer(staleWarm);
+			await staleWarm.connection.close();
+		}
+		if (this.prewarmInFlight) {
+			if (
+				this.prewarmInFlight.apiKey === apiKey &&
+				this.prewarmInFlight.clientFs === clientFs &&
+				this.prewarmInFlight.cwd === cwd
+			) {
+				return this.prewarmInFlight.promise;
+			}
+			const previousInFlight = this.prewarmInFlight.promise;
+			this.prewarmInFlight = undefined;
+			await previousInFlight
+				.then(async (warm) => {
+					if (this.warmConnection === warm) this.warmConnection = undefined;
+					this.clearWarmIdleTimer(warm);
+					await warm.connection.close();
+				})
+				.catch(() => undefined);
+		}
+		this.assertEpoch(epoch);
+		const connection = this.createConnection({ cwd, clientFs });
+		let promise!: Promise<WarmConnection>;
+		promise = (async (): Promise<WarmConnection> => {
+			try {
+				const initialize = await connection.initialize(signal);
+				this.assertEpoch(epoch);
+				await authenticateForCredential(connection, initialize, apiKey, signal);
+				this.assertEpoch(epoch);
+				const warm: WarmConnection = {
+					connection,
+					initialize,
+					apiKey,
+					clientFs,
+					cwd,
+					idleTimer: undefined,
+				};
+				this.warmConnection = warm;
+				void connection.process.exited
+					.then(() => {
+						if (this.warmConnection === warm) {
+							this.clearWarmIdleTimer(warm);
+							this.warmConnection = undefined;
+						}
+					})
+					.catch(() => undefined);
+				return warm;
+			} catch (error) {
+				await connection.close();
+				throw error;
+			} finally {
+				if (this.prewarmInFlight?.promise === promise) {
+					this.prewarmInFlight = undefined;
+				}
+			}
+		})();
+		this.prewarmInFlight = { apiKey, clientFs, cwd, promise };
+		return promise;
+	}
+
+	private async takeWarmConnection(
+		cwd: string,
+		apiKey: string | undefined,
+		clientFs: boolean,
+	): Promise<WarmConnection | undefined> {
+		if (
+			this.prewarmInFlight &&
+			this.prewarmInFlight.apiKey === apiKey &&
+			this.prewarmInFlight.clientFs === clientFs &&
+			this.prewarmInFlight.cwd === cwd
+		) {
+			try {
+				await this.prewarmInFlight.promise;
+			} catch {
+				// Fall back to creating a fresh connection in createBinding.
+			}
+		}
+		const candidate = this.warmConnection;
+		if (!candidate) return undefined;
+		this.warmConnection = undefined;
+		this.clearWarmIdleTimer(candidate);
+		if (
+			candidate.connection.process.alive &&
+			candidate.apiKey === apiKey &&
+			candidate.clientFs === clientFs &&
+			candidate.cwd === cwd
+		) {
+			return candidate;
+		}
+		await candidate.connection.close();
+		return undefined;
+	}
+
+	private scheduleWarmIdleTimer(warm: WarmConnection): void {
+		this.clearWarmIdleTimer(warm);
+		if (this.idleTimeoutMs <= 0 || this.disposed || this.warmConnection !== warm || !warm.connection.process.alive) {
+			return;
+		}
+		const timer = setTimeout(() => {
+			warm.idleTimer = undefined;
+			if (this.warmConnection !== warm) return;
+			this.warmConnection = undefined;
+			void warm.connection.close().catch(() => undefined);
+		}, this.idleTimeoutMs);
+		timer.unref();
+		warm.idleTimer = timer;
+	}
+
+	private clearWarmIdleTimer(warm: WarmConnection): void {
+		if (!warm.idleTimer) return;
+		clearTimeout(warm.idleTimer);
+		warm.idleTimer = undefined;
+	}
+
+	private scheduleBindingIdleTimer(binding: Binding): void {
+		this.clearBindingIdleTimer(binding);
+		if (this.idleTimeoutMs <= 0 || this.disposed || !binding.connection.process.alive) return;
+		const timer = setTimeout(() => {
+			binding.idleTimer = undefined;
+			if (
+				this.disposed ||
+				!this.resolvedBindings.has(binding) ||
+				binding.turnCompletion !== undefined ||
+				binding.permission !== undefined ||
+				binding.pendingTools.size > 0 ||
+				this.queues.has(binding.key)
+			) {
+				return;
+			}
+			void this.dropBinding(binding.key, binding, "idle timeout", false).catch(() => undefined);
+		}, this.idleTimeoutMs);
+		timer.unref();
+		binding.idleTimer = timer;
+	}
+
+	private clearBindingIdleTimer(binding: Binding): void {
+		if (!binding.idleTimer) return;
+		clearTimeout(binding.idleTimer);
+		binding.idleTimer = undefined;
 	}
 
 	private confirmedMode(binding: Binding): string | undefined {
@@ -1535,4 +1884,19 @@ function isAbort(error: unknown): boolean {
 	return error instanceof AntigravityAcpError
 		? error.code === "aborted"
 		: error instanceof DOMException && error.name === "AbortError";
+}
+
+/** Detects synthetic error messages `agy_acp_server.par` emits as normal
+ * `agent_message_chunk` text before returning `stop_reason: "end_turn"` when
+ * `localharness_external` fails with `AntigravityExecutionError` or a broken
+ * WebSocket connection (`server.py` + `api_errors.py`). */
+export function isSyntheticExecutionErrorChunk(delta: string): boolean {
+	const trimmed = delta.trim();
+	return (
+		trimmed === "Internal error encountered." ||
+		trimmed === "Bad Gateway: Failed to connect to backend API" ||
+		trimmed === "The model is currently unreachable." ||
+		trimmed.startsWith("Agent execution error:") ||
+		trimmed.startsWith("Agent connection was lost and could not be re-established:")
+	);
 }

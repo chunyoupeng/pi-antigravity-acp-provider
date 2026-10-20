@@ -2,6 +2,8 @@
 
 import { spawn } from "node:child_process";
 
+import { CCPA_BASE_URL_ENV, shouldStartCcpaRelay, startCcpaRelay } from "./ccpa-relay.mjs";
+
 // SSL_CERT_FILE is resolved by AntigravityProcess.applyDefaultTlsEnvironment
 // before this supervisor is spawned; the supervisor passes its environment
 // through to the agent unchanged.
@@ -17,6 +19,17 @@ if (!entryOrCommand) {
 const agentCommand = genericCommand ? entryOrCommand : process.execPath;
 const agentArgs = genericCommand ? forwardedArgs : [entryOrCommand, ...forwardedArgs];
 
+let ccpaRelay;
+const agentEnv = { ...process.env };
+if (shouldStartCcpaRelay(agentEnv)) {
+	try {
+		ccpaRelay = await startCcpaRelay({ env: agentEnv });
+		agentEnv[CCPA_BASE_URL_ENV] = ccpaRelay.baseUrl;
+	} catch {
+		// Fall back to direct upstream connections if a loopback listener cannot start.
+	}
+}
+
 const parentPid = process.ppid;
 const agent = spawn(agentCommand, agentArgs, {
 	stdio: ["pipe", "pipe", "pipe"],
@@ -24,7 +37,7 @@ const agent = spawn(agentCommand, agentArgs, {
 	windowsHide: true,
 	// Give Antigravity and every tool it starts a group separate from the watchdog.
 	detached: process.platform !== "win32",
-	env: process.env,
+	env: agentEnv,
 });
 
 let shuttingDown = false;
@@ -56,6 +69,7 @@ agent.once("error", (error) => {
 agent.once("exit", (code, signal) => {
 	clearInterval(parentWatch);
 	if (hardKillTimer) clearTimeout(hardKillTimer);
+	void ccpaRelay?.close();
 	process.stdin.unpipe(agent.stdin);
 	process.stdin.destroy();
 	if (!shuttingDown && signal) process.stderr.write(`Antigravity ACP agent exited on ${signal}\n`);
@@ -69,6 +83,7 @@ function shutdown(_reason, exitCode) {
 	if (shuttingDown) return;
 	shuttingDown = true;
 	clearInterval(parentWatch);
+	void ccpaRelay?.close();
 	process.exitCode = exitCode;
 	try {
 		process.stdin.unpipe(agent.stdin);
