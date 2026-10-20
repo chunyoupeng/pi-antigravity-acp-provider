@@ -145,21 +145,43 @@ describe("Pi takeover of Antigravity capabilities", () => {
 	it("discovers thinking levels and selects them through the family and thinking_level selectors", async () => {
 		const runtime = runtimeFor("thinking-levels");
 		try {
-			const [flash] = projectModels(await runtime.discoverModels("test-key"));
+			const models = projectModels(await runtime.discoverModels("test-key"));
+			const flash = models.find((candidate) => candidate.id === "gemini-flash");
 			expect(flash).toMatchObject({ id: "gemini-flash", reasoning: true });
 			expect(flash?.thinkingLevelMap).toMatchObject({ low: "gemini-flash-low", medium: "gemini-flash-medium", high: "gemini-flash-high" });
-			const writer = runtime.stream(
+			const first = runtime.stream(
 				flash!,
 				normalizeContext({ messages: [{ role: "user", content: "inspect meta", timestamp: 1 }] }),
-				{ apiKey: "test-key", reasoning: "low" },
+				{ apiKey: "test-key", reasoning: "low", sessionId: "thinking-session" },
 			);
-			for await (const _event of writer.stream) void _event;
-			expect(writer.message.stopReason).toBe("stop");
-			const block = writer.message.content.find((item) => item.type === "text");
-			expect(JSON.parse(block?.type === "text" ? block.text : "").selectionMethods).toEqual([
+			for await (const _event of first.stream) void _event;
+			expect(first.message.stopReason).toBe("stop");
+			const firstBlock = first.message.content.find((item) => item.type === "text");
+			expect(JSON.parse(firstBlock?.type === "text" ? firstBlock.text : "").selectionMethods).toEqual([
 				"set_config_option:permission-selector=yolo",
 				"set_config_option:model=gemini-flash",
 				"set_config_option:thinking_level=low",
+			]);
+			// Changing only the thinking level on the same family skips re-setting the model selector.
+			const second = runtime.stream(
+				flash!,
+				normalizeContext({
+					messages: [
+						{ role: "user", content: "inspect meta", timestamp: 1 },
+						first.message,
+						{ role: "user", content: "inspect meta", timestamp: 2 },
+					],
+				}),
+				{ apiKey: "test-key", reasoning: "medium", sessionId: "thinking-session" },
+			);
+			for await (const _event of second.stream) void _event;
+			expect(second.message.stopReason).toBe("stop");
+			const secondBlock = second.message.content.find((item) => item.type === "text");
+			expect(JSON.parse(secondBlock?.type === "text" ? secondBlock.text : "").selectionMethods).toEqual([
+				"set_config_option:permission-selector=yolo",
+				"set_config_option:model=gemini-flash",
+				"set_config_option:thinking_level=low",
+				"set_config_option:thinking_level=medium",
 			]);
 		} finally {
 			await runtime.close();

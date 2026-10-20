@@ -269,10 +269,25 @@ export class AntigravityAcpConnection {
 	): Promise<void> {
 		await this.initialize(signal);
 		const models = findSessionSelector(this.sessions.get(sessionId) ?? {}, "model");
-		if (thinking && thinking.model !== modelId && models && selectorValues(models).some((option) => option.value === thinking.model)) {
-			await this.setSelector(sessionId, "model", thinking.model, signal);
-			if (await this.setSelector(sessionId, "thought_level", thinking.level, signal)) return;
-			throw new AntigravityAcpError("protocol", `Antigravity offered no thinking levels for ${thinking.model}`);
+		const match = thinking ? undefined : modelId.match(/^(.+)-(low|medium|high)$/u);
+		const resolvedThinking = thinking ?? (match?.[1] && match[2] ? { model: match[1], level: match[2] } : undefined);
+		if (
+			resolvedThinking &&
+			resolvedThinking.model !== modelId &&
+			models &&
+			selectorValues(models).some((option) => option.value === resolvedThinking.model)
+		) {
+			if (models.currentValue !== resolvedThinking.model) {
+				await this.setSelector(sessionId, "model", resolvedThinking.model, signal);
+			}
+			const thoughts = findSessionSelector(this.sessions.get(sessionId) ?? {}, "thought_level");
+			if (!thoughts) {
+				throw new AntigravityAcpError("protocol", `Antigravity offered no thinking levels for ${resolvedThinking.model}`);
+			}
+			if (thoughts.currentValue !== resolvedThinking.level) {
+				await this.setSelector(sessionId, "thought_level", resolvedThinking.level, signal);
+			}
+			return;
 		}
 		if (await this.setSelector(sessionId, "model", modelId, signal)) return;
 		// Older official Antigravity builds still implement this removed draft

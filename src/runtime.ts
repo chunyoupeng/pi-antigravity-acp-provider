@@ -278,9 +278,7 @@ export class AntigravityRuntime {
 			this.assertEpoch(epoch);
 			const session = await connection.newSession(process.cwd(), signal);
 			this.assertEpoch(epoch);
-			// The legacy list keeps one entry per thinking-level variant; Antigravity
-			// 1.4's model selector folds them into families.
-			return session.models?.availableModels ?? sessionModels(session)?.availableModels ?? [];
+			return sessionModels(session)?.availableModels ?? [];
 		} finally {
 			await connection.close();
 		}

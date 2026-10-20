@@ -14,7 +14,7 @@ const modern = scenario?.startsWith("config-options") || thinkingLevels;
 const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
 // A UUID here lets the provider find a transcript a test writes for it.
 const SESSION_ID = process.env.FAKE_SESSION_ID ?? "fake-session";
-let model = thinkingLevels ? "gemini-flash-high" : "auto";
+let model = thinkingLevels ? "gemini-pro-high" : "auto";
 let mode = "default";
 let permissionPromptId;
 let hangingPromptId;
@@ -159,10 +159,12 @@ for await (const line of rl) {
 				configOptions: sessionConfigOptions(),
 				models: {
 					currentModelId: model,
-					availableModels: ["high", "medium", "low"].map((level) => ({
-						modelId: `gemini-flash-${level}`,
-						name: `Gemini Flash (${level[0].toUpperCase()}${level.slice(1)})`,
-					})),
+					availableModels: ["gemini-pro", "gemini-flash"].flatMap((family) =>
+						["high", "medium", "low"].map((level) => ({
+							modelId: `${family}-${level}`,
+							name: `${family === "gemini-pro" ? "Gemini Pro" : "Gemini Flash"} (${level[0].toUpperCase()}${level.slice(1)})`,
+						})),
+					),
 				},
 			} : modern ? { sessionId: SESSION_ID, configOptions: sessionConfigOptions() } : {
 				sessionId: SESSION_ID,
@@ -189,8 +191,8 @@ for await (const line of rl) {
 	} else if (method === "session/set_config_option") {
 		selectionMethods.push(`set_config_option:${params.configId}=${params.value}`);
 		if (params.configId === "model-selector") model = params.value;
-		else if (thinkingLevels && params.configId === "model") model = params.value === "gemini-flash" ? `gemini-flash-${model.split("-").at(-1)}` : params.value;
-		else if (thinkingLevels && params.configId === "thinking_level") model = `gemini-flash-${params.value}`;
+		else if (thinkingLevels && params.configId === "model") model = `${params.value}-${model.split("-").at(-1)}`;
+		else if (thinkingLevels && params.configId === "thinking_level") model = `${model.split("-").slice(0, -1).join("-")}-${params.value}`;
 		else if (params.configId === "permission-selector") {
 			if (scenario !== "config-options-ignored-mode") mode = params.value;
 		}
@@ -418,10 +420,11 @@ function sessionModes(restored = false) {
 
 function sessionConfigOptions() {
 	if (thinkingLevels) {
+		const family = model.split("-").slice(0, -1).join("-");
 		const level = model.split("-").at(-1);
 		return [
-			{ id: "model", name: "Model", category: "model", type: "select", currentValue: "gemini-flash",
-				options: [{ value: "gemini-flash", name: "Gemini Flash" }] },
+			{ id: "model", name: "Model", category: "model", type: "select", currentValue: family,
+				options: [{ value: "gemini-pro", name: "Gemini Pro" }, { value: "gemini-flash", name: "Gemini Flash" }] },
 			{ id: "thinking_level", name: "Thinking Level", category: "thought_level", type: "select", currentValue: level,
 				options: ["low", "medium", "high"].map((value) => ({ value, name: value })) },
 			{ id: "permission-selector", name: "Permissions", category: "mode", type: "select", currentValue: mode,

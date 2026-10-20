@@ -46,9 +46,15 @@ export function decodeSessionState(response: unknown): SessionState {
 	return parsed.data as SessionState;
 }
 
-export function findSessionSelector(state: SessionState, category: "model" | "mode" | "thought_level"): SelectOption | undefined {
+export function findSessionSelector(
+	state: SessionState,
+	category: "model" | "mode" | "thought_level",
+): SelectOption | undefined {
 	return state.configOptions?.find((option): option is SelectOption =>
-		option.type === "select" && (option.category === category || option.id === category),
+		option.type === "select" &&
+		(option.category === category ||
+			option.id === category ||
+			(category === "thought_level" && option.id === "thinking_level")),
 	);
 }
 
@@ -59,9 +65,31 @@ export function selectorValues(option: SelectOption): SessionConfigSelectOption[
 export function sessionModels(state: SessionState): { currentModelId: string; availableModels: AcpModelInfo[] } | undefined {
 	const selector = findSessionSelector(state, "model");
 	if (!selector) return state.models ?? undefined;
+	const thoughtSelector = findSessionSelector(state, "thought_level");
+	const modelOptions = selectorValues(selector);
+	if (thoughtSelector) {
+		const thoughtOptions = selectorValues(thoughtSelector);
+		if (thoughtOptions.length > 0 && modelOptions.some((option) => !/-(?:low|medium|high)$/u.test(option.value))) {
+			const currentModelId =
+				/-(?:low|medium|high)$/u.test(selector.currentValue) || !thoughtSelector.currentValue
+					? selector.currentValue
+					: `${selector.currentValue}-${thoughtSelector.currentValue}`;
+			const availableModels = state.models?.availableModels?.length
+				? state.models.availableModels
+				: modelOptions.flatMap((modelOpt) =>
+						/-(?:low|medium|high)$/u.test(modelOpt.value)
+							? [{ modelId: modelOpt.value, name: modelOpt.name }]
+							: thoughtOptions.map((thoughtOpt) => ({
+									modelId: `${modelOpt.value}-${thoughtOpt.value}`,
+									name: `${modelOpt.name} (${thoughtOpt.name})`,
+								})),
+					);
+			return { currentModelId, availableModels };
+		}
+	}
 	return {
 		currentModelId: selector.currentValue,
-		availableModels: selectorValues(selector).map((option) => ({ modelId: option.value, name: option.name })),
+		availableModels: modelOptions.map((option) => ({ modelId: option.value, name: option.name })),
 	};
 }
 
