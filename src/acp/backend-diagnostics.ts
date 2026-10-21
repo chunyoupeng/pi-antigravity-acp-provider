@@ -1,4 +1,9 @@
+import { INFERENCE_HEARTBEAT_MS } from "./ccpa-relay.mjs";
+
 const MAX_LINE_LENGTH = 16 * 1024;
+const HEARTBEAT = /^Antigravity CCPA relay: inference streaming \(\d+ open, (\d+) bytes received\)$/u;
+/** A stream counts as open until two heartbeats are missed. */
+const HEARTBEAT_FRESH_MS = INFERENCE_HEARTBEAT_MS * 2.5;
 
 /** Only classify known server/relay error records. Never display raw stderr,
  * response bodies, URLs or credentials in a model-visible warning. */
@@ -6,13 +11,21 @@ export class BackendDiagnostics {
 	private partial = "";
 	private oversized = false;
 	private lastError: string | undefined;
+	private streamSeenAt: number | undefined;
+	private streamBytes = 0;
 
 	write(chunk: string): void {
 		const lines = (this.partial + chunk).split("\n");
 		this.partial = lines.pop() ?? "";
 		for (const line of lines) {
 			if (!this.oversized && line.length <= MAX_LINE_LENGTH) {
-				this.lastError = classifyBackendError(line) ?? this.lastError;
+				const heartbeat = HEARTBEAT.exec(line);
+				if (heartbeat) {
+					this.streamSeenAt = Date.now();
+					this.streamBytes = Number(heartbeat[1]);
+				} else {
+					this.lastError = classifyBackendError(line) ?? this.lastError;
+				}
 			}
 			this.oversized = false;
 		}
@@ -20,6 +33,12 @@ export class BackendDiagnostics {
 			this.partial = "";
 			this.oversized = true;
 		}
+	}
+
+	/** Bytes received so far while the relay reports an open model response stream. */
+	get streamingBytes(): number | undefined {
+		if (this.streamSeenAt === undefined || Date.now() - this.streamSeenAt > HEARTBEAT_FRESH_MS) return undefined;
+		return this.streamBytes;
 	}
 
 	get error(): string | undefined {

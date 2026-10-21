@@ -3,6 +3,8 @@ import type https from "node:https";
 import type tls from "node:tls";
 
 export const CCPA_BASE_URL_ENV: "AGY_ACP_CCPA_BASE_URL";
+export const INFERENCE_HEARTBEAT_MS: number;
+export function formatInferenceHeartbeat(open: number, bytes: number): string;
 export const CCPA_RELAY_ENABLED_ENV: "PI_ANTIGRAVITY_CCPA_RELAY";
 export const CCPA_UPSTREAM_URL_ENV: "PI_ANTIGRAVITY_CCPA_UPSTREAM_URL";
 export const CCPA_MAX_RETRIES_ENV: "PI_ANTIGRAVITY_CCPA_MAX_RETRIES";
@@ -50,6 +52,7 @@ export interface CcpaRelayOptions {
 	tlsOptions?: https.AgentOptions & tls.ConnectionOptions;
 	readSystemProxy?: () => string;
 	onLog?: (message: string) => void;
+	heartbeatMs?: number;
 }
 
 export interface CcpaRelayHandle {

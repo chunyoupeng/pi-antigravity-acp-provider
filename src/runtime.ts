@@ -61,7 +61,7 @@ import {
 } from "./mcp/bridge.js";
 import type { PermissionMode, ToolOwner } from "./config.js";
 import { MAX_TEXT_RESULT_BYTES, MCP_MAX_OUTPUT_BYTES, resolveAcpModelId, resolveAcpThinking } from "./models.js";
-import { PI_BASH_DESCRIPTION, PI_READ_DESCRIPTION, type PromptParts, buildPromptParts, currentSystemInstructions } from "./stream/context.js";
+import { PI_BASH_DESCRIPTION, PI_EDIT_DESCRIPTION, PI_READ_DESCRIPTION, type PromptParts, buildPromptParts, currentSystemInstructions } from "./stream/context.js";
 import { PiEventWriter } from "./stream/pi-events.js";
 import { contextUsage, usageFromPrompt, withContextUsage } from "./stream/usage.js";
 import { RuntimeMetrics } from "./status.js";
@@ -101,16 +101,18 @@ export const PI_OWNED_NATIVE_TOOLS = [
 	"start_subagent",
 ] as const;
 
-/** Pi tool descriptions replaced when Pi owns tools: they state the 46 KiB
- * page and argument list that the lazy-loaded MCP schema would otherwise hold. */
+/** Pi tool descriptions replaced when Pi owns tools: read and bash state the
+ * 46 KiB page and argument list that the lazy-loaded MCP schema would otherwise
+ * hold; edit drops the overlap rule its parameters already state. */
 export const PI_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = {
 	read: PI_READ_DESCRIPTION,
 	bash: PI_BASH_DESCRIPTION,
+	edit: PI_EDIT_DESCRIPTION,
 };
 
 /** Antigravity built-ins disabled in every tool mode. Each one costs prompt
  * tokens on every turn (schedule alone about 2k) and has no use behind Pi. */
-export const UNUSED_NATIVE_TOOLS = ["schedule", "ask_question", "generate_image"] as const;
+export const UNUSED_NATIVE_TOOLS = ["schedule", "ask_question", "generate_image", "list_resources", "read_resource"] as const;
 
 type AntigravityModel = Model<"antigravity-acp">;
 
@@ -1298,6 +1300,14 @@ export class AntigravityRuntime {
 		const writer = binding?.writer;
 		if (!writer || writer.finished) return;
 		const seconds = Math.max(1, Math.round(info.silentMs / 1000));
+		if (info.streamingBytes !== undefined) {
+			writer.text(
+				`\n\n⏳ No update from Antigravity for ${seconds}s, but the model's response is still open ` +
+				`(${Math.round(info.streamingBytes / 1024)} KB received so far). Antigravity relays nothing while the model ` +
+				"writes a long tool call. The turn keeps waiting while the response stays open; Esc aborts it.\n\n",
+			);
+			return;
+		}
 		const work = info.busy ? " with tool/permission work still outstanding" : "";
 		const abort = info.abortInMs === undefined
 			? "The turn keeps waiting; Esc aborts it."

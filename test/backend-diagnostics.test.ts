@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { BackendDiagnostics, describeBackendSilence } from "../src/acp/backend-diagnostics.js";
+import { formatInferenceHeartbeat, INFERENCE_HEARTBEAT_MS } from "../src/acp/ccpa-relay.mjs";
+
+afterEach(() => vi.useRealTimers());
 
 const relay = (reason: string, path = "streamGenerateContent?alt=sse") =>
 	`Antigravity CCPA relay: transient ${reason} on POST /v1internal:${path} (attempt 2/5); retrying in 2000ms`;
@@ -7,6 +10,17 @@ const server = (message: string) =>
 	`I1020 15:07:17.529816 6193999872 local_connection.py:551] harness stderr: received model response error: ${message}`;
 
 describe("backend silence diagnostics", () => {
+	it("reports streamed bytes until relay heartbeats stop", () => {
+		vi.useFakeTimers();
+		const diagnostics = new BackendDiagnostics();
+		expect(diagnostics.streamingBytes).toBeUndefined();
+		diagnostics.write(`${formatInferenceHeartbeat(1, 51200)}\n`);
+		expect(diagnostics.streamingBytes).toBe(51200);
+		expect(diagnostics.error).toBeUndefined();
+		vi.advanceTimersByTime(INFERENCE_HEARTBEAT_MS * 2.5 + 1);
+		expect(diagnostics.streamingBytes).toBeUndefined();
+	});
+
 	it.each([
 		["HTTP 503 (No capacity available)", "HTTP 503: model capacity unavailable on the server"],
 		["HTTP 503", "HTTP 503: service unavailable"],

@@ -135,6 +135,33 @@ describe("bounded prompt progress watchdog", () => {
 		watch.dispose();
 	});
 
+	it("defers the auto-abort while the upstream response is still streaming", () => {
+		vi.useFakeTimers();
+		const timeout = vi.fn();
+		const stall = vi.fn();
+		let streaming = true;
+		const watch = new PromptWatchdog(60_000, 60_000, timeout, 100, stall, 150, () => streaming);
+		watch.arm();
+		vi.advanceTimersByTime(100);
+		expect(stall).toHaveBeenCalledExactlyOnceWith(false, 100, undefined);
+		vi.advanceTimersByTime(450);
+		expect(timeout).not.toHaveBeenCalled();
+		streaming = false;
+		vi.advanceTimersByTime(150);
+		expect(timeout).toHaveBeenCalledExactlyOnceWith(false, 700);
+		watch.dispose();
+	});
+
+	it("still applies the idle timeout while the upstream response streams", () => {
+		vi.useFakeTimers();
+		const timeout = vi.fn();
+		const watch = new PromptWatchdog(1000, 60_000, timeout, 100, vi.fn(), 150, () => true);
+		watch.arm();
+		vi.advanceTimersByTime(1000);
+		expect(timeout).toHaveBeenCalledExactlyOnceWith(false, 1000);
+		watch.dispose();
+	});
+
 	it("cancels a pending auto-abort when progress resumes, then re-escalates", () => {
 		vi.useFakeTimers();
 		const timeout = vi.fn();

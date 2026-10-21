@@ -8,6 +8,12 @@ import path from "node:path";
 import tls from "node:tls";
 
 export const CCPA_BASE_URL_ENV = "AGY_ACP_CCPA_BASE_URL";
+/** While a streamed model response is open, the relay logs a heartbeat this often. */
+export const INFERENCE_HEARTBEAT_MS = 10_000;
+
+export function formatInferenceHeartbeat(open, bytes) {
+	return `Antigravity CCPA relay: inference streaming (${open} open, ${bytes} bytes received)`;
+}
 export const CCPA_RELAY_ENABLED_ENV = "PI_ANTIGRAVITY_CCPA_RELAY";
 export const CCPA_UPSTREAM_URL_ENV = "PI_ANTIGRAVITY_CCPA_UPSTREAM_URL";
 export const CCPA_MAX_RETRIES_ENV = "PI_ANTIGRAVITY_CCPA_MAX_RETRIES";
@@ -588,6 +594,7 @@ export async function startCcpaRelay(options = {}) {
 							"ccpa-models-cache.json",
 						));
 	const log = options.onLog ?? ((message) => process.stderr.write(`${message}\n`));
+	const heartbeatMs = options.heartbeatMs ?? INFERENCE_HEARTBEAT_MS;
 	const ca = options.tlsOptions?.ca ?? resolveCustomCa(env);
 	const baseAgentOptions = {
 		keepAlive: true,
@@ -701,6 +708,33 @@ export async function startCcpaRelay(options = {}) {
 
 	const requestFn = upstreamUrl.protocol === "https:" ? https.request : http.request;
 
+	// Antigravity sends no ACP update while the model writes a long tool call, so the
+	// heartbeat on stderr is the only sign that the backend is still receiving its response.
+	const streams = { open: 0, bytes: 0 };
+	let heartbeat;
+	const trackStream = () => {
+		streams.open += 1;
+		if (!heartbeat) {
+			heartbeat = setInterval(() => log(formatInferenceHeartbeat(streams.open, streams.bytes)), heartbeatMs);
+			heartbeat.unref?.();
+		}
+		let ended = false;
+		return {
+			received: (bytes) => {
+				streams.bytes += bytes;
+			},
+			end: () => {
+				if (ended) return;
+				ended = true;
+				streams.open -= 1;
+				if (streams.open > 0) return;
+				clearInterval(heartbeat);
+				heartbeat = undefined;
+				streams.bytes = 0;
+			},
+		};
+	};
+
 	const server = http.createServer(async (clientReq, clientRes) => {
 		let clientClosed = false;
 		const closeListeners = new Set();
@@ -775,6 +809,7 @@ export async function startCcpaRelay(options = {}) {
 				isStream,
 				clientRes,
 				isClientClosed: () => clientClosed,
+				onStreamCommitted: isStream ? trackStream : undefined,
 				onSuccessBody: cacheKey
 					? (statusCode, resHeaders, resBody) => {
 							if (statusCode === 200 && !resHeaders["content-encoding"]) {
@@ -896,6 +931,7 @@ export async function startCcpaRelay(options = {}) {
 		close() {
 			if (closed) return Promise.resolve();
 			closed = true;
+			clearInterval(heartbeat);
 			options.agent?.destroy();
 			for (const pooledAgent of agentPool.values()) {
 				pooledAgent.destroy();
@@ -927,13 +963,16 @@ function attemptUpstreamRequest({
 	clientRes,
 	isClientClosed,
 	onSuccessBody,
+	onStreamCommitted,
 	onCancelRegister,
 }) {
 	return new Promise((resolve) => {
 		let settled = false;
+		let stream;
 		const finish = (result) => {
 			if (settled) return;
 			settled = true;
+			stream?.end();
 			onCancelRegister(abortUpstream, false);
 			resolve(result);
 		};
@@ -988,6 +1027,12 @@ function attemptUpstreamRequest({
 					}
 					clientRes.writeHead(statusCode, sanitizeResponseHeaders(upRes.headers));
 					clientRes.write(buf);
+					if (statusCode === 200 && onStreamCommitted) {
+						const tracked = onStreamCommitted();
+						stream = tracked;
+						tracked.received(buf.length);
+						upRes.on("data", (chunk) => tracked.received(chunk.length));
+					}
 					const shouldCapture = typeof onSuccessBody === "function" && statusCode === 200;
 					const capturedChunks = shouldCapture ? [buf] : undefined;
 					let capturedBytes = shouldCapture ? buf.length : 0;

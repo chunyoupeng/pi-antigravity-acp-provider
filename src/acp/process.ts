@@ -10,6 +10,7 @@ import { redact } from "./errors.js";
 import { applyAcpProxyEnvironment } from "./proxy.js";
 import { applyCredentialStorageEnvironment, type CredentialStorageOptions } from "./credential-storage.js";
 const STDERR_LIMIT = 16 * 1024;
+const HEARTBEAT_LINES = /^Antigravity CCPA relay: inference streaming .*\n/gmu;
 // Rotated once to `.1` when a new server starts past this size.
 const SERVER_LOG_LIMIT = 5 * 1024 * 1024;
 // Longer than supervisor.mjs's 750 ms agent-tree escalation window.
@@ -180,7 +181,8 @@ export class AntigravityProcess {
 		if (logPath) this.log = openServerLog(logPath, `${new Date().toISOString()} start pid=${child.pid ?? "?"} cwd=${path.resolve(options.cwd)}`);
 		child.stderr.setEncoding("utf8");
 		child.stderr.on("data", (chunk: string) => {
-			this.stderr = redact((this.stderr + chunk).slice(-STDERR_LIMIT));
+			// Heartbeats stay in the log but would push real errors out of the exit message.
+			this.stderr = redact((this.stderr + chunk.replace(HEARTBEAT_LINES, "")).slice(-STDERR_LIMIT));
 			this.appendLog(chunk);
 		});
 		child.once("error", (cause) => {

@@ -20,6 +20,7 @@ export class PromptWatchdog {
 		private readonly stallWarnMs?: number,
 		private readonly onStall?: (busy: boolean, silentMs: number, abortInMs?: number) => void,
 		private readonly stallAbortMs?: number,
+		private readonly upstreamActive?: () => boolean,
 	) {
 		for (const value of [idleMs, workIdleMs]) {
 			if (!Number.isFinite(value) || value <= 0 || value > 2_147_483_647) {
@@ -64,14 +65,8 @@ export class PromptWatchdog {
 					this.onStall?.(busy, silentMs);
 					return;
 				}
-				this.onStall?.(busy, silentMs, abortMs);
-				this.stallAbortTimer = setTimeout(() => {
-					this.stallAbortTimer = undefined;
-					if (this.disposed || this.fired) return;
-					this.fired = true;
-					this.onTimeout(false, silentMs + abortMs);
-				}, abortMs);
-				this.stallAbortTimer.unref?.();
+				this.onStall?.(busy, silentMs, this.upstreamActive?.() ? undefined : abortMs);
+				this.scheduleStallAbort(silentMs, abortMs);
 			}, silentMs);
 			this.stallTimer.unref?.();
 		}
@@ -107,6 +102,21 @@ export class PromptWatchdog {
 		this.stallWarned = false;
 		this.tools.clear();
 		this.holds = this.permissions = 0;
+	}
+
+	private scheduleStallAbort(silentMs: number, abortMs: number): void {
+		this.stallAbortTimer = setTimeout(() => {
+			this.stallAbortTimer = undefined;
+			if (this.disposed || this.fired) return;
+			// A model response still streaming into the relay is progress Antigravity has not relayed yet.
+			if (this.upstreamActive?.()) {
+				this.scheduleStallAbort(silentMs + abortMs, abortMs);
+				return;
+			}
+			this.fired = true;
+			this.onTimeout(false, silentMs + abortMs);
+		}, abortMs);
+		this.stallAbortTimer.unref?.();
 	}
 
 	private acquire(kind: "holds" | "permissions"): () => void {

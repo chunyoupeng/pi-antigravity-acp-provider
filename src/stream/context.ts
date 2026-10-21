@@ -120,10 +120,23 @@ export const PI_BASH_DESCRIPTION =
 	"Execute bash commands in the current working directory. " +
 	"Arguments: command (string, required), timeout (seconds, optional). " +
 	"Output returns its last 2000 lines or 45 KiB; longer output names a file holding all of it, readable with pi_read.";
+/** Pi's edit description without the overlap rule that edits[] and oldText already state. */
+export const PI_EDIT_DESCRIPTION =
+	"Edit a single file using exact text replacement. Do not include large unchanged regions just to connect distant changes.";
 export const PI_READ_EXAMINE_RULE =
 	"- Use pi_read to examine files and images instead of cat or sed.";
 export const PI_READ_FALLBACK_RULE =
 	"- Use pi_read to examine files and images.";
+
+/** Rules that only restate what the bridged tool's MCP description or parameters already say. */
+const SCHEMA_DUPLICATE_RULES = new Set([
+	"- Use edit for precise changes (edits[].oldText must match exactly)",
+	"- Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
+	"- Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
+	"- Use google_search when you need real-time, up-to-date web information, latest news, documentation, or fact checking.",
+	"- Pass specific URLs into the urls array if you want the search engine to fetch and analyze specific pages.",
+	"- Set instruction to provide special research directives from the lead agent (e.g. focus on issues, compare benchmarks, restrict time range).",
+]);
 
 /**
  * Adapts Pi's system instructions for the Antigravity ACP environment.
@@ -133,36 +146,12 @@ export function adaptInstructionsForAntigravity(instructions: string): string {
 	if (!instructions) return instructions;
 	let adapted = instructions;
 
-	// Strip Pi documentation instructions to save prompt tokens
-	adapted = adapted.replace(/<docs>[\s\S]*?<\/docs>\s*/u, "");
+	const hasReadTool = adapted.includes("- read:") || adapted.includes("pi_read:");
 
-	if (adapted.includes("<tools>")) {
-		adapted = adapted.replace(/<tools>([\s\S]*?)<\/tools>/u, (_, toolsContent: string) => {
-			let content = toolsContent;
-			if (content.includes("- read: Read file contents")) {
-				content = content.replace(
-					"- read: Read file contents",
-					`- pi_read: ${PI_READ_DESCRIPTION}`,
-				);
-			} else if (content.includes("- read:")) {
-				content = content.replace(
-					/-\s+read:\s*(.*)/u,
-					`- pi_read: ${PI_READ_DESCRIPTION}`,
-				);
-			}
-			if (content.includes("- bash:")) {
-				content = content.replace(
-					/-\s+bash:\s*(.*)/u,
-					`- pi_bash: ${PI_BASH_DESCRIPTION}`,
-				);
-			}
-			content = content.replace(/-\s+([a-zA-Z0-9_-]+):/gu, (match, name: string) => {
-				if (name.startsWith("pi_")) return match;
-				return `- pi_${name}:`;
-			});
-			return `<tools>${content}</tools>`;
-		});
-	} else if (adapted.includes("- read: Read file contents")) {
+	// Strip Pi documentation and redundant tool list (tools are eagerly declared via MCP)
+	adapted = adapted.replace(/<docs>[\s\S]*?<\/docs>\s*/u, "");
+	adapted = adapted.replace(/<tools>[\s\S]*?<\/tools>\s*/u, "");
+	if (adapted.includes("- read: Read file contents")) {
 		adapted = adapted.replace(
 			"- read: Read file contents",
 			`- pi_read: ${PI_READ_DESCRIPTION}`,
@@ -171,13 +160,13 @@ export function adaptInstructionsForAntigravity(instructions: string): string {
 
 	if (adapted.includes("<rules>")) {
 		adapted = adapted.replace(/<rules>([\s\S]*?)<\/rules>/u, (_, rulesContent: string) => {
-			let content = rulesContent;
+			let content = rulesContent.split("\n").filter((line) => !SCHEMA_DUPLICATE_RULES.has(line)).join("\n");
 			if (content.includes("- Use read to examine files instead of cat or sed.")) {
 				content = content.replace(
 					"- Use read to examine files instead of cat or sed.",
 					PI_READ_EXAMINE_RULE,
 				);
-			} else if (!content.includes("Use pi_read to examine") && (adapted.includes("pi_read:") || adapted.includes("- read:"))) {
+			} else if (!content.includes("Use pi_read to examine") && hasReadTool) {
 				content = `${content.trimEnd()}\n${PI_READ_FALLBACK_RULE}\n`;
 			}
 			content = content.replace(/\bUse bash\b/gu, "Use pi_bash");

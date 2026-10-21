@@ -38,6 +38,8 @@ export interface PromptStallInfo {
 	silentMs: number;
 	abortInMs?: number;
 	upstreamError?: string;
+	/** Set while the relay still receives the model's response: bytes received so far. */
+	streamingBytes?: number;
 }
 
 export interface AntigravityConnectionHandlers {
@@ -474,9 +476,10 @@ export class AntigravityAcpConnection {
 			void this.close().catch(() => undefined);
 		}, this.promptStallWarnMs, (busy, silentMs, abortInMs) => {
 			const upstreamError = diagnostics.error;
+			const streamingBytes = diagnostics.streamingBytes;
 			this.handlers.onStall?.({ busy, silentMs, ...(abortInMs === undefined ? {} : { abortInMs }),
-				...(upstreamError ? { upstreamError } : {}) });
-		}, this.promptStallAbortMs);
+				...(upstreamError ? { upstreamError } : {}), ...(streamingBytes === undefined ? {} : { streamingBytes }) });
+		}, this.promptStallAbortMs, () => diagnostics.streamingBytes !== undefined);
 		this.watchdogs.set(request.sessionId, watchdog);
 		watchdog.arm();
 		try {

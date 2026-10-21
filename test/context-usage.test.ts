@@ -2,10 +2,7 @@ import { type Context, normalizeContext } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 
 import {
-	adaptInstructionsForAntigravity,
 	buildPromptParts,
-	PI_BASH_DESCRIPTION,
-	PI_READ_DESCRIPTION,
 	PI_READ_EXAMINE_RULE,
 } from "../src/stream/context.js";
 import { quotaFromPrompt } from "../src/status.js";
@@ -185,6 +182,26 @@ describe("prompt context", () => {
 		expect(result.prompt[1]).toEqual({ type: "text", text: "current" });
 	});
 
+	it("drops rules that only repeat a bridged tool's schema", () => {
+		const rawInstructions =
+			"<rules>\n- Use bash for file operations\n" +
+			"- Use edit for precise changes (edits[].oldText must match exactly)\n" +
+			"- When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls\n" +
+			"- Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.\n" +
+			"- Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.\n" +
+			"- Use google_search when you need real-time, up-to-date web information, latest news, documentation, or fact checking.\n" +
+			"- Pass specific URLs into the urls array if you want the search engine to fetch and analyze specific pages.\n" +
+			"- Set instruction to provide special research directives from the lead agent (e.g. focus on issues, compare benchmarks, restrict time range).\n" +
+			"</rules>";
+		const context = normalizeContext({ systemPrompt: rawInstructions, messages: [{ role: "user", content: "hello", timestamp: 1 }] });
+		const text = (buildPromptParts(context, true).prompt[0] as { resource: { text: string } }).resource.text;
+		const rules = /<rules>([\s\S]*)<\/rules>/u.exec(text)?.[1]?.trim().split("\n");
+		expect(rules).toEqual([
+			"- Use pi_bash for file operations",
+			"- When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
+		]);
+	});
+
 	it("routes images and Pi skills through Pi read while keeping other text reads native", () => {
 		const rawInstructions =
 			"<tools>\n- read: Read file contents\n- bash: Execute commands\n</tools>\n\n" +
@@ -201,8 +218,8 @@ describe("prompt context", () => {
 		const text = (result.prompt[0] as { resource: { text: string } }).resource.text;
 		expect(text).not.toContain("<docs>");
 		expect(text).not.toContain("Pi documentation to strip");
-		expect(text).toContain(`- pi_read: ${PI_READ_DESCRIPTION}`);
-		expect(text).toContain(`- pi_bash: ${PI_BASH_DESCRIPTION}`);
+		expect(text).not.toContain("<tools>");
+		expect(text).not.toContain("- read: Read file contents");
 		expect(text).toContain("- Use pi_bash for file operations");
 		expect(text).toContain(PI_READ_EXAMINE_RULE);
 		expect(text).not.toContain("view_file");

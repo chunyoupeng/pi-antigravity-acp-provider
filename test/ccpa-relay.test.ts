@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	CCPA_BASE_URL_ENV,
 	CCPA_RELAY_ENABLED_ENV,
+	formatInferenceHeartbeat,
 	resolveProxyUrl,
 	shouldBypassProxy,
 	shouldStartCcpaRelay,
@@ -127,6 +128,25 @@ describe("CCPA Keep-Alive and Retry Relay", () => {
 		expect(logs).toHaveLength(2);
 		expect(logs[0]).toContain("transient HTTP 500");
 		expect(logs[1]).toContain("transient HTTP 503 (The model is currently unreachable)");
+	});
+
+	it("logs heartbeats only while a streamed model response is open", async () => {
+		const logs: string[] = [];
+		const upstream = http.createServer((_req, res) => {
+			res.writeHead(200, { "content-type": "text/event-stream" });
+			res.write("data: {}\n\n");
+			setTimeout(() => res.end("data: {}\n\n"), 150);
+		});
+		const { port } = await listenServer(upstream);
+		const relay = await startCcpaRelay({ upstreamUrl: `http://127.0.0.1:${port}`, heartbeatMs: 30, onLog: (msg) => logs.push(msg) });
+		relays.push(relay);
+		const response = await fetch(`${relay.baseUrl}/v1internal:streamGenerateContent?alt=sse`, { method: "POST", body: "{}" });
+		await response.text();
+		const beats = logs.length;
+		expect(beats).toBeGreaterThan(0);
+		expect(logs[0]).toBe(formatInferenceHeartbeat(1, "data: {}\n\n".length));
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		expect(logs).toHaveLength(beats);
 	});
 
 	it.each([false, true])("logs a safe capacity reason even when retries are exhausted (SSE=%s)", async (sse) => {
