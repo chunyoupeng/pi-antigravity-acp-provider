@@ -214,12 +214,18 @@ function projectTools(
 		output.push({
 			mcpName,
 			piName: tool.name,
-			description: descriptions[tool.name] ?? tool.description,
+			description: projectDescription(tool.description, descriptions[tool.name]),
 			inputSchema,
 			originalSchema: tool.parameters,
 		});
 	}
 	return output;
+}
+
+function projectDescription(original: string, replacement: string | undefined): string {
+	if (replacement === undefined) return original;
+	const codemodeIndex = original.lastIndexOf("\n\nCodemode: ");
+	return codemodeIndex >= 0 ? `${replacement}${original.slice(codemodeIndex)}` : replacement;
 }
 
 async function readJson(request: IncomingMessage): Promise<unknown> {

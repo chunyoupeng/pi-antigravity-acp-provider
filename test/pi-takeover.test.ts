@@ -243,15 +243,16 @@ describe("Pi takeover of Antigravity capabilities", () => {
 		}
 	});
 
-	it("steers Pi's read and bash descriptions when Pi owns tools", async () => {
+	it("steers Pi's read and bash descriptions when Pi owns tools while preserving Codemode call hints", async () => {
+		const readCodemode = "\n\nCodemode: `tools.read(args)` resolves to a string.";
 		const tools = [
-			{ name: "read", description: "Read a file", parameters: Type.Object({ path: Type.String() }) },
+			{ name: "read", description: `Read a file${readCodemode}`, parameters: Type.Object({ path: Type.String() }) },
 			{ name: "bash", description: "Run a shell command", parameters: Type.Object({ command: Type.String() }) },
 			{ name: "echo", description: "Echo text", parameters: Type.Object({ text: Type.String() }) },
 		];
 		for (const [owner, read, bash] of [
-			["pi", PI_TOOL_DESCRIPTIONS.read, PI_TOOL_DESCRIPTIONS.bash],
-			["native", "Read a file", "Run a shell command"],
+			["pi", `${PI_TOOL_DESCRIPTIONS.read}${readCodemode}`, PI_TOOL_DESCRIPTIONS.bash],
+			["native", `Read a file${readCodemode}`, "Run a shell command"],
 		] as const) {
 			const runtime = runtimeFor("default", owner);
 			try {
