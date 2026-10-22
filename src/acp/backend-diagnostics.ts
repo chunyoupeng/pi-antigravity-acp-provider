@@ -23,8 +23,13 @@ export class BackendDiagnostics {
 				if (heartbeat) {
 					this.streamSeenAt = Date.now();
 					this.streamBytes = Number(heartbeat[1]);
+					this.lastError = undefined;
 				} else {
-					this.lastError = classifyBackendError(line) ?? this.lastError;
+					const error = classifyBackendError(line);
+					if (error) {
+						this.lastError = error;
+						this.streamSeenAt = undefined;
+					}
 				}
 			}
 			this.oversized = false;

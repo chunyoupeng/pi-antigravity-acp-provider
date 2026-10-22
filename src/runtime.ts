@@ -112,7 +112,7 @@ export const PI_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = {
 
 /** Antigravity built-ins disabled in every tool mode. Each one costs prompt
  * tokens on every turn (schedule alone about 2k) and has no use behind Pi. */
-export const UNUSED_NATIVE_TOOLS = ["schedule", "ask_question", "generate_image", "list_resources", "read_resource"] as const;
+export const UNUSED_NATIVE_TOOLS = ["schedule", "ask_question", "generate_image"] as const;
 
 type AntigravityModel = Model<"antigravity-acp">;
 
@@ -1298,16 +1298,8 @@ export class AntigravityRuntime {
 
 	private noteBackendStall(binding: Binding | undefined, info: PromptStallInfo): void {
 		const writer = binding?.writer;
-		if (!writer || writer.finished) return;
+		if (!writer || writer.finished || info.streamingBytes !== undefined) return;
 		const seconds = Math.max(1, Math.round(info.silentMs / 1000));
-		if (info.streamingBytes !== undefined) {
-			writer.text(
-				`\n\n⏳ No update from Antigravity for ${seconds}s, but the model's response is still open ` +
-				`(${Math.round(info.streamingBytes / 1024)} KB received so far). Antigravity relays nothing while the model ` +
-				"writes a long tool call. The turn keeps waiting while the response stays open; Esc aborts it.\n\n",
-			);
-			return;
-		}
 		const work = info.busy ? " with tool/permission work still outstanding" : "";
 		const abort = info.abortInMs === undefined
 			? "The turn keeps waiting; Esc aborts it."

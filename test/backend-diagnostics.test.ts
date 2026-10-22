@@ -17,6 +17,12 @@ describe("backend silence diagnostics", () => {
 		diagnostics.write(`${formatInferenceHeartbeat(1, 51200)}\n`);
 		expect(diagnostics.streamingBytes).toBe(51200);
 		expect(diagnostics.error).toBeUndefined();
+		diagnostics.write(relay("HTTP 503") + "\n");
+		expect(diagnostics.streamingBytes).toBeUndefined();
+		expect(diagnostics.error).toBe("HTTP 503: service unavailable (attempt 2/5)");
+		diagnostics.write(`${formatInferenceHeartbeat(1, 0)}\n`);
+		expect(diagnostics.streamingBytes).toBe(0);
+		expect(diagnostics.error).toBeUndefined();
 		vi.advanceTimersByTime(INFERENCE_HEARTBEAT_MS * 2.5 + 1);
 		expect(diagnostics.streamingBytes).toBeUndefined();
 	});

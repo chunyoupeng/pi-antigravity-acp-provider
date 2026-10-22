@@ -130,21 +130,25 @@ describe("CCPA Keep-Alive and Retry Relay", () => {
 		expect(logs[1]).toContain("transient HTTP 503 (The model is currently unreachable)");
 	});
 
-	it("logs heartbeats only while a streamed model response is open", async () => {
+	it("logs heartbeats while waiting for the first SSE chunk and while streaming", async () => {
 		const logs: string[] = [];
+		const chunk = "data: {}\n\n";
 		const upstream = http.createServer((_req, res) => {
-			res.writeHead(200, { "content-type": "text/event-stream" });
-			res.write("data: {}\n\n");
-			setTimeout(() => res.end("data: {}\n\n"), 150);
+			setTimeout(() => {
+				res.writeHead(200, { "content-type": "text/event-stream" });
+				res.write(chunk);
+				setTimeout(() => res.end(chunk), 80);
+			}, 80);
 		});
 		const { port } = await listenServer(upstream);
-		const relay = await startCcpaRelay({ upstreamUrl: `http://127.0.0.1:${port}`, heartbeatMs: 30, onLog: (msg) => logs.push(msg) });
+		const relay = await startCcpaRelay({ upstreamUrl: `http://127.0.0.1:${port}`, heartbeatMs: 25, onLog: (msg) => logs.push(msg) });
 		relays.push(relay);
 		const response = await fetch(`${relay.baseUrl}/v1internal:streamGenerateContent?alt=sse`, { method: "POST", body: "{}" });
 		await response.text();
 		const beats = logs.length;
-		expect(beats).toBeGreaterThan(0);
-		expect(logs[0]).toBe(formatInferenceHeartbeat(1, "data: {}\n\n".length));
+		expect(beats).toBeGreaterThan(1);
+		expect(logs[0]).toBe(formatInferenceHeartbeat(1, 0));
+		expect(logs).toContain(formatInferenceHeartbeat(1, chunk.length));
 		await new Promise((resolve) => setTimeout(resolve, 100));
 		expect(logs).toHaveLength(beats);
 	});

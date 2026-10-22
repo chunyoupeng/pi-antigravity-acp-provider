@@ -53,22 +53,7 @@ export class PromptWatchdog {
 		}, duration);
 		this.timer.unref?.();
 		if (this.onStall && this.stallWarnMs !== undefined && !this.stallWarned && this.stallWarnMs < duration) {
-			const silentMs = this.stallWarnMs;
-			this.stallTimer = setTimeout(() => {
-				this.stallTimer = undefined;
-				if (this.disposed || this.fired || this.stallWarned) return;
-				this.stallWarned = true;
-				// Outstanding tool/permission work can legitimately stay mute; only
-				// an idle backend gets aborted once the grace period also expires.
-				const abortMs = !busy && this.stallAbortMs !== undefined ? this.stallAbortMs : undefined;
-				if (abortMs === undefined) {
-					this.onStall?.(busy, silentMs);
-					return;
-				}
-				this.onStall?.(busy, silentMs, this.upstreamActive?.() ? undefined : abortMs);
-				this.scheduleStallAbort(silentMs, abortMs);
-			}, silentMs);
-			this.stallTimer.unref?.();
+			this.scheduleStallWarn(busy, this.stallWarnMs, this.stallWarnMs);
 		}
 	}
 
@@ -102,6 +87,30 @@ export class PromptWatchdog {
 		this.stallWarned = false;
 		this.tools.clear();
 		this.holds = this.permissions = 0;
+	}
+
+	private scheduleStallWarn(busy: boolean, silentMs: number, stepMs: number): void {
+		this.stallTimer = setTimeout(() => {
+			this.stallTimer = undefined;
+			if (this.disposed || this.fired || this.stallWarned) return;
+			// Active upstream inference (including pre-first-chunk tool-call generation)
+			// is real progress that Antigravity has not relayed over ACP yet.
+			if (!busy && this.upstreamActive?.()) {
+				this.scheduleStallWarn(busy, silentMs + stepMs, stepMs);
+				return;
+			}
+			this.stallWarned = true;
+			// Outstanding tool/permission work can legitimately stay mute; only
+			// an idle backend gets aborted once the grace period also expires.
+			const abortMs = !busy && this.stallAbortMs !== undefined ? this.stallAbortMs : undefined;
+			if (abortMs === undefined) {
+				this.onStall?.(busy, silentMs);
+				return;
+			}
+			this.onStall?.(busy, silentMs, abortMs);
+			this.scheduleStallAbort(silentMs, abortMs);
+		}, stepMs);
+		this.stallTimer.unref?.();
 	}
 
 	private scheduleStallAbort(silentMs: number, abortMs: number): void {

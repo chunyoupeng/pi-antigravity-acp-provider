@@ -135,20 +135,22 @@ describe("bounded prompt progress watchdog", () => {
 		watch.dispose();
 	});
 
-	it("defers the auto-abort while the upstream response is still streaming", () => {
+	it("defers both the stall warning and auto-abort while the upstream response is still streaming", () => {
 		vi.useFakeTimers();
 		const timeout = vi.fn();
 		const stall = vi.fn();
 		let streaming = true;
 		const watch = new PromptWatchdog(60_000, 60_000, timeout, 100, stall, 150, () => streaming);
 		watch.arm();
-		vi.advanceTimersByTime(100);
-		expect(stall).toHaveBeenCalledExactlyOnceWith(false, 100, undefined);
-		vi.advanceTimersByTime(450);
+		vi.advanceTimersByTime(550);
+		expect(stall).not.toHaveBeenCalled();
 		expect(timeout).not.toHaveBeenCalled();
 		streaming = false;
+		vi.advanceTimersByTime(50);
+		expect(stall).toHaveBeenCalledExactlyOnceWith(false, 600, 150);
+		expect(timeout).not.toHaveBeenCalled();
 		vi.advanceTimersByTime(150);
-		expect(timeout).toHaveBeenCalledExactlyOnceWith(false, 700);
+		expect(timeout).toHaveBeenCalledExactlyOnceWith(false, 750);
 		watch.dispose();
 	});
 

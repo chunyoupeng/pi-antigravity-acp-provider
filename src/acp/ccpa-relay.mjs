@@ -969,6 +969,10 @@ function attemptUpstreamRequest({
 	return new Promise((resolve) => {
 		let settled = false;
 		let stream;
+		const startStream = () => {
+			if (settled || stream || !onStreamCommitted) return;
+			stream = onStreamCommitted();
+		};
 		const finish = (result) => {
 			if (settled) return;
 			settled = true;
@@ -989,6 +993,9 @@ function attemptUpstreamRequest({
 			},
 			async (upRes) => {
 				const statusCode = upRes.statusCode ?? 502;
+				if (statusCode !== 200) {
+					stream?.end();
+				}
 				if (RETRYABLE_STATUS_CODES.has(statusCode)) {
 					const errBody = await readErrorBody(upRes);
 					finish({
@@ -1028,10 +1035,9 @@ function attemptUpstreamRequest({
 					clientRes.writeHead(statusCode, sanitizeResponseHeaders(upRes.headers));
 					clientRes.write(buf);
 					if (statusCode === 200 && onStreamCommitted) {
-						const tracked = onStreamCommitted();
-						stream = tracked;
-						tracked.received(buf.length);
-						upRes.on("data", (chunk) => tracked.received(chunk.length));
+						startStream();
+						stream.received(buf.length);
+						upRes.on("data", (chunk) => stream.received(chunk.length));
 					}
 					const shouldCapture = typeof onSuccessBody === "function" && statusCode === 200;
 					const capturedChunks = shouldCapture ? [buf] : undefined;
@@ -1119,6 +1125,16 @@ function attemptUpstreamRequest({
 			finish({ kind: "completed" });
 		};
 		onCancelRegister(abortUpstream, true);
+
+		if (onStreamCommitted) {
+			upReq.once("socket", (socket) => {
+				if (socket.connecting || socket.secureConnecting) {
+					socket.once("encrypted" in socket ? "secureConnect" : "connect", startStream);
+					return;
+				}
+				startStream();
+			});
+		}
 
 		upReq.once("error", (err) => {
 			finish({
