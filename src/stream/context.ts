@@ -111,18 +111,6 @@ export function buildPromptParts(
 	return { prompt, messageCount: context.messages.length };
 }
 
-/** Pi's read and bash page text at 45 KiB for Antigravity (see extensions/safe-read.ts). */
-export const PI_READ_DESCRIPTION =
-	"Read text files and images (png, jpg, gif, webp) at any path. " +
-	"Arguments: path (string, required), offset (1-indexed start line, optional), limit (max lines, optional). " +
-	"Text returns at most 2000 lines or 45 KiB per call; a longer file ends with the offset to continue from.";
-export const PI_BASH_DESCRIPTION =
-	"Execute bash commands in the current working directory. " +
-	"Arguments: command (string, required), timeout (seconds, optional). " +
-	"Output returns its last 2000 lines or 45 KiB; longer output names a file holding all of it, readable with pi_read.";
-/** Pi's edit description without the overlap rule that edits[] and oldText already state. */
-export const PI_EDIT_DESCRIPTION =
-	"Edit a single file using exact text replacement. Do not include large unchanged regions just to connect distant changes.";
 export const PI_READ_EXAMINE_RULE =
 	"- Use pi_read to examine files and images instead of cat or sed.";
 export const PI_READ_FALLBACK_RULE =
@@ -151,12 +139,6 @@ export function adaptInstructionsForAntigravity(instructions: string): string {
 	// Strip Pi documentation and redundant tool list (tools are eagerly declared via MCP)
 	adapted = adapted.replace(/<docs>[\s\S]*?<\/docs>\s*/u, "");
 	adapted = adapted.replace(/<tools>[\s\S]*?<\/tools>\s*/u, "");
-	if (adapted.includes("- read: Read file contents")) {
-		adapted = adapted.replace(
-			"- read: Read file contents",
-			`- pi_read: ${PI_READ_DESCRIPTION}`,
-		);
-	}
 
 	if (adapted.includes("<rules>")) {
 		adapted = adapted.replace(/<rules>([\s\S]*?)<\/rules>/u, (_, rulesContent: string) => {

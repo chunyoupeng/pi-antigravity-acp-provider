@@ -61,7 +61,7 @@ import {
 } from "./mcp/bridge.js";
 import type { PermissionMode, ToolOwner } from "./config.js";
 import { MAX_TEXT_RESULT_BYTES, MCP_MAX_OUTPUT_BYTES, resolveAcpModelId, resolveAcpThinking } from "./models.js";
-import { PI_BASH_DESCRIPTION, PI_EDIT_DESCRIPTION, PI_READ_DESCRIPTION, type PromptParts, buildPromptParts, currentSystemInstructions } from "./stream/context.js";
+import { type PromptParts, buildPromptParts, currentSystemInstructions } from "./stream/context.js";
 import { PiEventWriter } from "./stream/pi-events.js";
 import { contextUsage, usageFromPrompt, withContextUsage } from "./stream/usage.js";
 import { RuntimeMetrics } from "./status.js";
@@ -100,15 +100,6 @@ export const PI_OWNED_NATIVE_TOOLS = [
 	"find_file",
 	"start_subagent",
 ] as const;
-
-/** Pi tool descriptions replaced when Pi owns tools: read and bash state the
- * 46 KiB page and argument list that the lazy-loaded MCP schema would otherwise
- * hold; edit drops the overlap rule its parameters already state. */
-export const PI_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = {
-	read: PI_READ_DESCRIPTION,
-	bash: PI_BASH_DESCRIPTION,
-	edit: PI_EDIT_DESCRIPTION,
-};
 
 /** Antigravity built-ins disabled in every tool mode. Each one costs prompt
  * tokens on every turn (schedule alone about 2k) and has no use behind Pi. */
@@ -1047,7 +1038,6 @@ export class AntigravityRuntime {
 			if (tools.length > 0 && initialize.agentCapabilities?.mcpCapabilities?.http === true) {
 				bridge = new PiMcpBridge({
 					tools,
-					...(toolOwner === "pi" ? { descriptions: PI_TOOL_DESCRIPTIONS } : {}),
 					onCall: (invocation, abandoned) => this.requestPiTool(binding, invocation, abandoned),
 				});
 				mcpServer = await bridge.start();

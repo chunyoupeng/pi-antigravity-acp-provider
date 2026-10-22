@@ -35,8 +35,6 @@ export interface PiToolInvocation {
 
 export interface PiMcpBridgeOptions {
 	tools: readonly Tool[];
-	/** Descriptions that replace a Pi tool's own, keyed by Pi tool name. */
-	descriptions?: Readonly<Record<string, string>>;
 	/** `abandoned` aborts when the agent drops the HTTP request, e.g. after
 	 * Antigravity's 3-minute MCP deadline, before the result was sent. */
 	onCall: (invocation: PiToolInvocation, abandoned: AbortSignal) => Promise<CallToolResult>;
@@ -72,7 +70,7 @@ export class PiMcpBridge {
 	private url: string | undefined;
 
 	constructor(private readonly options: PiMcpBridgeOptions) {
-		this.tools = projectTools(options.tools, this.omissions, options.descriptions);
+		this.tools = projectTools(options.tools, this.omissions);
 		this.fingerprint = projectionFingerprint(this.tools, this.omissions);
 	}
 
@@ -189,7 +187,6 @@ export class PiMcpBridge {
 function projectTools(
 	tools: readonly Tool[],
 	omissions: ToolOmission[],
-	descriptions: Readonly<Record<string, string>> = {},
 ): BridgeTool[] {
 	const output: BridgeTool[] = [];
 	const names = new Set<string>();
@@ -214,18 +211,12 @@ function projectTools(
 		output.push({
 			mcpName,
 			piName: tool.name,
-			description: projectDescription(tool.description, descriptions[tool.name]),
+			description: tool.description,
 			inputSchema,
 			originalSchema: tool.parameters,
 		});
 	}
 	return output;
-}
-
-function projectDescription(original: string, replacement: string | undefined): string {
-	if (replacement === undefined) return original;
-	const codemodeIndex = original.lastIndexOf("\n\nCodemode: ");
-	return codemodeIndex >= 0 ? `${replacement}${original.slice(codemodeIndex)}` : replacement;
 }
 
 async function readJson(request: IncomingMessage): Promise<unknown> {

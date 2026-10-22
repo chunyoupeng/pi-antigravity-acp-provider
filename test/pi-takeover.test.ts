@@ -10,7 +10,7 @@ import { AntigravityAcpConnection } from "../src/acp/connection.js";
 import { AcpSessionStore } from "../src/acp/session-store.js";
 import type { ToolOwner } from "../src/config.js";
 import { MCP_MAX_OUTPUT_BYTES, projectModels } from "../src/models.js";
-import { AntigravityRuntime, PI_OWNED_NATIVE_TOOLS, PI_TOOL_DESCRIPTIONS, UNUSED_NATIVE_TOOLS } from "../src/runtime.js";
+import { AntigravityRuntime, PI_OWNED_NATIVE_TOOLS, UNUSED_NATIVE_TOOLS } from "../src/runtime.js";
 
 const fakeAgent = fileURLToPath(new URL("./fixtures/fake-agent.mjs", import.meta.url));
 const model: Model<"antigravity-acp"> = {
@@ -240,37 +240,6 @@ describe("Pi takeover of Antigravity capabilities", () => {
 			expect(writer.message.content).toEqual([{ type: "text", text: "Decision: selected" }]);
 		} finally {
 			await runtime.close();
-		}
-	});
-
-	it("steers Pi's read and bash descriptions when Pi owns tools while preserving Codemode call hints", async () => {
-		const readCodemode = "\n\nCodemode: `tools.read(args)` resolves to a string.";
-		const tools = [
-			{ name: "read", description: `Read a file${readCodemode}`, parameters: Type.Object({ path: Type.String() }) },
-			{ name: "bash", description: "Run a shell command", parameters: Type.Object({ command: Type.String() }) },
-			{ name: "echo", description: "Echo text", parameters: Type.Object({ text: Type.String() }) },
-		];
-		for (const [owner, read, bash] of [
-			["pi", `${PI_TOOL_DESCRIPTIONS.read}${readCodemode}`, PI_TOOL_DESCRIPTIONS.bash],
-			["native", `Read a file${readCodemode}`, "Run a shell command"],
-		] as const) {
-			const runtime = runtimeFor("default", owner);
-			try {
-				const writer = runtime.stream(
-					model,
-					normalizeContext({ messages: [{ role: "user", content: "list bridge tools", timestamp: 1 }], tools }),
-					{ apiKey: "test-key" },
-				);
-				for await (const _event of writer.stream) void _event;
-				const block = writer.message.content.find((item) => item.type === "text");
-				expect(JSON.parse(block?.type === "text" ? block.text : "")).toEqual([
-					{ name: "pi_read", description: read },
-					{ name: "pi_bash", description: bash },
-					{ name: "pi_echo", description: "Echo text" },
-				]);
-			} finally {
-				await runtime.close();
-			}
 		}
 	});
 
