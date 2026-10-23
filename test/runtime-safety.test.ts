@@ -430,7 +430,7 @@ describe("warm connection pool and idle binding hibernation", () => {
 		expect(connections).toHaveLength(2);
 	});
 
-	it("hibernates an idle persistent binding while retaining its saved session record for seamless resume", async () => {
+	it("drops an idle persistent binding and clears its saved session record so wake rebuilds via newSession", async () => {
 		const fixture = setup();
 		const store = new AcpSessionStore(path.join(fixture.root, "sessions.json"));
 		const { runtime, connections, entries } = setup(undefined, "yolo", store, undefined, 80);
@@ -444,13 +444,13 @@ describe("warm connection pool and idle binding hibernation", () => {
 			expect((await runtime.snapshot()).bindings).toBe(0);
 			expect(connections[0]?.process.alive).toBe(false);
 		}, { timeout: 2_000 });
-		// Saved session record must remain in AcpSessionStore across hibernation.
-		expect(store.get("hibernate")).toBeDefined();
+		// Saved session record is cleared on idle so the next turn rebuilds via newSession.
+		expect(store.get("hibernate")).toBeUndefined();
 
 		const second = await turn(runtime, [user("hello"), first, user("after wake", 2)], "hibernate");
 		expect(second.stopReason).toBe("stop");
 		expect(connections).toHaveLength(2);
-		expect((await runtime.snapshot()).processes[0]?.restored).toBe(true);
-		expect(entries().some((entry) => entry.method === "session/resume")).toBe(true);
+		expect((await runtime.snapshot()).processes[0]?.restored).toBe(false);
+		expect(entries().filter((entry) => entry.method === "session/new")).toHaveLength(2);
 	});
 });

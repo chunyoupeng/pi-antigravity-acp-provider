@@ -72,10 +72,11 @@ const TOOL_BATCH_MS = 100;
  * as a failure. A Pi tool still running before then is handed off instead:
  * the model ends its turn and gets the result as the next prompt. */
 const TOOL_HANDOFF_MS = 150_000;
-/** Default idle timeout before an inactive ACP binding hibernates its child
- * process while preserving its session record in AcpSessionStore for seamless
- * resume on the next turn. */
-export const DEFAULT_IDLE_TIMEOUT_MS = 20 * 60_000;
+/** Default idle timeout before an inactive ACP binding drops its child process
+ * and clears its saved session record so the next turn rebuilds via newSession. */
+export const DEFAULT_IDLE_TIMEOUT_MS = 60 * 60_000;
+/** Minimum context token count required to trigger automatic compaction on idle timeout. */
+export const IDLE_COMPACT_THRESHOLD_TOKENS = 20_000;
 
 function resolveIdleTimeoutMs(): number {
 	const raw = process.env.PI_ANTIGRAVITY_IDLE_TIMEOUT_MS?.trim();
@@ -254,6 +255,7 @@ export class AntigravityRuntime {
 	private toolOwner: ToolOwner;
 	private warmConnection: WarmConnection | undefined;
 	private prewarmInFlight: PrewarmInFlight | undefined;
+	private onIdleCompact?: (piSessionId: string, contextTokens: number) => void;
 
 	constructor(
 		connectionFactory?: AntigravityConnectionFactory,
@@ -271,6 +273,10 @@ export class AntigravityRuntime {
 		this.permissionMode = permissionMode;
 		this.sessionStore = sessionStore ?? (this.ensureAgent ? new AcpSessionStore() : undefined);
 		this.decisions = decisionLog ?? (this.ensureAgent ? new DecisionLog() : undefined);
+	}
+
+	setIdleCompactHandler(handler: (piSessionId: string, contextTokens: number) => void): void {
+		this.onIdleCompact = handler;
 	}
 
 	stream(model: AntigravityModel, context: Context, options: SimpleStreamOptions = {}): PiEventWriter {
@@ -598,8 +604,8 @@ export class AntigravityRuntime {
 		if (this.ensureAgent) await ensureAntigravityAcpReady(undefined, options.signal);
 		await this.modeChanges;
 		this.assertEpoch(epoch);
-		const persistent = Boolean(options.sessionId);
-		const key = options.sessionId
+		const persistent = Boolean(options.sessionId) && options.cacheRetention !== "none";
+		const key = persistent
 			? `sid:${options.sessionId}`
 			: (this.findContinuationKey(context) ?? `ephemeral:${crypto.randomUUID()}`);
 		const tools = getCurrentTools(normalizeContext(context).messages);
@@ -1534,7 +1540,15 @@ export class AntigravityRuntime {
 			) {
 				return;
 			}
-			void this.dropBinding(binding.key, binding, "idle timeout", false).catch(() => undefined);
+			const piSessionId = binding.piSessionId;
+			const contextTokens = binding.contextTokens ?? 0;
+			void this.dropBinding(binding.key, binding, "idle timeout", true)
+				.then(() => {
+					if (piSessionId && contextTokens > IDLE_COMPACT_THRESHOLD_TOKENS) {
+						this.onIdleCompact?.(piSessionId, contextTokens);
+					}
+				})
+				.catch(() => undefined);
 		}, this.idleTimeoutMs);
 		timer.unref();
 		binding.idleTimer = timer;

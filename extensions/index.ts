@@ -1,6 +1,7 @@
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
+	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -31,6 +32,7 @@ import {
 import { createAntigravityProvider } from "../src/provider.js";
 import {
 	AntigravityRuntime,
+	IDLE_COMPACT_THRESHOLD_TOKENS,
 	MANAGED_AUTH_MARKER,
 	PERMISSION_RESULT_KIND,
 	PERMISSION_TOOL_NAME,
@@ -51,6 +53,18 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 	const runtime = new AntigravityRuntime(
 		undefined, config.permissions, undefined, registerToolActivity(pi), config.tools,
 	);
+	const sessionContexts = new Map<string, ExtensionContext>();
+	runtime.setIdleCompactHandler((piSessionId) => {
+		const ctx = sessionContexts.get(piSessionId);
+		if (!ctx || !ctx.isIdle() || ctx.hasPendingMessages()) return;
+		const usage = ctx.getContextUsage();
+		if (usage?.tokens !== null && usage?.tokens !== undefined && usage.tokens <= IDLE_COMPACT_THRESHOLD_TOKENS) {
+			return;
+		}
+		ctx.compact({
+			onError: () => undefined,
+		});
+	});
 	const { provider } = createAntigravityProvider(runtime);
 	pi.registerProvider(provider);
 	pi.registerTool(createSafeReadToolDefinition(process.cwd()));
@@ -284,6 +298,7 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		sessionContexts.set(ctx.sessionManager.getSessionId(), ctx);
 		if (!historyPruned) {
 			historyPruned = true;
 			try {
@@ -322,7 +337,12 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("agent_end", (_event, ctx) => {
+		sessionContexts.set(ctx.sessionManager.getSessionId(), ctx);
+	});
+
+	pi.on("session_shutdown", async (_event, ctx) => {
+		sessionContexts.delete(ctx.sessionManager.getSessionId());
 		await runtime.close();
 	});
 }
