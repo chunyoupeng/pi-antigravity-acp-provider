@@ -1,7 +1,13 @@
-import type {
-	ExtensionAPI,
-	ExtensionCommandContext,
-	ExtensionContext,
+import {
+	buildSessionProjection,
+	DEFAULT_COMPACTION_SETTINGS,
+	estimateTokens,
+	sessionEntryToContextMessages,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type ExtensionContext,
+	type ProjectedSessionEntry,
+	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -56,9 +62,13 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 	const sessionContexts = new Map<string, ExtensionContext>();
 	runtime.setIdleCompactHandler((piSessionId) => {
 		const ctx = sessionContexts.get(piSessionId);
-		if (!ctx || !ctx.isIdle() || ctx.hasPendingMessages()) return;
+		if (!ctx || !ctx.isIdle() || ctx.hasPendingMessages() || !ctx.model) return;
 		const usage = ctx.getContextUsage();
 		if (usage?.tokens !== null && usage?.tokens !== undefined && usage.tokens <= IDLE_COMPACT_THRESHOLD_TOKENS) {
+			return;
+		}
+		const keepRecentTokens = resolveKeepRecentTokens(pi, ctx.model);
+		if (!canCompactBranch(ctx.sessionManager.getBranch(), keepRecentTokens)) {
 			return;
 		}
 		ctx.compact({
@@ -345,6 +355,153 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 		sessionContexts.delete(ctx.sessionManager.getSessionId());
 		await runtime.close();
 	});
+}
+
+function resolveKeepRecentTokens(
+	pi: ExtensionAPI,
+	model: { provider: string; id: string },
+): number {
+	const compaction = pi.getSettings().compaction;
+	const override = compaction?.modelOverrides?.[`${model.provider}/${model.id}`]?.keepRecentTokens;
+	if (typeof override === "number" && Number.isSafeInteger(override) && override >= 0) {
+		return override;
+	}
+	const ordinary = compaction?.keepRecentTokens;
+	if (typeof ordinary === "number" && Number.isSafeInteger(ordinary) && ordinary >= 0) {
+		return ordinary;
+	}
+	return DEFAULT_COMPACTION_SETTINGS.keepRecentTokens;
+}
+
+function isCutPointMessage(role: string): boolean {
+	return (
+		role === "user" ||
+		role === "assistant" ||
+		role === "bashExecution" ||
+		role === "custom" ||
+		role === "branchSummary" ||
+		role === "compactionSummary"
+	);
+}
+
+function isTurnStartMessage(role: string): boolean {
+	return (
+		role === "user" ||
+		role === "bashExecution" ||
+		role === "custom" ||
+		role === "branchSummary" ||
+		role === "compactionSummary"
+	);
+}
+
+function isProjectedTurnStart(entry: ProjectedSessionEntry): boolean {
+	if (entry.sourceEntry.type === "compaction") return false;
+	return entry.messages.some((message) => isTurnStartMessage(message.role));
+}
+
+function findProjectedTurnStartIndex(
+	entries: ProjectedSessionEntry[],
+	entryIndex: number,
+	startIndex: number,
+): number {
+	for (let i = entryIndex; i >= startIndex; i--) {
+		if (isProjectedTurnStart(entries[i]!)) return i;
+	}
+	return -1;
+}
+
+/**
+ * Mirrors Pi's `prepareCompaction()` eligibility check so idle compaction never
+ * invokes `ctx.compact()` when the retained history fits inside `keepRecentTokens`
+ * (which would emit a manual `compaction_end` error in Pi's TUI).
+ */
+export function canCompactBranch(pathEntries: SessionEntry[], keepRecentTokens: number): boolean {
+	if (pathEntries.length === 0 || pathEntries[pathEntries.length - 1]?.type === "compaction") {
+		return false;
+	}
+	const projection = buildSessionProjection(pathEntries);
+	const projectedEntries = projection.entries;
+	const prevCompactionIndex = projectedEntries.findIndex(
+		(entry) => entry.sourceEntry.type === "compaction" && entry.messages.length > 0,
+	);
+	const boundaryStart = prevCompactionIndex >= 0 ? prevCompactionIndex + 1 : 0;
+	const boundaryEnd = projectedEntries.length;
+
+	const cutPoints: number[] = [];
+	for (let i = boundaryStart; i < boundaryEnd; i++) {
+		const entry = projectedEntries[i]!;
+		if (entry.sourceEntry.type !== "compaction" && entry.messages.some((m) => isCutPointMessage(m.role))) {
+			cutPoints.push(i);
+		}
+	}
+
+	let cutIndex = boundaryStart;
+	let turnStartIndex = -1;
+	let isSplitTurn = false;
+
+	if (cutPoints.length > 0) {
+		let accumulatedTokens = 0;
+		let exceededBudget = false;
+		cutIndex = cutPoints[0]!;
+		for (let i = boundaryEnd - 1; i >= boundaryStart; i--) {
+			const messageTokens = projectedEntries[i]!.messages.reduce((sum, message) => sum + estimateTokens(message), 0);
+			if (messageTokens === 0) continue;
+			accumulatedTokens += messageTokens;
+			if (accumulatedTokens >= keepRecentTokens) {
+				exceededBudget = true;
+				cutIndex = cutPoints.find((candidate) => candidate >= i) ?? cutPoints[cutPoints.length - 1]!;
+				break;
+			}
+		}
+
+		const suffix = projectedEntries.slice(cutIndex + 1, boundaryEnd);
+		const isIntrinsicallyVisible = (entry: ProjectedSessionEntry): boolean =>
+			entry.sourceEntry.type !== "context_edit" && sessionEntryToContextMessages(entry.sourceEntry).length > 0;
+		const isOmitted = (entry: ProjectedSessionEntry): boolean =>
+			isIntrinsicallyVisible(entry) && entry.messages.length === 0;
+		const omittedSuffixIds = new Set(suffix.filter(isOmitted).map((entry) => entry.sourceEntry.id));
+		const hasExternalReplacement = suffix.some(
+			(entry) =>
+				entry.sourceEntry.type === "context_edit" &&
+				entry.sourceEntry.replacement !== null &&
+				!omittedSuffixIds.has(entry.sourceEntry.targetId),
+		);
+		const isRecoveryOmissionSuffix =
+			exceededBudget &&
+			!hasExternalReplacement &&
+			suffix.some(
+				(entry) =>
+					entry.sourceEntry.type === "message" &&
+					entry.sourceEntry.message.role === "assistant" &&
+					isOmitted(entry),
+			) &&
+			suffix.every(
+				(entry) => entry.sourceEntry.type !== "compaction" && (!isIntrinsicallyVisible(entry) || isOmitted(entry)),
+			);
+		if (isRecoveryOmissionSuffix) cutIndex++;
+
+		while (cutIndex > boundaryStart) {
+			const previous = projectedEntries[cutIndex - 1]!;
+			if (previous.sourceEntry.type === "compaction" || previous.messages.length > 0) break;
+			cutIndex--;
+		}
+		const startsTurn = isProjectedTurnStart(projectedEntries[cutIndex]!);
+		turnStartIndex = startsTurn ? -1 : findProjectedTurnStartIndex(projectedEntries, cutIndex, boundaryStart);
+		isSplitTurn = !startsTurn && turnStartIndex !== -1;
+	}
+
+	const firstKeptEntry = projectedEntries[cutIndex]?.sourceEntry;
+	if (!firstKeptEntry?.id) return false;
+	const historyEnd = isSplitTurn ? turnStartIndex : cutIndex;
+
+	const hasSummarizeable = (entry: ProjectedSessionEntry): boolean =>
+		entry.sourceEntry.type !== "compaction" && entry.messages.some((m) => m.role !== "system");
+
+	const hasMessagesToSummarize = projectedEntries.slice(boundaryStart, historyEnd).some(hasSummarizeable);
+	const hasTurnPrefixMessages =
+		isSplitTurn && projectedEntries.slice(turnStartIndex, cutIndex).some(hasSummarizeable);
+
+	return hasMessagesToSummarize || hasTurnPrefixMessages;
 }
 
 function formatMetrics(metrics: {

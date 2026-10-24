@@ -1,10 +1,12 @@
 import { normalizeContext, type Context, type Model } from "@earendil-works/pi-ai";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { canCompactBranch } from "../extensions/index.js";
 import { AntigravityAcpConnection } from "../src/acp/connection.js";
 import { AcpSessionStore } from "../src/acp/session-store.js";
 import { DecisionLog } from "../src/acp/decision-log.js";
@@ -452,5 +454,23 @@ describe("warm connection pool and idle binding hibernation", () => {
 		expect(connections).toHaveLength(2);
 		expect((await runtime.snapshot()).processes[0]?.restored).toBe(false);
 		expect(entries().filter((entry) => entry.method === "session/new")).toHaveLength(2);
+	});
+
+	it("skips idle compaction when the conversation messages fit inside keepRecentTokens", () => {
+		const sm = SessionManager.inMemory();
+		sm.appendMessage({ role: "user", content: [{ type: "text", text: "short prompt" }], timestamp: 1 });
+		sm.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "short reply" }],
+			api: "antigravity-acp",
+			provider: "antigravity-acp",
+			model: "gemini-test",
+			usage: { input: 25_000, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 25_010, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			stopReason: "stop",
+			timestamp: 2,
+		});
+
+		expect(canCompactBranch(sm.getBranch(), 20_000)).toBe(false);
+		expect(canCompactBranch(sm.getBranch(), 1)).toBe(true);
 	});
 });
