@@ -74,7 +74,8 @@ export function boundedNdjsonStream(
 
 	const writable = new WritableStream<AnyMessage>({
 		async write(message) {
-			const bytes = encoder.encode(`${JSON.stringify(message)}\n`);
+			const json = JSON.stringify(message, (_key, value) => (typeof value === "string" ? wellFormedString(value) : value));
+			const bytes = encoder.encode(`${json}\n`);
 			if (bytes.byteLength > maxFrameBytes) {
 				throw new Error(`Outbound ACP frame exceeds ${maxFrameBytes} bytes`);
 			}
@@ -138,6 +139,10 @@ function isKnownCompatibilityNoise(text: string): boolean {
 	// URL is opened in an already-running browser. Antigravity currently lets
 	// that child output share its otherwise NDJSON-only stdout stream.
 	return text.trim() === "Opening in existing browser session.";
+}
+
+export function wellFormedString(text: string): string {
+	return text.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/gu, "\uFFFD");
 }
 
 function isMessage(value: unknown): value is AnyMessage {

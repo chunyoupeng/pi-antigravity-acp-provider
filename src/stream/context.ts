@@ -1,6 +1,7 @@
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 import { getCurrentSystemPrompt, type Context, type Message } from "@earendil-works/pi-ai";
 
+import { wellFormedString } from "../acp/bounded-stream.js";
 import { AntigravityAcpError } from "../acp/errors.js";
 
 /** Antigravity keeps about the first 192 KB of one user input and cuts the
@@ -81,10 +82,10 @@ export function buildPromptParts(
 		// truncatable history. This also preserves its image blocks on handoff.
 		if (hasTrailingResults) request.push({ type: "text", text: CONTINUATION_LABEL });
 		if (typeof latest.content === "string") {
-			if (latest.content.length > 0) request.push({ type: "text", text: latest.content });
+			if (latest.content.length > 0) request.push({ type: "text", text: wellFormedString(latest.content) });
 		} else {
 			for (const block of latest.content) {
-				if (block.type === "text") request.push({ type: "text", text: block.text });
+				if (block.type === "text") request.push({ type: "text", text: wellFormedString(block.text) });
 				else request.push({ type: "image", data: block.data, mimeType: block.mimeType });
 			}
 		}
@@ -182,7 +183,7 @@ export function adaptInstructionsForAntigravity(instructions: string): string {
 function contextResource(kind: string, text: string): ContentBlock {
 	return { type: "resource", resource: {
 		uri: `urn:pi:antigravity-acp:${kind}/${crypto.randomUUID()}`,
-		mimeType: "text/markdown", text,
+		mimeType: "text/markdown", text: wellFormedString(text),
 	} };
 }
 

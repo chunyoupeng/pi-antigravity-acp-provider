@@ -67,6 +67,28 @@ describe("boundedNdjsonStream", () => {
 		writer.releaseLock();
 		expect(new TextDecoder().decode(chunks[0])).toBe('{"jsonrpc":"2.0","id":1,"method":"initialize"}\n');
 	});
+
+	it("replaces lone surrogates before serializing outbound NDJSON frames", async () => {
+		const chunks: Uint8Array[] = [];
+		const output = new WritableStream<Uint8Array>({ write: (chunk) => void chunks.push(chunk) });
+		const stream = boundedNdjsonStream(output, bytes(""));
+		const writer = stream.writable.getWriter();
+		await writer.write({
+			jsonrpc: "2.0",
+			id: 1,
+			method: "session/prompt",
+			params: { text: `prefix${"🇹".slice(0, 1)}suffix🇹🇼` },
+		});
+		writer.releaseLock();
+		const raw = new TextDecoder().decode(chunks[0]);
+		expect(raw).not.toContain("\\ud83c");
+		expect(JSON.parse(raw)).toEqual({
+			jsonrpc: "2.0",
+			id: 1,
+			method: "session/prompt",
+			params: { text: "prefix\uFFFDsuffix🇹🇼" },
+		});
+	});
 });
 
 function bytes(text: string): ReadableStream<Uint8Array> {
