@@ -2,6 +2,8 @@
 
 The provider installs Google Antigravity ACP separately from the npm package. Managed installations default to automatic runtime updates and check at most once every 24 hours when Antigravity is first used. External executables selected through `AGY_ACP_BIN`, `~/.local/bin`, or `PATH` are never replaced.
 
+Automatic updates run in the background, but they are not silent: when one installs a new version (or fails to install it), Pi shows a warning with the old and new version. If no Pi session is open at that moment, the notice is kept in `~/.pi/agent/antigravity-acp-provider/runtime-update-notice.json` and shown once at the next start. A failed update *check* (offline, registry unreachable) is not reported; it is retried on the next start.
+
 A new server version can silently change how Antigravity counts, truncates and stores context, which decides whether Pi still manages compaction. After an update, re-check the measured values listed in [CONTEXT-COMPACTION.md](CONTEXT-COMPACTION.md#acp-更新时要检查什么) (usage double count, byte ratio, checkpoint threshold, user-input cap, transcript format).
 
 ## Trust model

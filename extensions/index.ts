@@ -46,6 +46,11 @@ import {
 } from "../src/runtime.js";
 import { pruneAcpHistory } from "../src/acp/history-cleanup.js";
 import { AcpSessionStore } from "../src/acp/session-store.js";
+import {
+	formatRuntimeUpdateNotice,
+	setRuntimeUpdateNoticeListener,
+	takeRuntimeUpdateNotices,
+} from "../src/acp/update-notice.js";
 import { runSetupWizard } from "../src/wizard.js";
 import { fetchUsage, formatUsage } from "../src/usage.js";
 import { registerToolActivity } from "./tool-activity.js";
@@ -60,6 +65,8 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 		undefined, config.permissions, undefined, registerToolActivity(pi), config.tools,
 	);
 	const sessionContexts = new Map<string, ExtensionContext>();
+	/** Most recently active Pi session; receives live runtime-update notices. */
+	let noticeContext: ExtensionContext | undefined;
 	runtime.setIdleCompactHandler((piSessionId) => {
 		const ctx = sessionContexts.get(piSessionId);
 		if (!ctx || !ctx.isIdle() || ctx.hasPendingMessages() || !ctx.model) return;
@@ -309,6 +316,19 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		sessionContexts.set(ctx.sessionManager.getSessionId(), ctx);
+		noticeContext = ctx;
+		// Background runtime updates are silent; tell the user what changed.
+		setRuntimeUpdateNoticeListener((notice) => {
+			if (!noticeContext) throw new Error("No Pi session to notify");
+			noticeContext.ui.notify(formatRuntimeUpdateNotice(notice), "warning");
+		});
+		try {
+			for (const notice of takeRuntimeUpdateNotices()) {
+				ctx.ui.notify(formatRuntimeUpdateNotice(notice), "warning");
+			}
+		} catch {
+			// Notices are advisory and must not interrupt Pi startup.
+		}
 		if (!historyPruned) {
 			historyPruned = true;
 			try {
@@ -349,10 +369,16 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 
 	pi.on("agent_end", (_event, ctx) => {
 		sessionContexts.set(ctx.sessionManager.getSessionId(), ctx);
+		noticeContext = ctx;
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		sessionContexts.delete(ctx.sessionManager.getSessionId());
+		if (noticeContext === ctx) {
+			// A notice arriving with no live session is kept for the next start.
+			noticeContext = undefined;
+			setRuntimeUpdateNoticeListener(undefined);
+		}
 		await runtime.close();
 	});
 }

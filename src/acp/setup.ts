@@ -12,6 +12,7 @@ import { loadConfig, type RuntimeUpdateMode } from "../config.js";
 import { resolveAntigravityAcpDirectory, resolveAntigravityAcpLaunch, type AntigravityLaunch } from "./antigravity.js";
 import { AntigravityAcpConnection } from "./connection.js";
 import { abortError, AntigravityAcpError } from "./errors.js";
+import { recordRuntimeUpdateNotice } from "./update-notice.js";
 import {
 	compareRuntimeVersions,
 	latestManifestRelease,
@@ -196,10 +197,29 @@ async function ensureOnce(onProgress?: (message: string) => void): Promise<void>
 
 function startBackgroundUpdate(launch: AntigravityLaunch): void {
 	backgroundUpdate ??= (async () => {
+		// A failed check (offline, registry down) stays silent: it is retried
+		// on the next start and must not nag. Only a failed install is reported.
 		const { release } = await resolveLatestRelease(platformKey(), false);
 		const installedVersion = readInstallRecord(path.dirname(launch.command))?.version;
 		if (installedVersion && compareRuntimeVersions(installedVersion, release.version) >= 0) return;
-		await installRuntime(release);
+		try {
+			const result = await installRuntime(release);
+			if (result.changed) {
+				recordRuntimeUpdateNotice({
+					kind: "updated",
+					...(installedVersion ? { from: installedVersion } : {}),
+					to: result.version,
+					at: Date.now(),
+				});
+			}
+		} catch (cause) {
+			recordRuntimeUpdateNotice({
+				kind: "failed",
+				to: release.version,
+				error: cause instanceof Error ? cause.message : String(cause),
+				at: Date.now(),
+			});
+		}
 	})()
 		.catch(() => {
 			// Background update failures must never surface as unhandled rejections
