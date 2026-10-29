@@ -74,7 +74,7 @@ const TOOL_BATCH_MS = 100;
 const TOOL_HANDOFF_MS = 150_000;
 /** Default idle timeout before an inactive ACP binding drops its child process
  * and clears its saved session record so the next turn rebuilds via newSession. */
-export const DEFAULT_IDLE_TIMEOUT_MS = 60 * 60_000;
+export const DEFAULT_IDLE_TIMEOUT_MS = 6 * 60 * 60_000;
 /** Minimum context token count required to trigger automatic compaction on idle timeout. */
 export const IDLE_COMPACT_THRESHOLD_TOKENS = 20_000;
 
