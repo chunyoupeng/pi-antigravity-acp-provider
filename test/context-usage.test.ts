@@ -6,7 +6,7 @@ import {
 	PI_READ_EXAMINE_RULE,
 } from "../src/stream/context.js";
 import { quotaFromPrompt } from "../src/status.js";
-import { usageFromPrompt } from "../src/stream/usage.js";
+import { usageFromPrompt, withContextUsage } from "../src/stream/usage.js";
 
 describe("prompt context", () => {
 	it("reconstructs history only for a fresh binding", () => {
@@ -304,6 +304,16 @@ describe("usageFromPrompt", () => {
 				},
 			}),
 		).toMatchObject({ remaining: 12, limit: 100, tier: "pro" });
+	});
+
+	it("prefers the context-window measurement over turn-cumulative prompt counts", () => {
+		// Antigravity 1.4.3 sums usage over every model call in the turn.
+		const cumulative = usageFromPrompt({
+			stopReason: "end_turn",
+			usage: { inputTokens: 343_158, outputTokens: 5_231, cachedReadTokens: 273_253, totalTokens: 348_389 },
+		});
+		expect(withContextUsage(cumulative, 70_136).totalTokens).toBe(70_136);
+		expect(withContextUsage(cumulative, undefined)).toBe(cumulative);
 	});
 
 	it("rejects malformed counts to zero", () => {

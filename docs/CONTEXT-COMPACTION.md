@@ -150,6 +150,8 @@ run 4（代码，关闭 Pi 自动压缩，逼 AGY 先截断）验证兜底：AGY
 | AGY 截断阈值 | 约 247–250k（名义 256k） | `CONTEXT_WINDOW = 240k` | 同上，看截断前后两步的 AGY 计数 |
 | 单条用户输入上限 | 约 192KB | `MAX_PROMPT_BYTES = 160 KiB` | 发一条 250KB 的输入，看 transcript 里是否出现 `<truncated N bytes>`、新会话第一步的真实 token |
 | transcript 的路径和格式 | `brain/<id>/.system_generated/logs/transcript_full.jsonl`，字段 `type`、`content`、`tool_calls`、`input_tokens`、`cache_read_tokens`、`output_tokens`，类型 `PLANNER_RESPONSE`、`CHECKPOINT` | `transcript-usage.ts` | 打开一个新会话的文件看一眼 |
+| `PromptResponse.usage` 的含义 | 1.4.3 起才有值，是整轮所有模型调用的**累加**（8 次调用、上下文约 70k 的一轮报约 350k），不是上下文占用 | `withContextUsage` 优先用 `usage_update` 的值 | 跑一轮多工具调用，把 transcript 里各步 `input_tokens`、`cache_read_tokens` 加起来，对比 prompt 返回的 `inputTokens`、`cachedReadTokens` |
+| 客户端能否配置 AGY 压缩阈值 | 不能（1.4.0–1.4.4 均如此）。SDK 有 `CompactionConfig(token_threshold)`，但 ACP server 建会话时不传 `compaction_config`；`_meta.antigravity` 只认 `enabledTools`、`disabledTools`、`eagerMcpServers`、`mcpMaxOutputBytes`、`systemPrompt`、`forceAllToolsEager`、`gateway`；没有相关环境变量；`hooks.json` 没有压缩事件 | 所以只能让 Pi 抢在 AGY 之前压缩（`CONTEXT_WINDOW`） | 在新版二进制里搜 `compaction_config`，看 ACP agent 构造 `common_args` 时是否带上 |
 
 最后一项最要紧。transcript 读不到或格式变了，`contextTokensInUse` 会退回 AGY 报的 `used`，那个值偏大，只会让 Pi 早压缩，不会晚压缩。但兜底依赖在 transcript 里看到 CHECKPOINT，格式一变它就失效。
 
