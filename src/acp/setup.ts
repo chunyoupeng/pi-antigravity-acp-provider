@@ -15,10 +15,12 @@ import { abortError, AntigravityAcpError } from "./errors.js";
 import { recordRuntimeUpdateNotice } from "./update-notice.js";
 import {
 	compareRuntimeVersions,
+	isRuntimePlatform,
 	latestManifestRelease,
 	parseTrustedRuntimeManifest,
 	readBundledRuntimeManifest,
 	RUNTIME_MANIFEST_URL,
+	validateGoogleArchiveUrl,
 	type RuntimeRelease,
 	type RuntimeReleaseAsset,
 	type TrustedRuntimeManifest,
@@ -32,8 +34,9 @@ const VALIDATION_TIMEOUT_MS = 90_000;
 const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60_000;
 const LOCK_POLL_MS = 250;
 const LOCK_STALE_MS = INSTALL_TIMEOUT_MS + 5 * 60_000;
-const PARALLEL_RANGE_BYTES = 4 * 1024 * 1024;
-const PARALLEL_RANGE_CONCURRENCY = 8;
+const PARALLEL_RANGE_BYTES = 1024 * 1024;
+const PARALLEL_RANGE_CONCURRENCY = 16;
+const MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024;
 let inFlight: Promise<void> | undefined;
 let backgroundUpdate: Promise<void> | undefined;
 
@@ -41,16 +44,21 @@ interface RegistryEntry {
 	archive: string;
 	cmd?: string;
 	args?: string[];
+	sha256?: string;
 }
 
-interface OfficialRegistryRelease {
+export interface OfficialRegistryRelease {
 	version: string;
 	entry: RegistryEntry;
 }
 
-export interface ResolvedRuntimeRelease extends RuntimeReleaseAsset {
+export interface ResolvedRuntimeRelease
+	extends Omit<RuntimeReleaseAsset, "archiveBytes" | "binaryBytes" | "harnessBytes"> {
 	version: string;
 	platform: string;
+	archiveBytes?: number;
+	binaryBytes?: number;
+	harnessBytes?: number;
 }
 
 interface CachedManifest {
@@ -106,7 +114,13 @@ export function inspectRuntimeSetup(): RuntimeSetupStatus {
 	}
 	const key = platformKey();
 	const installedVersion = launch?.source === "managed" ? readInstallRecord(path.dirname(launch.command))?.version : undefined;
-	const approvedVersion = latestManifestRelease(readCachedManifest()?.manifest ?? readBundledRuntimeManifest()).version;
+	const manifestVersion = latestManifestRelease(readCachedManifest()?.manifest ?? readBundledRuntimeManifest()).version;
+	const cachedOfficial = readCachedOfficialRelease(key)?.release;
+	const officialRelease = cachedOfficial ? resolveOfficialRelease(key, cachedOfficial) : undefined;
+	const approvedVersion =
+		officialRelease && compareRuntimeVersions(officialRelease.version, manifestVersion) > 0
+			? officialRelease.version
+			: manifestVersion;
 	return {
 		installed: launch !== undefined,
 		...(launch ? { launch } : {}),
@@ -262,16 +276,67 @@ async function resolveLatestRelease(
 		loadRuntimeManifest(force),
 		fetchOfficialRelease(key, force),
 	]);
+	const matched = selectApprovedRelease(manifest, official.version);
+	if (matched) {
+		const asset = matched.platforms[key];
+		if (!asset) throw new Error(`No signed Antigravity ACP ${matched.version} build for ${key}`);
+		if (asset.archive !== official.entry.archive) {
+			throw new Error("Signed runtime manifest differs from the official ACP registry archive");
+		}
+		if (official.entry.sha256 && asset.archiveSha256 !== official.entry.sha256) {
+			throw new Error("Signed runtime manifest differs from the official ACP registry SHA-256");
+		}
+		return {
+			release: { version: matched.version, platform: key, ...asset },
+			officialVersion: official.version,
+		};
+	}
+
 	const approved = latestManifestRelease(manifest);
-	const selected = selectApprovedRelease(manifest, official.version) ?? approved;
-	const asset = selected.platforms[key];
-	if (!asset) throw new Error(`No signed Antigravity ACP ${selected.version} build for ${key}`);
-	if (selected.version === official.version && asset.archive !== official.entry.archive) {
-		throw new Error("Signed runtime manifest differs from the official ACP registry archive");
+	const officialRelease = resolveOfficialRelease(key, official);
+	if (officialRelease && compareRuntimeVersions(officialRelease.version, approved.version) >= 0) {
+		return {
+			release: officialRelease,
+			officialVersion: official.version,
+		};
+	}
+
+	const asset = approved.platforms[key];
+	if (!asset) throw new Error(`No signed Antigravity ACP ${approved.version} build for ${key}`);
+	return {
+		release: { version: approved.version, platform: key, ...asset },
+		officialVersion: official.version,
+	};
+}
+
+export function resolveOfficialRelease(
+	key: string,
+	official: OfficialRegistryRelease,
+): ResolvedRuntimeRelease | undefined {
+	if (!isRuntimePlatform(key)) return undefined;
+	const { version, entry } = official;
+	if (!entry || typeof entry.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(entry.sha256)) return undefined;
+	try {
+		validateGoogleArchiveUrl(entry.archive, version);
+	} catch {
+		return undefined;
+	}
+	const windows = key.startsWith("windows-");
+	const binaryName = windows ? "agy_acp_server.exe" : "agy_acp_server.par";
+	const harnessName = windows ? "localharness_external.exe" : "localharness_external";
+	const commandName = path.posix.basename(String(entry.cmd ?? binaryName).replaceAll("\\", "/"));
+	if (commandName !== binaryName) return undefined;
+	if (entry.args !== undefined && (!Array.isArray(entry.args) || entry.args.some((arg) => typeof arg !== "string"))) {
+		return undefined;
 	}
 	return {
-		release: { version: selected.version, platform: key, ...asset },
-		officialVersion: official.version,
+		version,
+		platform: key,
+		archive: entry.archive,
+		archiveSha256: entry.sha256,
+		binaryName,
+		harnessName,
+		args: entry.args ?? [],
 	};
 }
 
@@ -307,9 +372,8 @@ async function fetchOfficialRelease(key: string, force: boolean): Promise<Offici
 		if (cached && Date.now() - cached.checkedAt < UPDATE_CHECK_INTERVAL_MS) return cached.release;
 	}
 	try {
-		const response = await fetch(REGISTRY_URL, { signal: AbortSignal.timeout(15_000) });
-		if (!response.ok) throw new Error(`ACP registry returned HTTP ${response.status}`);
-		const document = JSON.parse(await readBoundedText(response, 256 * 1024)) as {
+		const text = await fetchBoundedText(REGISTRY_URL, 256 * 1024, 15_000, "ACP registry");
+		const document = JSON.parse(text) as {
 			version?: unknown;
 			distribution?: { binary?: Record<string, RegistryEntry> };
 		};
@@ -326,6 +390,26 @@ async function fetchOfficialRelease(key: string, force: boolean): Promise<Offici
 			if (cached) return cached.release;
 		}
 		throw error;
+	}
+}
+
+async function fetchBoundedText(url: string, maxBytes: number, timeoutMs: number, label: string): Promise<string> {
+	try {
+		const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+		if (!response.ok) throw new Error(`${label} returned HTTP ${response.status}`);
+		return await readBoundedText(response, maxBytes);
+	} catch (error) {
+		if ("mock" in globalThis.fetch) throw error;
+		try {
+			const { stdout } = await execFileAsync(
+				"curl",
+				["-fsSL", "--max-time", String(Math.ceil(timeoutMs / 1000)), url],
+				{ maxBuffer: maxBytes, timeout: timeoutMs + 2_000 },
+			);
+			return stdout;
+		} catch {
+			throw error;
+		}
 	}
 }
 
@@ -388,9 +472,12 @@ async function installRelease(
 		onProgress?.("Downloading the Antigravity ACP server (this is a large download)…");
 		const archiveSha256 = await download(release, archive, onProgress);
 		if (archiveSha256 !== release.archiveSha256) throw new Error("Antigravity ACP archive SHA-256 mismatch");
+		const archiveBytes = release.archiveBytes ?? fs.statSync(archive).size;
 		onProgress?.("Extracting the verified Antigravity ACP runtime…");
 		await extractRuntimeArchive(archive, runtime, release);
 		fs.rmSync(archive, { force: true });
+		const binaryBytes = release.binaryBytes ?? fs.statSync(path.join(runtime, release.binaryName)).size;
+		const harnessBytes = release.harnessBytes ?? fs.statSync(path.join(runtime, release.harnessName)).size;
 		if (process.platform !== "win32") {
 			fs.chmodSync(path.join(runtime, release.binaryName), 0o755);
 			fs.chmodSync(path.join(runtime, release.harnessName), 0o755);
@@ -409,11 +496,11 @@ async function installRelease(
 			platform: release.platform,
 			archive: release.archive,
 			archiveSha256: release.archiveSha256,
-			archiveBytes: release.archiveBytes,
+			archiveBytes,
 			binaryName: release.binaryName,
-			binaryBytes: release.binaryBytes,
+			binaryBytes,
 			harnessName: release.harnessName,
-			harnessBytes: release.harnessBytes,
+			harnessBytes,
 			installedAt: new Date().toISOString(),
 		};
 		fs.writeFileSync(path.join(runtime, "install-integrity.json"), `${JSON.stringify(record, null, 2)}\n`, {
@@ -448,12 +535,12 @@ async function extractRuntimeArchive(
 ): Promise<void> {
 	const archive = await Open.file(archivePath);
 	validateRuntimeArchiveEntries(archive.files, release);
-	const expected = new Map<string, number>([
+	const expected = new Map<string, number | undefined>([
 		[release.binaryName, release.binaryBytes],
 		[release.harnessName, release.harnessBytes],
 	]);
 	for (const entry of archive.files) {
-		const size = expected.get(entry.path)!;
+		const size = expected.get(entry.path) ?? entry.uncompressedSize;
 		await pipeline(entry.stream(), fs.createWriteStream(path.join(destination, entry.path), { flags: "wx", mode: 0o600 }));
 		if (fs.statSync(path.join(destination, entry.path)).size !== size) {
 			throw new Error(`ACP archive file was truncated: ${entry.path}`);
@@ -463,23 +550,28 @@ async function extractRuntimeArchive(
 
 export function validateRuntimeArchiveEntries(
 	entries: Array<Pick<ZipFile, "type" | "path" | "compressionMethod" | "uncompressedSize">>,
-	release: RuntimeReleaseAsset,
+	release: Pick<RuntimeReleaseAsset, "binaryName" | "harnessName"> &
+		Partial<Pick<RuntimeReleaseAsset, "binaryBytes" | "harnessBytes">>,
 ): void {
-	const expected = new Map<string, number>([
+	const expected = new Map<string, number | undefined>([
 		[release.binaryName, release.binaryBytes],
 		[release.harnessName, release.harnessBytes],
 	]);
 	if (entries.length !== expected.size) throw new Error("ACP archive contains an unexpected number of files");
 	for (const entry of entries) {
-		const size = expected.get(entry.path);
 		if (
-			size === undefined ||
+			!expected.has(entry.path) ||
 			entry.type !== "File" ||
 			entry.path.includes("/") ||
 			entry.path.includes("\\") ||
 			(entry.compressionMethod !== 0 && entry.compressionMethod !== 8) ||
-			entry.uncompressedSize !== size
+			!Number.isSafeInteger(entry.uncompressedSize) ||
+			entry.uncompressedSize <= 0
 		) {
+			throw new Error("ACP archive contains an unexpected, unsafe, or incorrectly sized file");
+		}
+		const size = expected.get(entry.path);
+		if (size !== undefined && entry.uncompressedSize !== size) {
 			throw new Error("ACP archive contains an unexpected, unsafe, or incorrectly sized file");
 		}
 		expected.delete(entry.path);
@@ -541,7 +633,7 @@ async function download(
 function canUseDirectRangeDownload(release: ResolvedRuntimeRelease): boolean {
 	return (
 		release.archive.startsWith("https://dl.google.com/") &&
-		release.archiveBytes > PARALLEL_RANGE_BYTES &&
+		(release.archiveBytes === undefined || release.archiveBytes > PARALLEL_RANGE_BYTES) &&
 		!("mock" in globalThis.fetch)
 	);
 }
@@ -551,7 +643,10 @@ async function downloadDirectParallel(
 	destination: string,
 	onProgress?: (message: string) => void,
 ): Promise<string> {
-	const totalBytes = release.archiveBytes;
+	const totalBytes = release.archiveBytes ?? (await fetchArchiveSizeDirect(release.archive));
+	if (totalBytes <= PARALLEL_RANGE_BYTES) {
+		return downloadViaFetch({ ...release, archiveBytes: totalBytes }, destination, onProgress);
+	}
 	const ranges: Array<{ start: number; end: number }> = [];
 	for (let start = 0; start < totalBytes; start += PARALLEL_RANGE_BYTES) {
 		ranges.push({ start, end: Math.min(start + PARALLEL_RANGE_BYTES, totalBytes) - 1 });
@@ -601,22 +696,33 @@ function fetchRangeDirect(
 	const expectedLength = end - start + 1;
 	return new Promise<Buffer>((resolve, reject) => {
 		let chunkBytes = 0;
+		let settled = false;
+		const fail = (error: Error) => {
+			if (settled) return;
+			settled = true;
+			if (chunkBytes > 0) {
+				onDelta(-chunkBytes);
+				chunkBytes = 0;
+			}
+			reject(error);
+		};
 		const req = https.get(
 			url,
 			{
-				agent,
+				agent: attempt === 1 ? agent : false,
 				family: 4,
-				headers: { Range: `bytes=${start}-${end}` },
-				timeout: 20_000,
+				headers: { Range: `bytes=${start}-${end}`, "Accept-Encoding": "identity" },
+				timeout: 30_000,
 			},
 			(res) => {
 				if (res.statusCode !== 206) {
 					res.resume();
-					reject(new Error(`Direct range request returned HTTP ${res.statusCode ?? "unknown"}`));
+					fail(new Error(`Direct range request returned HTTP ${res.statusCode ?? "unknown"}`));
 					return;
 				}
 				const chunks: Buffer[] = [];
 				res.on("data", (chunk: Buffer) => {
+					if (settled) return;
 					chunkBytes += chunk.length;
 					if (chunkBytes > expectedLength) {
 						req.destroy(new Error("Range chunk exceeded requested length"));
@@ -626,29 +732,57 @@ function fetchRangeDirect(
 					onDelta(chunk.length);
 				});
 				res.on("end", () => {
+					if (settled) return;
 					if (chunkBytes !== expectedLength) {
-						onDelta(-chunkBytes);
-						reject(new Error("Range chunk was truncated"));
+						fail(new Error("Range chunk was truncated"));
 						return;
 					}
+					settled = true;
 					resolve(Buffer.concat(chunks));
 				});
-				res.on("error", (error) => {
-					onDelta(-chunkBytes);
-					reject(error);
-				});
+				res.on("error", fail);
 			},
 		);
 		req.on("timeout", () => {
 			req.destroy(new Error("Direct range request timed out"));
 		});
-		req.on("error", (error) => {
-			onDelta(-chunkBytes);
-			reject(error);
-		});
+		req.on("error", fail);
 	}).catch((error) => {
-		if (attempt < 3) return fetchRangeDirect(url, start, end, agent, onDelta, attempt + 1);
+		if (attempt < 5) return fetchRangeDirect(url, start, end, agent, onDelta, attempt + 1);
 		throw error;
+	});
+}
+
+function fetchArchiveSizeDirect(url: string): Promise<number> {
+	return new Promise<number>((resolve, reject) => {
+		const req = https.request(
+			url,
+			{
+				method: "HEAD",
+				agent: false,
+				family: 4,
+				headers: { "Accept-Encoding": "identity" },
+				timeout: 15_000,
+			},
+			(res) => {
+				res.resume();
+				if (res.statusCode !== 200) {
+					reject(new Error(`Direct HEAD request returned HTTP ${res.statusCode ?? "unknown"}`));
+					return;
+				}
+				const length = Number(res.headers["x-identity-content-length"] ?? res.headers["content-length"]);
+				if (!Number.isSafeInteger(length) || length <= 0 || length > MAX_ARCHIVE_BYTES) {
+					reject(new Error("Invalid or missing Content-Length header on archive HEAD request"));
+					return;
+				}
+				resolve(length);
+			},
+		);
+		req.on("timeout", () => {
+			req.destroy(new Error("Direct HEAD request timed out"));
+		});
+		req.on("error", reject);
+		req.end();
 	});
 }
 
@@ -659,41 +793,61 @@ async function downloadViaFetch(
 ): Promise<string> {
 	const response = await fetch(release.archive, { signal: AbortSignal.timeout(INSTALL_TIMEOUT_MS) });
 	if (!response.ok || !response.body) throw new Error(`ACP server download returned HTTP ${response.status}`);
+	const identityHeader = Number(response.headers.get("x-identity-content-length"));
+	const contentLengthHeader = response.headers.get("content-encoding")
+		? Number.NaN
+		: Number(response.headers.get("content-length"));
+	const headerLength = Number.isSafeInteger(identityHeader) && identityHeader > 0 ? identityHeader : contentLengthHeader;
+	const expectedBytes =
+		release.archiveBytes ?? (Number.isSafeInteger(headerLength) && headerLength > 0 ? headerLength : undefined);
+	if (expectedBytes !== undefined && expectedBytes > MAX_ARCHIVE_BYTES) {
+		throw new Error("ACP server download exceeded its signed size");
+	}
 	const hash = createHash("sha256");
 	let received = 0;
 	let lastReported = 0;
 	const progress = new TransformStream<Uint8Array, Uint8Array>({
 		transform(chunk, controller) {
 			received += chunk.byteLength;
-			if (received > release.archiveBytes) throw new Error("ACP server download exceeded its signed size");
+			if (received > (expectedBytes ?? MAX_ARCHIVE_BYTES)) {
+				throw new Error("ACP server download exceeded its signed size");
+			}
 			hash.update(chunk);
-			const percent = Math.floor((received / release.archiveBytes) * 100);
-			if (percent >= lastReported + 10) {
-				lastReported = percent;
-				onProgress?.(`Downloading Antigravity ACP: ${percent}%`);
+			if (expectedBytes !== undefined) {
+				const percent = Math.floor((received / expectedBytes) * 100);
+				if (percent >= lastReported + 10) {
+					lastReported = percent;
+					onProgress?.(`Downloading Antigravity ACP: ${percent}%`);
+				}
 			}
 			controller.enqueue(chunk);
 		},
 	});
 	await pipeline(response.body.pipeThrough(progress), fs.createWriteStream(destination, { mode: 0o600 }));
-	if (received !== release.archiveBytes) throw new Error("ACP server download size did not match its signed manifest");
+	if (expectedBytes !== undefined && received !== expectedBytes) {
+		throw new Error("ACP server download size did not match its signed manifest");
+	}
 	return hash.digest("hex");
 }
 
 function isInstalledRelease(directory: string, release: ResolvedRuntimeRelease): boolean {
 	const record = readInstallRecord(directory);
+	if (!record) return false;
+	const archiveBytes = release.archiveBytes ?? record.archiveBytes;
+	const binaryBytes = release.binaryBytes ?? record.binaryBytes;
+	const harnessBytes = release.harnessBytes ?? record.harnessBytes;
 	return (
-		record?.version === release.version &&
+		record.version === release.version &&
 		record.platform === release.platform &&
 		record.archive === release.archive &&
 		record.archiveSha256 === release.archiveSha256 &&
-		record.archiveBytes === release.archiveBytes &&
+		record.archiveBytes === archiveBytes &&
 		record.binaryName === release.binaryName &&
-		record.binaryBytes === release.binaryBytes &&
+		record.binaryBytes === binaryBytes &&
 		record.harnessName === release.harnessName &&
-		record.harnessBytes === release.harnessBytes &&
-		validRuntimeFile(path.join(directory, release.binaryName), release.binaryBytes) &&
-		validRuntimeFile(path.join(directory, release.harnessName), release.harnessBytes)
+		record.harnessBytes === harnessBytes &&
+		validRuntimeFile(path.join(directory, release.binaryName), binaryBytes) &&
+		validRuntimeFile(path.join(directory, release.harnessName), harnessBytes)
 	);
 }
 
@@ -732,6 +886,9 @@ export function adoptLegacyCurrentRelease(root: string, release: ResolvedRuntime
 			legacy.version !== release.version ||
 			legacy.platform !== release.platform ||
 			legacy.archiveSha256 !== release.archiveSha256 ||
+			release.archiveBytes === undefined ||
+			release.binaryBytes === undefined ||
+			release.harnessBytes === undefined ||
 			!validRuntimeFile(path.join(directory, release.binaryName), release.binaryBytes) ||
 			!validRuntimeFile(path.join(directory, release.harnessName), release.harnessBytes)
 		) {

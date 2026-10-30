@@ -9,6 +9,7 @@ import {
 	ensureAntigravityAcpReady,
 	isExpectedRuntimeIdentity,
 	repairRuntimeExecutablePermissions,
+	resolveOfficialRelease,
 	validateRuntimeArchiveEntries,
 	updateAntigravityAcpRuntime,
 } from "../src/acp/setup.js";
@@ -44,6 +45,41 @@ describe("managed runtime archive validation", () => {
 
 	it("accepts only the signed executable and harness layout", () => {
 		expect(() => validateRuntimeArchiveEntries(entries, asset)).not.toThrow();
+		expect(() =>
+			validateRuntimeArchiveEntries(entries, {
+				binaryName: asset.binaryName,
+				harnessName: asset.harnessName,
+			}),
+		).not.toThrow();
+	});
+
+	it("resolves official registry releases with SHA-256 without waiting for external manifest signature", () => {
+		const resolved = resolveOfficialRelease("darwin-aarch64", {
+			version: "1.4.5",
+			entry: {
+				archive: "https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-1.4.5-darwin-arm64.zip",
+				cmd: "./agy_acp_server.par",
+				sha256: "886fff7767d08994ca39eb02c3d01a7532c7325a94aa33aaf52d52068733284f",
+			},
+		});
+		expect(resolved).toEqual({
+			version: "1.4.5",
+			platform: "darwin-aarch64",
+			archive: "https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-1.4.5-darwin-arm64.zip",
+			archiveSha256: "886fff7767d08994ca39eb02c3d01a7532c7325a94aa33aaf52d52068733284f",
+			binaryName: "agy_acp_server.par",
+			harnessName: "localharness_external",
+			args: [],
+		});
+		expect(
+			resolveOfficialRelease("darwin-aarch64", {
+				version: "1.4.5",
+				entry: {
+					archive: "https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-1.4.5-darwin-arm64.zip",
+					cmd: "./agy_acp_server.par",
+				},
+			}),
+		).toBeUndefined();
 	});
 
 	it("rejects extra, traversing, or incorrectly sized members", () => {

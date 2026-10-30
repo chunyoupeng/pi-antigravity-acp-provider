@@ -211,11 +211,20 @@ export class AntigravityAcpConnection {
 		signal?: AbortSignal,
 		mcpServers: McpServer[] = [],
 		meta?: SessionMeta,
+		additionalDirectories?: string[],
 	): Promise<AcpNewSessionResponse> {
-		await this.initialize();
+		const init = await this.initialize();
+		const supportsAdditionalDirs =
+			init.agentCapabilities?.sessionCapabilities?.additionalDirectories !== undefined &&
+			init.agentCapabilities?.sessionCapabilities?.additionalDirectories !== null;
 		const response = await this.withAbort(
 			this.withDeadline(
-				this.connection.newSession({ cwd, mcpServers, ...(meta ? { _meta: meta } : {}) }),
+				this.connection.newSession({
+					cwd,
+					mcpServers,
+					...(supportsAdditionalDirs && additionalDirectories?.length ? { additionalDirectories } : {}),
+					...(meta ? { _meta: meta } : {}),
+				}),
 				this.operationTimeoutMs,
 				"session/new",
 			),
@@ -235,11 +244,21 @@ export class AntigravityAcpConnection {
 		mcpServers: McpServer[] = [],
 		signal?: AbortSignal,
 		meta?: SessionMeta,
+		additionalDirectories?: string[],
 	): Promise<SessionState> {
-		await this.initialize();
+		const init = await this.initialize();
+		const supportsAdditionalDirs =
+			init.agentCapabilities?.sessionCapabilities?.additionalDirectories !== undefined &&
+			init.agentCapabilities?.sessionCapabilities?.additionalDirectories !== null;
 		const response = await this.withAbort(
 			this.withDeadline(
-				this.connection.loadSession({ sessionId, cwd, mcpServers, ...(meta ? { _meta: meta } : {}) }),
+				this.connection.loadSession({
+					sessionId,
+					cwd,
+					mcpServers,
+					...(supportsAdditionalDirs && additionalDirectories?.length ? { additionalDirectories } : {}),
+					...(meta ? { _meta: meta } : {}),
+				}),
 				this.operationTimeoutMs,
 				"session/load",
 			),
@@ -254,11 +273,21 @@ export class AntigravityAcpConnection {
 		mcpServers: McpServer[] = [],
 		signal?: AbortSignal,
 		meta?: SessionMeta,
+		additionalDirectories?: string[],
 	): Promise<SessionState> {
-		await this.initialize();
+		const init = await this.initialize();
+		const supportsAdditionalDirs =
+			init.agentCapabilities?.sessionCapabilities?.additionalDirectories !== undefined &&
+			init.agentCapabilities?.sessionCapabilities?.additionalDirectories !== null;
 		const response = await this.withAbort(
 			this.withDeadline(
-				this.connection.resumeSession({ sessionId, cwd, mcpServers, ...(meta ? { _meta: meta } : {}) }),
+				this.connection.resumeSession({
+					sessionId,
+					cwd,
+					mcpServers,
+					...(supportsAdditionalDirs && additionalDirectories?.length ? { additionalDirectories } : {}),
+					...(meta ? { _meta: meta } : {}),
+				}),
 				this.operationTimeoutMs,
 				"session/resume",
 			),
