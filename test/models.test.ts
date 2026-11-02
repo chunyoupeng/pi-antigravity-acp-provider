@@ -1,9 +1,22 @@
 import { describe, expect, it } from "vitest";
 
-import { MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, projectModels, resolveAcpModelId } from "../src/models.js";
+import { FALLBACK_MODELS, MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, projectModels, resolveAcpModelId, splitEffortSuffix } from "../src/models.js";
 import { createAntigravityProvider } from "../src/provider.js";
 
 describe("projectModels", () => {
+	it("keeps Flash as the conservative offline default while allowing explicit Argon selection", () => {
+		expect(FALLBACK_MODELS[0]?.id).toBe("gemini-3.8-flash");
+		expect(FALLBACK_MODELS.some((model) => model.id === "gemini-4-argon")).toBe(true);
+	});
+
+	it.each(["low", "medium", "high"])("splits a known %s suffix without truncating the base", (effort) => {
+		expect(splitEffortSuffix(`gemini-hyphenated-base-${effort}`)).toEqual({ base: "gemini-hyphenated-base", effort });
+	});
+
+	it.each(["gemini-base", "-low", "gemini-base-off", "gemini-base-high-extra"])("does not invent a known effort from %s", (id) => {
+		expect(splitEffortSuffix(id)).toBeUndefined();
+	});
+
 	it("deduplicates and rejects unsafe ids", () => {
 		const models = projectModels([
 			{ modelId: "gemini-a", name: "Gemini A" },

@@ -27,14 +27,19 @@ describe.skipIf(!enabled)("Google Antigravity ACP contract", () => {
 		}
 	}, 60_000);
 
-	it("reads model and permission settings and reselects current values without sending a prompt", async () => {
+	it("selects every advertised model/effort and restores current settings without sending a prompt", async () => {
 		const connection = new AntigravityAcpConnection({ cwd: process.cwd(), initializeTimeoutMs: 45_000 });
 		try {
 			const session = await connection.newSession(process.cwd());
 			const models = sessionModels(session);
 			expect(models?.availableModels.length).toBeGreaterThan(0);
 			if (!models) throw new Error("Official runtime did not advertise models");
+			for (const model of models.availableModels) {
+				await connection.setModel(session.sessionId, model.modelId);
+				expect(sessionModels(connection.getSessionState(session.sessionId))?.currentModelId).toBe(model.modelId);
+			}
 			await connection.setModel(session.sessionId, models.currentModelId);
+			expect(sessionModels(connection.getSessionState(session.sessionId))?.currentModelId).toBe(models.currentModelId);
 			const modes = sessionModes(session);
 			if (!modes) throw new Error("Official runtime did not advertise permission modes");
 			expect(modes.availableModes.map((mode) => mode.id)).toEqual(expect.arrayContaining(["default", "auto_edit", "yolo"]));

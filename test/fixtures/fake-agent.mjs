@@ -10,12 +10,17 @@ const scenario = process.argv[2];
 // "thinking-levels" mirrors Antigravity 1.4: the model selector lists families
 // with a separate thinking_level selector, and the legacy list keeps variants.
 const thinkingLevels = scenario === "thinking-levels";
-const modern = scenario?.startsWith("config-options") || thinkingLevels;
+const modern = scenario?.startsWith("config-options") || thinkingLevels || scenario === "effort-selector" || scenario === "legacy-set-model";
+// The real 1.4.x server takes only base model ids on its `model` selector and
+// silently ignores an effort-qualified id; these scenarios model that.
+const qualifiedModelRejected = scenario === "effort-selector" || scenario === "legacy-set-model";
+const effortSelector = scenario === "effort-selector";
 const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
 // A UUID here lets the provider find a transcript a test writes for it.
 const SESSION_ID = process.env.FAKE_SESSION_ID ?? "fake-session";
 let model = thinkingLevels ? "gemini-pro-high" : "auto";
 let mode = "default";
+let effort = "high";
 let permissionPromptId;
 let hangingPromptId;
 let bridgePromptId;
@@ -190,7 +195,9 @@ for await (const line of rl) {
 		});
 	} else if (method === "session/set_config_option") {
 		selectionMethods.push(`set_config_option:${params.configId}=${params.value}`);
-		if (params.configId === "model-selector") model = params.value;
+		if (params.configId === "model-selector") {
+			if (!qualifiedModelRejected || ["auto", "gemini-test"].includes(params.value)) model = params.value;
+		} else if (params.configId === "thinking-level-selector") effort = params.value;
 		else if (thinkingLevels && params.configId === "model") model = `${params.value}-${model.split("-").at(-1)}`;
 		else if (thinkingLevels && params.configId === "thinking_level") model = `${model.split("-").slice(0, -1).join("-")}-${params.value}`;
 		else if (params.configId === "permission-selector") {
@@ -202,6 +209,12 @@ for await (const line of rl) {
 		}
 		send({ jsonrpc: "2.0", id, result: { configOptions: sessionConfigOptions() } });
 	} else if (modern && (method === "session/set_model" || method === "session/set_mode")) {
+		if (scenario === "legacy-set-model" && method === "session/set_model") {
+			model = params.modelId;
+			selectionMethods.push(`set_model:${model}`);
+			send({ jsonrpc: "2.0", id, result: {} });
+			continue;
+		}
 		send({ jsonrpc: "2.0", id, error: { code: -32601, message: "Use config options" } });
 	} else if (method === "session/set_model") {
 		model = params.modelId;
@@ -474,6 +487,10 @@ function sessionConfigOptions() {
 				{ value: "auto", name: "Auto" }, { value: "gemini-test", name: "Gemini Test" },
 				...(model === "gemini-other" ? [{ value: "gemini-other", name: "Gemini Other" }] : []),
 			] }] },
+		...(effortSelector || (scenario === "config-options-disappearing-thought" && model === "auto")
+			? [{ id: "thinking-level-selector", name: "Thinking", category: "thought_level", type: "select",
+				currentValue: effort, options: ["low", "medium", "high"].map((value) => ({ value, name: value })) }]
+			: []),
 		{ id: "permission-selector", name: "Permissions", category: "mode", type: "select", currentValue: mode,
 			options: ["default", "auto_edit", "yolo"].map((value) => ({ value, name: value })) },
 	];

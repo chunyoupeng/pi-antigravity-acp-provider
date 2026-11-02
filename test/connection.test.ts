@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 
 import { AntigravityAcpConnection } from "../src/acp/connection.js";
-import { sessionModels, sessionModes } from "../src/acp/session-state.js";
+import { findSessionSelector, sessionModels, sessionModes } from "../src/acp/session-state.js";
 
 const fakeAgent = fileURLToPath(new URL("./fixtures/fake-agent.mjs", import.meta.url));
 
@@ -193,6 +193,51 @@ describe("AntigravityAcpConnection", () => {
 			expect(sessionModes(resumed)?.currentModeId).toBe("yolo");
 			const loaded = await connection.loadSession(session.sessionId, process.cwd());
 			expect(sessionModels(loaded)?.currentModelId).toBe("gemini-test");
+		} finally {
+			await connection.close();
+		}
+	});
+
+	it("rejects when changing the base model removes the thought_level selector before effort can be confirmed", async () => {
+		const connection = new AntigravityAcpConnection({
+			cwd: path.dirname(fakeAgent),
+			command: process.execPath,
+			args: [fakeAgent, "config-options-disappearing-thought"],
+		});
+		try {
+			const session = await connection.newSession(process.cwd());
+			await expect(connection.setModel(session.sessionId, "gemini-test-low")).rejects.toThrow(
+				"Antigravity did not confirm the requested thought_level selection",
+			);
+		} finally {
+			await connection.close();
+		}
+	});
+
+	it("sends the base model id and the tier on the server's own selector", async () => {
+		const connection = new AntigravityAcpConnection({
+			cwd: path.dirname(fakeAgent), command: process.execPath, args: [fakeAgent, "effort-selector"],
+		});
+		try {
+			const session = await connection.newSession(process.cwd());
+			await connection.setModel(session.sessionId, "gemini-test-low");
+			const state = connection.getSessionState(session.sessionId);
+			expect(sessionModels(state)?.currentModelId).toBe("gemini-test-low");
+			expect(findSessionSelector(state, "thought_level")?.currentValue).toBe("low");
+		} finally {
+			await connection.close();
+		}
+	});
+
+	it("falls back to the draft set_model when the model selector ignores the id", async () => {
+		const connection = new AntigravityAcpConnection({
+			cwd: path.dirname(fakeAgent), command: process.execPath, args: [fakeAgent, "legacy-set-model"],
+		});
+		try {
+			const session = await connection.newSession(process.cwd());
+			await connection.setModel(session.sessionId, "gemini-test-high");
+			const resumed = await connection.resumeSession(session.sessionId, process.cwd());
+			expect(sessionModels(resumed)?.currentModelId).toBe("gemini-test-high");
 		} finally {
 			await connection.close();
 		}

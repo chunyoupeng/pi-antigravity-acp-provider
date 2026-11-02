@@ -31,11 +31,17 @@ const EFFORTS = ["low", "medium", "high"] as const;
 type Effort = (typeof EFFORTS)[number];
 type Variants = Partial<Record<Effort, string>>;
 
+// Keep the broadly available Flash model first for offline/default selection.
 export const FALLBACK_MODELS: readonly Model<typeof API_ID>[] = [
 	reasoningModel("gemini-3.8-flash", "Gemini 3.8 Flash", {
 		low: "gemini-3.8-flash-low",
 		medium: "gemini-3.8-flash-medium",
 		high: "gemini-3.8-flash-high",
+	}),
+	reasoningModel("gemini-4-argon", "Gemini 4 Argon", {
+		low: "gemini-4-argon-low",
+		medium: "gemini-4-argon-medium",
+		high: "gemini-4-argon-high",
 	}),
 	reasoningModel("gemini-3.7-flash", "Gemini 3.7 Flash", {
 		low: "gemini-3.7-flash-low",
@@ -102,6 +108,17 @@ export function projectModels(models: readonly AcpModelInfo[]): Model<typeof API
 			: fixedModel(id, candidate.name.trim() || id));
 	}
 	return projected;
+}
+
+export type ModelEffort = "low" | "medium" | "high";
+
+/** Antigravity advertises effort-qualified ids (`gemini-3.8-flash-high`) while the
+ * server's `model` config option takes only the base id and keeps the tier on a
+ * selector of its own, so a qualified id has to be split before it is sent. */
+export function splitEffortSuffix(modelId: string): { base: string; effort: ModelEffort } | undefined {
+	const match = /^(.*)-(low|medium|high)$/u.exec(modelId);
+	if (!match?.[1]) return undefined;
+	return { base: match[1], effort: match[2] as ModelEffort };
 }
 
 /** Resolve Pi's current reasoning level to the exact model ID advertised by
@@ -200,18 +217,14 @@ function effortFromName(name: string): { baseName: string; effort: Effort } | un
 }
 
 function effortFromId(id: string): { baseName: string; effort: Effort } | undefined {
-	const match = id.match(/^(.+)-(low|medium|high)$/u);
-	if (!match?.[1] || !match[2]) return undefined;
-	return {
-		baseName: titleFromId(match[1]),
-		effort: match[2] as Effort,
-	};
+	const split = splitEffortSuffix(id);
+	return split ? { baseName: titleFromId(split.base), effort: split.effort } : undefined;
 }
 
 function canonicalId(name: string, variants: Variants): string {
 	const bases = Object.values(variants)
 		.filter((value): value is string => typeof value === "string")
-		.map((value) => value.replace(/-(?:low|medium|high)$/u, ""));
+		.map((value) => splitEffortSuffix(value)?.base ?? value);
 	if (bases.length > 0 && bases.every((value) => value === bases[0])) return bases[0]!;
 	return name
 		.toLowerCase()

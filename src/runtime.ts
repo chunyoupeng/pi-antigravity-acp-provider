@@ -711,8 +711,15 @@ export class AntigravityRuntime {
 				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 			}
 			if (binding.modelId !== acpModelId) {
-				await binding.connection.setModel(binding.session.sessionId, acpModelId, options.signal, resolveAcpThinking(model, acpModelId));
-				binding.modelId = acpModelId;
+				try {
+					await binding.connection.setModel(binding.session.sessionId, acpModelId, options.signal, resolveAcpThinking(model, acpModelId));
+					binding.modelId = acpModelId;
+				} catch (error) {
+					// A split selection can change the base before effort fails. Neither
+					// the warm cache nor its saved session is trustworthy after failure.
+					await this.invalidateBinding(binding, "model selection failed");
+					throw error;
+				}
 			}
 			attachWriter(binding, writer);
 
@@ -800,13 +807,18 @@ export class AntigravityRuntime {
 					retriedExecutionError = true;
 					binding = await this.getBinding(key, model, acpModelId, options.apiKey, activeWriter, tools, options.signal);
 					if (binding.modelId !== acpModelId) {
-						await binding.connection.setModel(
-							binding.session.sessionId,
-							acpModelId,
-							options.signal,
-							resolveAcpThinking(model, acpModelId),
-						);
-						binding.modelId = acpModelId;
+						try {
+							await binding.connection.setModel(
+								binding.session.sessionId,
+								acpModelId,
+								options.signal,
+								resolveAcpThinking(model, acpModelId),
+							);
+							binding.modelId = acpModelId;
+						} catch (error) {
+							await this.invalidateBinding(binding, "model selection failed on retry");
+							throw error;
+						}
 					}
 					attachWriter(binding, activeWriter);
 					parts = adaptPromptToCapabilities(
