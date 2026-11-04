@@ -16,7 +16,7 @@ export const MAX_IMAGE_DIMENSION = 1536;
  * transcript-usage.ts) and checks it once per step, while one step can add a
  * 46 KiB tool result (about 18k), so Pi compacts first, visibly, with room for
  * that step. */
-export const CONTEXT_WINDOW = 240_000;
+export const CONTEXT_WINDOW = 512_000;
 /** `_meta.antigravity.mcpMaxOutputBytes`: each MCP result item up to this size
  * (images by decoded bytes) reaches the model inline; a larger one is only a
  * file path. Above every image Pi sends (verified 2026-10-15, server 1.4.0). */

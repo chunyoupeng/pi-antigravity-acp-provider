@@ -151,7 +151,90 @@ run 4（代码，关闭 Pi 自动压缩，逼 AGY 先截断）验证兜底：AGY
 | 单条用户输入上限 | 约 192KB | `MAX_PROMPT_BYTES = 160 KiB` | 发一条 250KB 的输入，看 transcript 里是否出现 `<truncated N bytes>`、新会话第一步的真实 token |
 | transcript 的路径和格式 | `brain/<id>/.system_generated/logs/transcript_full.jsonl`，字段 `type`、`content`、`tool_calls`、`input_tokens`、`cache_read_tokens`、`output_tokens`，类型 `PLANNER_RESPONSE`、`CHECKPOINT` | `transcript-usage.ts` | 打开一个新会话的文件看一眼 |
 | `PromptResponse.usage` 的含义 | 1.4.3 起才有值，是整轮所有模型调用的**累加**（8 次调用、上下文约 70k 的一轮报约 350k），不是上下文占用 | `withContextUsage` 优先用 `usage_update` 的值 | 跑一轮多工具调用，把 transcript 里各步 `input_tokens`、`cache_read_tokens` 加起来，对比 prompt 返回的 `inputTokens`、`cachedReadTokens` |
-| 客户端能否配置 AGY 压缩阈值 | 不能（1.4.0–1.4.4 均如此）。SDK 有 `CompactionConfig(token_threshold)`，但 ACP server 建会话时不传 `compaction_config`；`_meta.antigravity` 只认 `enabledTools`、`disabledTools`、`eagerMcpServers`、`mcpMaxOutputBytes`、`systemPrompt`、`forceAllToolsEager`、`gateway`；没有相关环境变量；`hooks.json` 没有压缩事件 | 所以只能让 Pi 抢在 AGY 之前压缩（`CONTEXT_WINDOW`） | 在新版二进制里搜 `compaction_config`，看 ACP agent 构造 `common_args` 时是否带上 |
+| 客户端能否配置 AGY 压缩阈值 | 不能（1.4.0–1.4.5 均如此）。SDK 有 `CompactionConfig(token_threshold)`，但 ACP server 建会话时不传 `compaction_config`；`_meta.antigravity` 只认 `enabledTools`、`disabledTools`、`eagerMcpServers`、`mcpMaxOutputBytes`、`systemPrompt`、`forceAllToolsEager`、`gateway`；没有相关环境变量；`hooks.json` 没有压缩事件 | 所以默认只能让 Pi 抢在 AGY 之前压缩（`CONTEXT_WINDOW`），或者直接对二进制打补丁，见下节「512K 二进制补丁与自动适配方案」 | 在新版二进制里搜 `compaction_config`，看 ACP agent 构造 `common_args` 时是否带上 |
+
+## 512K 二进制补丁与自动适配方案（2026-11-04 逆向记录）
+
+本节完整记录对 `agy_acp_server.par` + `localharness_external`（1.4.1–1.4.5）及原生 `/Users/pengchunyou/.local/bin/agy`（1.5.0）的逆向方法、关键函数地址、指令特征和补丁方案，供后续让 AI 在 `src/acp/setup.ts` 中直接写出自动补丁逻辑。
+
+### 1. 逆向怎么做的（还原无符号 Go 二进制 + 解包 `.par`）
+
+1. 解包 `agy_acp_server.par`：
+   - `.par` 是 Mach-O 64-bit arm64 可执行文件后拼接 ZIP 归档，末尾紧跟 Apple 代码签名块。标准 `unzip` 会因为签名尾块报错，只需在文件中搜索 ZIP EOCD 魔数 `PK\x05\x06`（最后一处 + 22 字节），截断后面的签名即可用 Python `zipfile.ZipFile` 读取全部源码。
+2. 还原 `localharness_external` 与 `agy` 的 Go 符号表：
+   - 两个 Go 二进制均 strip 了常规符号表（`nm` / `go tool nm` 无输出），但保留了 Go 运行时的 `__gopclntab`（魔数 `\xf1\xff\xff\xff\x00\x00`）。
+   - 解析方法：
+     1. 从 Mach-O `LC_SEGMENT_64`（`cmd == 0x19`）里读取 `__TEXT,__text` 的虚拟地址 `text_vaddr`（`sectOff + 32`）和文件偏移 `text_fileoff`（`sectOff + 48`）。在 `agy` 1.5.0 中 `text_vaddr = 0x1000011c0`、`text_fileoff = 0x11c0`；在 `localharness_external` 1.4.5 中 `text_vaddr = 0x100000e00`、`text_fileoff = 0xe00`。
+     2. 搜索 `\xf1\xff\xff\xff\x00\x00` 定位 `pclntab` 头 `pcln`：
+        - `nfunc = uint64(pcln + 8)`
+        - `funcnameOff = uint64(pcln + 32)`（字符串表基址 `fnBase = pcln + funcnameOff`）
+        - `functabOff = uint64(pcln + 64)`（函数表基址 `ftBase = pcln + functabOff`）
+     3. 遍历 `i in 0..nfunc-1`：
+        - `entryRel = uint32(ftBase + i * 8)`
+        - `finfoRel = uint32(ftBase + i * 8 + 4)`
+        - `nextRel = uint32(ftBase + (i + 1) * 8)`
+        - `nameRel = int32(ftBase + finfoRel + 4)`
+        - 函数名即 `fnBase + nameRel` 处的以 `\x00` 结尾的字符串；函数在文件中的指令范围为 `[text_fileoff + entryRel, text_fileoff + nextRel)`。
+
+### 2. 为什么默认被锁死在 256K（完整调用链）
+
+1. 独立版 `agy-acp`（`1.4.1–1.4.5`）：
+   - Python 层 `acp_server/server.py` 创建 `ProxyAgentConfig` 时未传 `compaction_config`；且 `acp_server/proxy_agent_config.py` 的 `ProxyAgentConfig.create_strategy()` 在构造 `ProxyConnectionStrategy` 时漏传了 `self.compaction_config`，导致发给 `localharness_external` 的 `CompactionConfig.token_threshold` 恒为 `0`。
+   - Go 层 `localharness_external` 有两处函数把上限锁死在 `256,000`（`0x3e800`，ARM64 编码为双指令 `mov reg, #0xe800; movk reg, #0x3, lsl #16`）：
+     - `google3/.../cortex/utils.GetCheckpointConfig`（1.4.5 虚拟地址 `0x1012f0910..0x1012f0da0`，文件偏移 `0x12f0a1c`、`0x12f0a28`、`0x12f0cf0`）：当 `CheckpointConfig.MaxTokenLimit`（结构体偏移 `+0xc`）为 `0` 或超出模型允许上限时，回退到 `256,000`（上限钳制公式为 `modelMaxTokens - max(16384, min(maxOutputTokens * 2.0, modelMaxTokens * 0.15))`，1M 模型约 `868,928`）。
+     - `google3/.../localharness/localagent.makeCascadeConfigWithSkillsRunnerAndFS`（1.4.1–1.4.3 名为 `makeCascadeConfigWithSkillsAndRunner`；1.4.5 虚拟地址 `0x101a44b80..0x101a48280`，文件偏移 `0x1a44d88`、`0x1a44d90`）：当 `CompactionConfig` 未设置时直接构造 `CheckpointConfig`，把 `TokenThreshold`（`+0xc0`）设为 `140,000`（`0x222e0`：`mov x3, #0x22e0; movk x3, #0x2, lsl #16`），把 `MaxTokenLimit`（`+0xc`）设为 `256,000`（`0x3e800`：`mov x4, #0xe800; movk x4, #0x3, lsl #16`）。
+
+2. 原生 `agy` CLI（`1.5.0`，`/Users/pengchunyou/.local/bin/agy`）：
+   - 已原生支持 `/compact` 斜杠命令（`slashcommands.GetSystemSlashCommandsDefinitions` `0x10bdd0370` -> `slashcmd.Expand` `0x10289f970` -> `cortex/shared.ParseCompactRequest` `0x100f05a90`）。
+   - 已原生支持 `"256K"` / `"512K"` / `"900K"` 预设（`backend.ParsePresetContextWindow` `0x102851cd0`）及环境变量 `AGY_CLI_AUTO_COMPACT_OVERRIDE`（`store.AutoCompactOverride` `0x102b6c160`，支持百分比或绝对 token 数），由 `ServerBackend.buildCascadeConfigInternal`（`0x1028617c8..0x102861844`）写入 `CheckpointConfig.MaxTokenLimit`。
+   - 但受限于两道门禁：
+     - TUI 层的 `store.(*Store).ContextWindow`（`0x102b6c390`）和 `SelectorModel.offersContextWindow`（`0x102d76db0`）检查当前模型显示名是否在白名单切片 `0x10bdb9380`（仅含 `["Gemini 4 Argon"]`）中，非 Argon 模型在文件偏移 `0x2b6c440` 和 `0x2d76eec` 处通过 `tbnz x0, #0x3f` 直接短路返回 `""`。
+     - `agy acp` 子命令的 `ACPServer.loadSettings`（`0x1028cc550`）只反序列化 5 个字段的结构体（`0x109b9cb58`），忽略了 `settings.json` 里的 `contextWindow`，且从未调用 `ServerBackend.SetContextWindow`（`0x102864c00`），因此回落到 `utils.GetCheckpointConfig`（文件偏移 `0x13465c4`、`0x13465d0`、`0x1346898`）的 `256,000` 默认值。
+
+3. 安全与风控验证：
+   - 两个二进制均无自校验或二进制哈希上报（`os.Executable` 全二进制仅 `acp.spawnWorkerProcesses.func1` `0x1028d1e80` 调用一次用于起子进程）。
+   - 发往 Google Cloud Code 的 `GenerateChatRequest`（`0x1007bc1a0..0x1007bc5e0`）与 `StreamGenerateContent` 不包含 `CheckpointConfig` 字段，`MaxTokenLimit` 仅在本地 `checkpoint.shouldCheckpoint`（`0x101c13c50` / `0x101913de0`）中消费。
+   - 在 `~/.gemini/antigravity-cli/settings.json` 中设置 `"enableTelemetry": false` 后，`analytics.Init`（`0x102837f30`）与 `ServerBackend.SetTelemetryEnabled`（`0x1028649f0`）直接在本地短路关闭 Clearcut。
+
+### 3. 本地二进制已应用的补丁（备份在 `~/.local/opt/agy-acp/backups/`）
+
+ARM64 32 位立即数双指令编码公式（寄存器号 `reg = 0..30`，目标值 `val`）：
+- `lo16 = val & 0xffff`，`hi16 = (val >>> 16) & 0xffff`
+- 第 1 条 `mov x<reg>, #lo16`（小端 uint32）：`(0xd2800000 | (lo16 << 5) | reg) >>> 0`
+- 第 2 条 `movk x<reg>, #hi16, lsl #16`（小端 uint32）：`(0xf2a00000 | (hi16 << 5) | reg) >>> 0`
+
+具体数值对应机器码：
+- `256,000`（`0x3e800`）：`ins1 & 0xffffffe0 == 0xd29d0000`，`ins2 & 0xffffffe0 == 0xf2a00060`
+- `140,000`（`0x222e0`）：`ins1 & 0xffffffe0 == 0xd2845c00`，`ins2 & 0xffffffe0 == 0xf2a00040`
+- `512,000`（`0x7d000`）：`lo16 = 0xd000`，`hi16 = 0x7` -> `0xd29a0000 | reg`，`0xf2a000e0 | reg`
+- `544,000`（`0x84d00`）：`lo16 = 0x4d00`，`hi16 = 0x8` -> `0xd289a000 | reg`，`0xf2a00100 | reg`
+- `300,000`（`0x493e0`）：`lo16 = 0x93e0`，`hi16 = 0x4` -> `0xd2927c00 | reg`，`0xf2a00080 | reg`
+
+已执行的修改：
+1. `/Users/pengchunyou/.local/opt/agy-acp/current/localharness_external`（1.4.5）：
+   - 文件偏移 `0x12f0a1c`（`x4`）、`0x12f0a28`（`x4`）、`0x12f0cf0`（`x3`）、`0x1a44d90`（`x4`）四处 `256,000` 改为 `544,000`（`0x84d00`），给 Pi 的 `CONTEXT_WINDOW = 512_000` 留出 32K 缓冲，确保永远由 Pi 先压缩。
+   - 文件偏移 `0x1a44d88`（`x3`）的 `TokenThreshold = 140,000` 改为 `300,000`（`0x493e0`）。
+   - 执行 `codesign -f -s -` 重签名，并将 `install-integrity.json` 中的 `harnessBytes` 更新为重签名后的文件大小（`122225056`）。
+2. `/Users/pengchunyou/.local/bin/agy`（1.5.0）：
+   - 文件偏移 `0x13465c4`（`x4`）、`0x13465d0`（`x4`）、`0x1346898`（`x3`）三处 `256,000` 改为 `512,000`（`0x7d000`；注意避开 `0x2d47a4c` 处 `model.(*History).load` 的历史文件截断常量）。
+   - 文件偏移 `0x2b6c440` 与 `0x2d76eec` 两处 `tbnz x0, #0x3f` 改为 `nop`（`1f 20 03 d5`），解除 TUI 非 Argon 模型的上下文窗口门禁。
+3. `src/models.ts`：`CONTEXT_WINDOW` 设为 `512_000`。
+
+### 4. 后续在 `src/acp/setup.ts` 实现自动补丁的设计要点
+
+如果希望 `pi-antigravity-acp-provider` 在自动升级 ACP runtime 时自动打补丁（跨版本免维护），只需让 AI 按以下 3 步修改 `src/acp/setup.ts`：
+
+1. 按 `pclntab` 函数名定位并替换指令（跨版本稳定，1.4.1–1.4.5 实测全部精确命中）：
+   - 解析 `localharness_external` 的 Mach-O `__text` 文件偏移和 `__gopclntab`（`\xf1\xff\xff\xff\x00\x00`）。
+   - 仅在函数名满足 `name.endsWith("utils.GetCheckpointConfig") || name.includes("localagent.makeCascadeConfigWithSkills")` 的指令区间 `[start, end - 8]` 内扫描：
+     - 匹配 `256,000`（`0xd29d0000` + `0xf2a00060`，且两条指令寄存器号相同）-> 替换为 `544,000`（`0x84d00`）。
+     - 在 `makeCascadeConfigWithSkills*` 内匹配 `140,000`（`0xd2845c00` + `0xf2a00040`）-> 替换为 `300,000`（`0x493e0`）。
+   - 写回文件后在 macOS 上调用 `codesign -f -s - <harnessPath>`。
+2. 处理 `installRelease` 与 `isInstalledRelease` 的文件大小校验：
+   - `codesign -f -s -` 生成的 ad-hoc 签名比 Google 原始签名略小（例如 1.4.5 从 `122957936` 变为 `122225056`），而 `release.harnessBytes` 来自 `runtime-manifest.json` 的原始大小。
+   - 因此在 `installRelease` 中应先打补丁再读取 `fs.statSync(harnessPath).size` 写入 `install-integrity.json`（可同时加一个 `harnessPatchMaxTokenLimit: 544000` 标记字段）；在 `isInstalledRelease` 中，当 `record.harnessPatchMaxTokenLimit` 存在时，用 `record.harnessBytes`（而非 `release.harnessBytes`）传给 `validRuntimeFile`。
+3. 在 `ensureOnce` 中做一次幂等补丁检查：
+   - 若当前已安装的受管 runtime 的 `install-integrity.json` 尚无 `harnessPatchMaxTokenLimit: 544000`，原地执行一次补丁并更新 `install-integrity.json`。
 
 最后一项最要紧。transcript 读不到或格式变了，`contextTokensInUse` 会退回 AGY 报的 `used`，那个值偏大，只会让 Pi 早压缩，不会晚压缩。但兜底依赖在 transcript 里看到 CHECKPOINT，格式一变它就失效。
 
