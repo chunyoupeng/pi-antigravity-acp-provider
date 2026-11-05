@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { contextTokensInUse, transcriptCheckpoints } from "../src/acp/transcript-usage.js";
+import { contextTokensInUse, contextUsageInUse, transcriptCheckpoints } from "../src/acp/transcript-usage.js";
 
 const sessionId = "f322dda8-074f-4e54-86ee-4d90ccbcd1b7";
 const directories: string[] = [];
@@ -34,6 +34,12 @@ describe("contextTokensInUse", () => {
 			planner(3, 3308, 44955, 11),
 		]);
 		await expect(contextTokensInUse(sessionId, 93229, profile, [])).resolves.toBe(48274);
+		await expect(contextUsageInUse(sessionId, 93229, profile, [])).resolves.toEqual({
+			contextTokens: 48274,
+			input: 3308,
+			cacheRead: 44955,
+			output: 11,
+		});
 		await expect(contextTokensInUse(sessionId, 48192, profile, [])).resolves.toBe(48192);
 	});
 

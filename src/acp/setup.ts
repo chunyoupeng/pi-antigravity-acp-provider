@@ -37,6 +37,8 @@ const LOCK_STALE_MS = INSTALL_TIMEOUT_MS + 5 * 60_000;
 const PARALLEL_RANGE_BYTES = 1024 * 1024;
 const PARALLEL_RANGE_CONCURRENCY = 16;
 const MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024;
+export const HARNESS_PATCH_MAX_TOKEN_LIMIT = 544_000;
+export const HARNESS_PATCH_TOKEN_THRESHOLD = 300_000;
 let inFlight: Promise<void> | undefined;
 let backgroundUpdate: Promise<void> | undefined;
 
@@ -81,6 +83,7 @@ interface RuntimeInstallRecord {
 	binaryBytes: number;
 	harnessName: string;
 	harnessBytes: number;
+	harnessPatchMaxTokenLimit?: number;
 	installedAt: string;
 }
 
@@ -198,7 +201,9 @@ async function ensureOnce(onProgress?: (message: string) => void): Promise<void>
 
 	if (launch && launch.source !== "managed") return;
 	if (launch) {
-		repairRuntimeExecutablePermissions(path.dirname(launch.command));
+		const directory = path.dirname(launch.command);
+		repairRuntimeExecutablePermissions(directory);
+		await ensureManagedHarnessPatched(directory);
 		if (loadConfig().runtimeUpdates === "automatic") {
 			startBackgroundUpdate(launch);
 		}
@@ -427,7 +432,11 @@ async function installRuntime(
 		const root = runtimeRoot();
 		return await withInstallLock(root, async () => {
 			adoptLegacyCurrentRelease(root, release);
-			const current = currentManagedRecord(root);
+			let current = currentManagedRecord(root);
+			if (current) {
+				await ensureManagedHarnessPatched(path.dirname(current.binary));
+				current = currentManagedRecord(root);
+			}
 			if (
 				current?.record.archiveSha256 === release.archiveSha256 &&
 				isInstalledRelease(path.dirname(current.binary), release)
@@ -477,10 +486,10 @@ async function installRelease(
 		await extractRuntimeArchive(archive, runtime, release);
 		fs.rmSync(archive, { force: true });
 		const binaryBytes = release.binaryBytes ?? fs.statSync(path.join(runtime, release.binaryName)).size;
-		const harnessBytes = release.harnessBytes ?? fs.statSync(path.join(runtime, release.harnessName)).size;
+		const harnessPath = path.join(runtime, release.harnessName);
 		if (process.platform !== "win32") {
 			fs.chmodSync(path.join(runtime, release.binaryName), 0o755);
-			fs.chmodSync(path.join(runtime, release.harnessName), 0o755);
+			fs.chmodSync(harnessPath, 0o755);
 		}
 		if (process.platform === "darwin") {
 			await Promise.all(
@@ -489,6 +498,10 @@ async function installRelease(
 				),
 			);
 		}
+		const harnessPatched = await patchLocalHarness(harnessPath);
+		const harnessBytes = harnessPatched
+			? fs.statSync(harnessPath).size
+			: (release.harnessBytes ?? fs.statSync(harnessPath).size);
 		onProgress?.("Starting the downloaded runtime for ACP validation…");
 		await validateRuntime(runtime, release);
 		const record: RuntimeInstallRecord = {
@@ -501,6 +514,7 @@ async function installRelease(
 			binaryBytes,
 			harnessName: release.harnessName,
 			harnessBytes,
+			...(harnessPatched ? { harnessPatchMaxTokenLimit: HARNESS_PATCH_MAX_TOKEN_LIMIT } : {}),
 			installedAt: new Date().toISOString(),
 		};
 		fs.writeFileSync(path.join(runtime, "install-integrity.json"), `${JSON.stringify(record, null, 2)}\n`, {
@@ -835,7 +849,10 @@ function isInstalledRelease(directory: string, release: ResolvedRuntimeRelease):
 	if (!record) return false;
 	const archiveBytes = release.archiveBytes ?? record.archiveBytes;
 	const binaryBytes = release.binaryBytes ?? record.binaryBytes;
-	const harnessBytes = release.harnessBytes ?? record.harnessBytes;
+	const harnessBytes =
+		record.harnessPatchMaxTokenLimit === HARNESS_PATCH_MAX_TOKEN_LIMIT
+			? record.harnessBytes
+			: (release.harnessBytes ?? record.harnessBytes);
 	return (
 		record.version === release.version &&
 		record.platform === release.platform &&
@@ -1123,6 +1140,169 @@ function validRuntimeFile(file: string, bytes: number): boolean {
 	} catch {
 		return false;
 	}
+}
+
+function encodeArm64MovImm32(reg: number, value: number): [number, number] {
+	const lo16 = value & 0xffff;
+	const hi16 = (value >>> 16) & 0xffff;
+	const r = reg & 0x1f;
+	return [((0xd2800000 | (lo16 << 5) | r) >>> 0), ((0xf2a00000 | (hi16 << 5) | r) >>> 0)];
+}
+
+function matchesArm64MovImm32(ins1: number, ins2: number, value: number): boolean {
+	const reg1 = ins1 & 0x1f;
+	const reg2 = ins2 & 0x1f;
+	if (reg1 !== reg2) return false;
+	const [expected1, expected2] = encodeArm64MovImm32(reg1, value);
+	return ins1 === expected1 && ins2 === expected2;
+}
+
+export function patchLocalHarnessBinary(buffer: Buffer): { modified: boolean; patched: boolean } {
+	// Mach-O 64-bit arm64 magic (0xfeedfacf) and CPU_TYPE_ARM64 (0x0100000c)
+	if (
+		buffer.length < 32 ||
+		buffer.readUInt32LE(0) !== 0xfeedfacf ||
+		buffer.readUInt32LE(4) !== 0x0100000c
+	) {
+		return { modified: false, patched: false };
+	}
+
+	const ncmds = buffer.readUInt32LE(16);
+	let cmdOff = 32;
+	let textFileOff = -1;
+	for (let i = 0; i < ncmds && cmdOff + 8 <= buffer.length; i++) {
+		const cmd = buffer.readUInt32LE(cmdOff);
+		const cmdsize = buffer.readUInt32LE(cmdOff + 4);
+		if (cmdsize < 8 || cmdOff + cmdsize > buffer.length) break;
+		if (cmd === 0x19 && cmdOff + 72 <= buffer.length) {
+			const nsects = buffer.readUInt32LE(cmdOff + 64);
+			let sectOff = cmdOff + 72;
+			for (let s = 0; s < nsects && sectOff + 80 <= cmdOff + cmdsize; s++) {
+				const sectname = buffer.subarray(sectOff, sectOff + 16).toString("utf8").replace(/\0+$/u, "");
+				const segname = buffer.subarray(sectOff + 16, sectOff + 32).toString("utf8").replace(/\0+$/u, "");
+				if (segname === "__TEXT" && sectname === "__text") {
+					textFileOff = buffer.readUInt32LE(sectOff + 48);
+				}
+				sectOff += 80;
+			}
+		}
+		cmdOff += cmdsize;
+	}
+	if (textFileOff < 0 || textFileOff >= buffer.length) {
+		return { modified: false, patched: false };
+	}
+
+	const pclnMagic = Buffer.from([0xf1, 0xff, 0xff, 0xff, 0x00, 0x00, 0x04, 0x08]);
+	let pcln = -1;
+	let searchFrom = 0;
+	while (searchFrom < buffer.length) {
+		const idx = buffer.indexOf(pclnMagic, searchFrom);
+		if (idx === -1 || idx + 72 > buffer.length) break;
+		const nfunc = Number(buffer.readBigUInt64LE(idx + 8));
+		if (nfunc > 0 && nfunc < 1_000_000) {
+			pcln = idx;
+			break;
+		}
+		searchFrom = idx + 1;
+	}
+	if (pcln < 0) return { modified: false, patched: false };
+
+	const nfunc = Number(buffer.readBigUInt64LE(pcln + 8));
+	const funcnameOff = Number(buffer.readBigUInt64LE(pcln + 32));
+	const functabOff = Number(buffer.readBigUInt64LE(pcln + 64));
+	const fnBase = pcln + funcnameOff;
+	const ftBase = pcln + functabOff;
+	if (fnBase < 0 || ftBase < 0 || ftBase + (nfunc + 1) * 8 > buffer.length) {
+		return { modified: false, patched: false };
+	}
+
+	let modifiedCount = 0;
+	let matchedCount = 0;
+	for (let i = 0; i < nfunc; i++) {
+		const entryOff = ftBase + i * 8;
+		const entryRel = buffer.readUInt32LE(entryOff);
+		const finfoRel = buffer.readUInt32LE(entryOff + 4);
+		const nextRel = buffer.readUInt32LE(entryOff + 8);
+		if (ftBase + finfoRel + 8 > buffer.length) continue;
+		const nameRel = buffer.readInt32LE(ftBase + finfoRel + 4);
+		const nameStart = fnBase + nameRel;
+		if (nameStart < 0 || nameStart >= buffer.length) continue;
+		const nameEnd = buffer.indexOf(0, nameStart);
+		if (nameEnd === -1) continue;
+		const name = buffer.subarray(nameStart, nameEnd).toString("utf8");
+		const isCheckpointConfig = name.endsWith("utils.GetCheckpointConfig");
+		const isCascadeConfig = name.includes("localagent.makeCascadeConfigWithSkills");
+		if (!isCheckpointConfig && !isCascadeConfig) continue;
+
+		const start = textFileOff + entryRel;
+		const end = Math.min(textFileOff + nextRel, buffer.length);
+		for (let off = start; off <= end - 8; off += 4) {
+			const ins1 = buffer.readUInt32LE(off);
+			const ins2 = buffer.readUInt32LE(off + 4);
+			const reg = ins1 & 0x1f;
+			if (matchesArm64MovImm32(ins1, ins2, 256_000)) {
+				const [patch1, patch2] = encodeArm64MovImm32(reg, HARNESS_PATCH_MAX_TOKEN_LIMIT);
+				buffer.writeUInt32LE(patch1, off);
+				buffer.writeUInt32LE(patch2, off + 4);
+				modifiedCount++;
+				matchedCount++;
+			} else if (matchesArm64MovImm32(ins1, ins2, HARNESS_PATCH_MAX_TOKEN_LIMIT)) {
+				matchedCount++;
+			} else if (isCascadeConfig && matchesArm64MovImm32(ins1, ins2, 140_000)) {
+				const [patch1, patch2] = encodeArm64MovImm32(reg, HARNESS_PATCH_TOKEN_THRESHOLD);
+				buffer.writeUInt32LE(patch1, off);
+				buffer.writeUInt32LE(patch2, off + 4);
+				modifiedCount++;
+				matchedCount++;
+			} else if (isCascadeConfig && matchesArm64MovImm32(ins1, ins2, HARNESS_PATCH_TOKEN_THRESHOLD)) {
+				matchedCount++;
+			}
+		}
+	}
+
+	return { modified: modifiedCount > 0, patched: matchedCount > 0 };
+}
+
+export async function patchLocalHarness(harnessPath: string): Promise<boolean> {
+	let buffer: Buffer;
+	try {
+		buffer = fs.readFileSync(harnessPath);
+	} catch {
+		return false;
+	}
+	const { modified, patched } = patchLocalHarnessBinary(buffer);
+	if (!patched) return false;
+	if (modified) {
+		fs.writeFileSync(harnessPath, buffer, { mode: 0o755 });
+		if (process.platform === "darwin") {
+			await execFileAsync("codesign", ["-f", "-s", "-", harnessPath]);
+		}
+	}
+	return true;
+}
+
+export async function ensureManagedHarnessPatched(directory: string): Promise<boolean> {
+	const record = readInstallRecord(directory);
+	if (!record) return false;
+	const harnessPath = path.join(directory, record.harnessName);
+	if (
+		record.harnessPatchMaxTokenLimit === HARNESS_PATCH_MAX_TOKEN_LIMIT &&
+		validRuntimeFile(harnessPath, record.harnessBytes)
+	) {
+		return false;
+	}
+	const patched = await patchLocalHarness(harnessPath);
+	if (!patched) return false;
+	const updated: RuntimeInstallRecord = {
+		...record,
+		harnessBytes: fs.statSync(harnessPath).size,
+		harnessPatchMaxTokenLimit: HARNESS_PATCH_MAX_TOKEN_LIMIT,
+	};
+	const file = path.join(directory, "install-integrity.json");
+	const temporary = `${file}.${process.pid}.tmp`;
+	fs.writeFileSync(temporary, `${JSON.stringify(updated, null, 2)}\n`, { mode: 0o600 });
+	fs.renameSync(temporary, file);
+	return true;
 }
 
 async function readBoundedText(response: Response, maxBytes: number): Promise<string> {

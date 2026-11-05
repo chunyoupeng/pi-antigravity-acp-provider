@@ -32,18 +32,27 @@ interface TranscriptScan {
 
 const scans = new Map<string, TranscriptScan>();
 
+export interface TranscriptContextUsage {
+	contextTokens: number;
+	input: number;
+	cacheRead: number;
+	output: number;
+}
+
 /** Context fill as Antigravity limits it: the larger of the real prompt size
- * and the harness's own count. `usage_update.used` counts cached tokens twice
- * (input + 2 × cacheRead + output, verified 2026-10-17, server 1.4.0); the
- * transcript step that produced it gives the real size. An unexplained value
- * stays as reported, which at worst makes Pi compact early, never late. */
-export async function contextTokensInUse(
+ * and the harness's own count, plus the matched step's real token breakdown.
+ * `usage_update.used` counts cached tokens twice (input + 2 × cacheRead +
+ * output, verified 2026-10-17, server 1.4.0); the transcript step that
+ * produced it gives the real size. An unexplained value stays as reported,
+ * which at worst makes Pi compact early, never late. */
+export async function contextUsageInUse(
 	sessionId: string,
 	used: number,
 	profile = resolveAcpProfileDir(),
 	retryDelaysMs: readonly number[] = RETRY_DELAYS_MS,
-): Promise<number> {
-	if (!UUID.test(sessionId)) return used;
+): Promise<TranscriptContextUsage> {
+	const fallback: TranscriptContextUsage = { contextTokens: used, input: used, cacheRead: 0, output: 0 };
+	if (!UUID.test(sessionId)) return fallback;
 	const file = transcriptFile(sessionId, profile);
 	for (const delay of [0, ...retryDelaysMs]) {
 		if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
@@ -51,15 +60,33 @@ export async function contextTokensInUse(
 		try {
 			scan = await advance(file);
 		} catch {
-			return used;
+			return fallback;
 		}
 		for (let index = scan.recent.length - 1; index >= 0; index--) {
 			const step = scan.recent[index]!;
 			if (step.input + 2 * step.cacheRead + step.output !== used) continue;
-			return Math.max(step.input + step.cacheRead + step.output, Math.ceil(scan.bytes / HARNESS_BYTES_PER_TOKEN));
+			const contextTokens = Math.max(
+				step.input + step.cacheRead + step.output,
+				Math.ceil(scan.bytes / HARNESS_BYTES_PER_TOKEN),
+			);
+			return {
+				contextTokens,
+				input: step.input,
+				cacheRead: step.cacheRead,
+				output: step.output,
+			};
 		}
 	}
-	return used;
+	return fallback;
+}
+
+export async function contextTokensInUse(
+	sessionId: string,
+	used: number,
+	profile = resolveAcpProfileDir(),
+	retryDelaysMs: readonly number[] = RETRY_DELAYS_MS,
+): Promise<number> {
+	return (await contextUsageInUse(sessionId, used, profile, retryDelaysMs)).contextTokens;
 }
 
 /** How many times the harness replaced this session's history with its own

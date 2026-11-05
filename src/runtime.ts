@@ -40,7 +40,7 @@ import { DecisionLog, type DecisionFields } from "./acp/decision-log.js";
 import { describeBackendSilence } from "./acp/backend-diagnostics.js";
 import { abortError, AntigravityAcpError, errorMessage } from "./acp/errors.js";
 import { AcpSessionStore } from "./acp/session-store.js";
-import { contextTokensInUse, transcriptCheckpoints } from "./acp/transcript-usage.js";
+import { contextUsageInUse, transcriptCheckpoints, type TranscriptContextUsage } from "./acp/transcript-usage.js";
 import { sessionModels, sessionModes, type AcpModelInfo, type AcpNewSessionResponse, type SessionState } from "./acp/session-state.js";
 import {
 	MANAGED_AUTH_MARKER,
@@ -162,6 +162,7 @@ interface Binding {
 	/** True when the Antigravity built-ins in PI_OWNED_NATIVE_TOOLS are disabled. */
 	piOwnsTools: boolean;
 	contextTokens: number | undefined;
+	lastStepUsage: TranscriptContextUsage | undefined;
 	/** Harness checkpoints already in the transcript when this binding first saw it. */
 	harnessCheckpoints: number | undefined;
 	/** The harness replaced this session's history with its own summary. */
@@ -880,7 +881,11 @@ export class AntigravityRuntime {
 			const activeWriter = binding.writer ?? writer;
 			if (binding.abortRequested) throw abortError();
 			const reported = usageFromPrompt(response);
-			activeWriter.message.usage = withContextUsage(reported, binding.contextTokens);
+			activeWriter.message.usage = withContextUsage(
+				reported,
+				binding.contextTokens,
+				binding.lastStepUsage ?? { input: 0, cacheRead: 0, output: 0 },
+			);
 			this.metrics.record(response, reported);
 			activeWriter.message.rawStopReason = response.stopReason;
 			binding.messageCount = binding.pendingContextCount || parts.messageCount;
@@ -1149,6 +1154,7 @@ export class AntigravityRuntime {
 				toolOwner,
 				piOwnsTools,
 				contextTokens: undefined,
+				lastStepUsage: undefined,
 				harnessCheckpoints: undefined,
 				harnessCheckpointed: false,
 				pendingErrorChunk: undefined,
@@ -1354,11 +1360,12 @@ export class AntigravityRuntime {
 					}
 					writer.thinking(activity.text);
 				} else if (activity.type === "usage") {
-					const used = await contextTokensInUse(notification.sessionId, activity.used);
+					const stepUsage = await contextUsageInUse(notification.sessionId, activity.used);
 					this.noteHarnessCheckpoint(binding, writer, transcriptCheckpoints(notification.sessionId));
-					binding.contextTokens = used;
-					this.metrics.recordContext(used, activity.size);
-					writer.message.usage = contextUsage(used);
+					binding.contextTokens = stepUsage.contextTokens;
+					binding.lastStepUsage = stepUsage;
+					this.metrics.recordContext(stepUsage.contextTokens, activity.size);
+					writer.message.usage = contextUsage(stepUsage.contextTokens, stepUsage);
 				} else if (activity.type === "config") {
 					// The server changed the selection itself, e.g. it replaced a model
 					// that is no longer offered. The connection already recorded the new
@@ -1670,8 +1677,11 @@ function hasUsableLocalAuth(health: AntigravityAuthHealth): boolean {
  * fill, so Pi's context meter stays correct across tool round trips. */
 function attachWriter(binding: Binding, writer: PiEventWriter): void {
 	binding.writer = writer;
+	binding.lastStepUsage = undefined;
 	writer.message.responseModel = binding.modelId;
-	if (binding.contextTokens !== undefined) writer.message.usage = contextUsage(binding.contextTokens);
+	if (binding.contextTokens !== undefined) {
+		writer.message.usage = contextUsage(binding.contextTokens, { input: 0, cacheRead: 0, output: 0 });
+	}
 }
 
 function supportsMode(session: SessionState, mode: PermissionMode): boolean {

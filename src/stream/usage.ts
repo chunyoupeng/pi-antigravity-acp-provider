@@ -28,6 +28,12 @@ export function usageFromPrompt(response: PromptResponse): Usage {
 	return usage;
 }
 
+export interface ContextTokenBreakdown {
+	input?: number;
+	cacheRead?: number;
+	output?: number;
+}
+
 /** Pi derives context fill and compaction from `totalTokens`, so it must be
  * the tokens now in the context window. Antigravity 1.3 reports that only as
  * `usage_update`. Antigravity 1.4.3 also fills `PromptResponse.usage`, but
@@ -35,13 +41,23 @@ export function usageFromPrompt(response: PromptResponse): Usage {
  * with a ~70k context reported ~350k), which made Pi compact after nearly
  * every multi-tool turn. Prefer the context measurement whenever we have it;
  * fall back to the prompt counts only when no `usage_update` arrived. */
-export function withContextUsage(usage: Usage, contextTokens: number | undefined): Usage {
+export function withContextUsage(
+	usage: Usage,
+	contextTokens: number | undefined,
+	breakdown?: ContextTokenBreakdown,
+): Usage {
 	if (contextTokens === undefined) return usage;
-	return contextUsage(contextTokens);
+	return contextUsage(contextTokens, breakdown);
 }
 
-export function contextUsage(contextTokens: number): Usage {
-	return { ...emptyUsage(), input: contextTokens, totalTokens: contextTokens };
+export function contextUsage(contextTokens: number, breakdown?: ContextTokenBreakdown): Usage {
+	return {
+		...emptyUsage(),
+		input: breakdown?.input ?? contextTokens,
+		cacheRead: breakdown?.cacheRead ?? 0,
+		output: breakdown?.output ?? 0,
+		totalTokens: contextTokens,
+	};
 }
 
 function token(value: unknown): number | undefined {

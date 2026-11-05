@@ -313,6 +313,14 @@ describe("usageFromPrompt", () => {
 			usage: { inputTokens: 343_158, outputTokens: 5_231, cachedReadTokens: 273_253, totalTokens: 348_389 },
 		});
 		expect(withContextUsage(cumulative, 70_136).totalTokens).toBe(70_136);
+		expect(
+			withContextUsage(cumulative, 70_136, { input: 5_000, cacheRead: 45_000, output: 120 }),
+		).toMatchObject({
+			input: 5_000,
+			cacheRead: 45_000,
+			output: 120,
+			totalTokens: 70_136,
+		});
 		expect(withContextUsage(cumulative, undefined)).toBe(cumulative);
 	});
 
