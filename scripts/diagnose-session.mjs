@@ -22,6 +22,7 @@ const JUMP_TOKENS = 30_000;
 /** Pi's own steps closer than this to a printed one are folded away. */
 const PRINT_STEP_TOKENS = 10_000;
 const CONTEXT_RESOURCE = "urn:pi:antigravity-acp:context/";
+const CONTEXT_PART_RESOURCE = "urn:pi:antigravity-acp:context-part/";
 
 const args = process.argv.slice(2);
 const all = args.includes("--all");
@@ -120,7 +121,8 @@ function readDecisions() {
 			const replay = entry.fresh && restoredBy.get(entry.acp)
 				? `full Pi history sent into a session restored by ${restoredBy.get(entry.acp)}; it already holds that history`
 				: undefined;
-			add(entry.t, source, `prompt ${entry.fresh ? "fresh" : "delta"} messages ${entry.from}..${entry.to} ${kilo(entry.bytes, "B")}`, replay);
+			const batch = entry.batch !== undefined && entry.batches !== undefined ? ` batch ${entry.batch}/${entry.batches}` : "";
+			add(entry.t, source, `prompt ${entry.fresh ? "fresh" : "delta"}${batch} messages ${entry.from}..${entry.to} ${kilo(entry.bytes, "B")}`, replay);
 			restoredBy.set(entry.acp, undefined);
 		} else if (entry.event === "end") {
 			add(entry.t, source, entry.error
@@ -159,10 +161,11 @@ function readTranscript(acp) {
 		const text = typeof step.content === "string" ? step.content : JSON.stringify(step.content ?? "");
 		if (step.type === "USER_INPUT") {
 			const history = text.includes(CONTEXT_RESOURCE);
+			const historyPart = text.includes(CONTEXT_PART_RESOURCE);
 			const replay = history && index > 0
 				? `Pi history replayed into a session that already has ${index} steps`
 				: undefined;
-			const what = history ? "Pi history" : `"${clip(userRequest(text), 60)}"`;
+			const what = history ? "Pi history" : historyPart ? "Pi history (continuation batch)" : `"${clip(userRequest(text), 60)}"`;
 			add(step.created_at, source, `USER_INPUT ${kilo(Buffer.byteLength(text, "utf8"), "B")} ${what}`, replay);
 		} else if (step.type === "ERROR_MESSAGE") {
 			errors.push(step);

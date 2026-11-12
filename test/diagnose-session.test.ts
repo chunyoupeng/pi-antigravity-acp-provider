@@ -69,4 +69,43 @@ describe("diagnose-session script", () => {
 		expect(output).toContain("4 flagged:");
 		expect(output).not.toContain("someone-else");
 	});
+
+	it("does not flag multi-batch initial context-part replay as an anomaly", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "diagnose-session-")); roots.push(root);
+		const agent = path.join(root, "agent");
+		const sessions = path.join(agent, "sessions", "--work--");
+		fs.mkdirSync(sessions, { recursive: true });
+		const sessionFile = path.join(sessions, `2026-10-19T14-37-00-000Z_${PI}.jsonl`);
+		fs.writeFileSync(sessionFile, jsonl([
+			{ type: "session", id: PI, cwd: "/work" },
+			{ type: "message", timestamp: "2026-10-19T14:37:00Z", message: { role: "user", content: "continue" } },
+			assistant("2026-10-19T14:37:41Z", 85_000, { stopReason: "stop" }),
+		]));
+		const logs = path.join(agent, "antigravity-acp-provider", "logs");
+		fs.mkdirSync(logs, { recursive: true });
+		fs.writeFileSync(path.join(logs, "bindings.jsonl"), jsonl([
+			{ t: "2026-10-19T14:37:25Z", event: "bind", pi: PI, acp: ACP, how: "new", messageCount: 0, model: "m" },
+			{ t: "2026-10-19T14:37:25Z", event: "prompt", pi: PI, acp: ACP, fresh: true, from: 0, to: 30, batch: 1, batches: 2, bytes: 160_000 },
+			{ t: "2026-10-19T14:37:28Z", event: "prompt", pi: PI, acp: ACP, fresh: true, from: 0, to: 30, batch: 2, batches: 2, bytes: 90_000 },
+			{ t: "2026-10-19T14:37:41Z", event: "end", pi: PI, acp: ACP, stop: "end_turn", tokens: 85_000 },
+		]));
+		const transcript = path.join(root, "gemini", "antigravity-acp", "brain", ACP, ".system_generated", "logs");
+		fs.mkdirSync(transcript, { recursive: true });
+		fs.writeFileSync(path.join(transcript, "transcript_full.jsonl"), jsonl([
+			{ step_index: 0, type: "USER_INPUT", created_at: "2026-10-19T14:37:25Z", content: "Embedded resource (urn:pi:antigravity-acp:context/1):\n..." },
+			{ step_index: 1, type: "PLANNER_RESPONSE", created_at: "2026-10-19T14:37:27Z", input_tokens: 55_000, cache_read_tokens: 0, output_tokens: 5 },
+			{ step_index: 2, type: "USER_INPUT", created_at: "2026-10-19T14:37:28Z", content: "Embedded resource (urn:pi:antigravity-acp:context-part/2):\n..." },
+			{ step_index: 3, type: "PLANNER_RESPONSE", created_at: "2026-10-19T14:37:41Z", input_tokens: 29_800, cache_read_tokens: 55_000, output_tokens: 200 },
+		]));
+
+		const output = execFileSync(process.execPath, [script, PI.slice(0, 8)], {
+			env: { ...process.env, PI_CODING_AGENT_DIR: agent, GEMINI_HOME: path.join(root, "gemini"), TZ: "Asia/Shanghai" },
+			encoding: "utf8",
+		});
+
+		expect(output).toContain("prompt fresh batch 1/2 messages 0..30 160kB");
+		expect(output).toContain("prompt fresh batch 2/2 messages 0..30 90.0kB");
+		expect(output).toContain("Pi history (continuation batch)");
+		expect(output).toContain("No anomalies flagged.");
+	});
 });

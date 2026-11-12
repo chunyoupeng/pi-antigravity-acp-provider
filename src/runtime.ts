@@ -2,6 +2,7 @@ import {
 	RequestError,
 	type ContentBlock,
 	type InitializeResponse,
+	type PromptResponse,
 	type RequestPermissionRequest,
 	type RequestPermissionResponse,
 	type SessionInfo,
@@ -156,6 +157,8 @@ interface Binding {
 	updateQueue: Promise<void>;
 	turnCompletion: Promise<void> | undefined;
 	abortRequested: boolean;
+	/** True while silent context-replay batches are running ahead of the active prompt. */
+	replayingContext: boolean;
 	piSessionId: string | undefined;
 	restored: boolean;
 	toolOwner: ToolOwner;
@@ -766,15 +769,11 @@ export class AntigravityRuntime {
 			// dies midway leaves steps in Antigravity that Pi's history repeats, so the
 			// next binding must start fresh rather than resume and replay it.
 			if (binding.piSessionId) this.sessionStore?.remove(binding.piSessionId);
-			this.decide(binding, "prompt", {
-				fresh,
-				from: fresh ? 0 : unseenStart,
-				to: context.messages.length,
-				bytes: Buffer.byteLength(JSON.stringify(parts.prompt), "utf8"),
-			});
 			let retriedExecutionError = false;
-			let response = await binding.connection.prompt(
-				{ sessionId: binding.session.sessionId, prompt: parts.prompt },
+			let response = await this.sendBatchedPrompt(
+				binding,
+				parts,
+				{ fresh, from: fresh ? 0 : unseenStart, to: context.messages.length },
 				options.signal,
 			);
 			for (;;) {
@@ -853,15 +852,10 @@ export class AntigravityRuntime {
 					binding.lateResults = [];
 					binding.updateQueue = Promise.resolve();
 					if (binding.piSessionId) this.sessionStore?.remove(binding.piSessionId);
-					this.decide(binding, "prompt", {
-						fresh: true,
-						from: 0,
-						to: retryContext.messages.length,
-						bytes: Buffer.byteLength(JSON.stringify(parts.prompt), "utf8"),
-						retry: true,
-					});
-					response = await binding.connection.prompt(
-						{ sessionId: binding.session.sessionId, prompt: parts.prompt },
+					response = await this.sendBatchedPrompt(
+						binding,
+						parts,
+						{ fresh: true, from: 0, to: retryContext.messages.length, retry: true },
 						options.signal,
 					);
 					continue;
@@ -918,6 +912,7 @@ export class AntigravityRuntime {
 			binding.turnCompletion = undefined;
 			binding.lateResults = [];
 			binding.abortRequested = false;
+			binding.replayingContext = false;
 			binding.writer = undefined;
 			release();
 			if (this.queues.get(key) === queue) this.queues.delete(key);
@@ -934,6 +929,55 @@ export class AntigravityRuntime {
 				this.scheduleBindingIdleTimer(binding);
 			}
 		}
+	}
+
+	private async sendBatchedPrompt(
+		binding: Binding,
+		parts: PromptParts,
+		meta: { fresh: boolean; from: number; to: number; retry?: boolean },
+		signal: AbortSignal | undefined,
+	): Promise<PromptResponse> {
+		const total = parts.warmupPrompts.length + 1;
+		try {
+			for (let index = 0; index < parts.warmupPrompts.length; index++) {
+				const warmupPrompt = parts.warmupPrompts[index]!;
+				binding.replayingContext = true;
+				binding.toolTracker.clear();
+				this.decide(binding, "prompt", {
+					fresh: meta.fresh,
+					from: meta.from,
+					to: meta.to,
+					batch: index + 1,
+					batches: total,
+					bytes: Buffer.byteLength(JSON.stringify(warmupPrompt), "utf8"),
+					...(meta.retry ? { retry: true } : {}),
+				});
+				const warmupResponse = await binding.connection.prompt(
+					{ sessionId: binding.session.sessionId, prompt: warmupPrompt },
+					signal,
+				);
+				await binding.updateQueue;
+				if (binding.abortRequested) throw abortError();
+				if (warmupResponse.stopReason === "cancelled") throw abortError();
+				this.metrics.record(warmupResponse, usageFromPrompt(warmupResponse));
+				if (binding.pendingErrorChunk !== undefined) return warmupResponse;
+			}
+		} finally {
+			binding.replayingContext = false;
+		}
+		binding.toolTracker.clear();
+		this.decide(binding, "prompt", {
+			fresh: meta.fresh,
+			from: meta.from,
+			to: meta.to,
+			...(total > 1 ? { batch: total, batches: total } : {}),
+			bytes: Buffer.byteLength(JSON.stringify(parts.prompt), "utf8"),
+			...(meta.retry ? { retry: true } : {}),
+		});
+		return binding.connection.prompt(
+			{ sessionId: binding.session.sessionId, prompt: parts.prompt },
+			signal,
+		);
 	}
 
 	private async awaitContinuation(binding: Binding, writer: PiEventWriter, signal?: AbortSignal): Promise<void> {
@@ -1149,6 +1193,7 @@ export class AntigravityRuntime {
 				updateQueue: Promise.resolve(),
 				turnCompletion: undefined,
 				abortRequested: false,
+				replayingContext: false,
 				piSessionId,
 				restored,
 				toolOwner,
@@ -1211,6 +1256,12 @@ export class AntigravityRuntime {
 		invocation: PiToolInvocation,
 		abandoned: AbortSignal,
 	): Promise<CallToolResult> {
+		if (binding?.replayingContext) {
+			return Promise.resolve({
+				content: [{ type: "text", text: "Context replay is still in progress; reply with OK only and do not call tools yet." }],
+				isError: true,
+			});
+		}
 		if (!binding?.writer || binding.writer.finished || binding.permission || binding.abortRequested || abandoned.aborted) {
 			return Promise.resolve({
 				content: [{ type: "text", text: "Pi cannot accept this tool call in the current turn" }],
@@ -1263,7 +1314,7 @@ export class AntigravityRuntime {
 		binding: Binding | undefined,
 		request: RequestPermissionRequest,
 	): Promise<RequestPermissionResponse> {
-		if (!binding?.writer || binding.writer.finished || binding.permission || binding.abortRequested || request.sessionId !== binding.session.sessionId) {
+		if (!binding?.writer || binding.writer.finished || binding.replayingContext || binding.permission || binding.abortRequested || request.sessionId !== binding.session.sessionId) {
 			return Promise.resolve({ outcome: { outcome: "cancelled" } });
 		}
 		// Pi runs bridged tools under its own policy; an Antigravity prompt
@@ -1334,31 +1385,38 @@ export class AntigravityRuntime {
 		}
 		if (!binding.writer) return;
 		const writer = binding.writer;
+		const replayingContext = binding.replayingContext;
 		binding.updateQueue = binding.updateQueue.then(async () => {
-			await writer.providerEvent(notification);
+			if (!replayingContext) await writer.providerEvent(notification);
 			for (const activity of mapSessionUpdate(notification)) {
 				if (activity.type === "text") {
 					if (isSyntheticExecutionErrorChunk(activity.delta)) {
 						binding.pendingErrorChunk = (binding.pendingErrorChunk ?? "") + activity.delta;
-					} else {
+					} else if (!replayingContext) {
 						if (binding.pendingErrorChunk) {
 							writer.text(binding.pendingErrorChunk);
 							binding.pendingErrorChunk = undefined;
 						}
 						writer.text(activity.delta);
+					} else {
+						binding.pendingErrorChunk = undefined;
 					}
 				} else if (activity.type === "thought") {
-					if (binding.pendingErrorChunk) {
-						writer.text(binding.pendingErrorChunk);
-						binding.pendingErrorChunk = undefined;
+					if (!replayingContext) {
+						if (binding.pendingErrorChunk) {
+							writer.text(binding.pendingErrorChunk);
+							binding.pendingErrorChunk = undefined;
+						}
+						writer.thinking(activity.delta);
 					}
-					writer.thinking(activity.delta);
 				} else if (activity.type === "plan") {
-					if (binding.pendingErrorChunk) {
-						writer.text(binding.pendingErrorChunk);
-						binding.pendingErrorChunk = undefined;
+					if (!replayingContext) {
+						if (binding.pendingErrorChunk) {
+							writer.text(binding.pendingErrorChunk);
+							binding.pendingErrorChunk = undefined;
+						}
+						writer.thinking(activity.text);
 					}
-					writer.thinking(activity.text);
 				} else if (activity.type === "usage") {
 					const stepUsage = await contextUsageInUse(notification.sessionId, activity.used);
 					this.noteHarnessCheckpoint(binding, writer, transcriptCheckpoints(notification.sessionId));
@@ -1377,7 +1435,7 @@ export class AntigravityRuntime {
 					}
 				} else if (activity.type === "tool") {
 					const toolCall = binding.toolTracker.apply(activity.update);
-					if (binding.bridge?.reports(toolCall.title, toolCall._meta)) continue;
+					if (replayingContext || binding.bridge?.reports(toolCall.title, toolCall._meta)) continue;
 					const toolActivity: AcpToolActivity = {
 						sessionId: notification.sessionId,
 						...(binding.piSessionId ? { piSessionId: binding.piSessionId } : {}),
@@ -1652,10 +1710,10 @@ async function authenticateForCredential(
 	await connection.authenticate({ methodId: method.id, _meta: { "api-key": apiKey } }, signal);
 }
 
-function adaptPromptToCapabilities(parts: PromptParts, initialize: InitializeResponse): PromptParts {
+function adaptBlocksToCapabilities(blocks: ContentBlock[], initialize: InitializeResponse): ContentBlock[] {
 	const capabilities = initialize.agentCapabilities?.promptCapabilities;
 	const output: ContentBlock[] = [];
-	for (const block of parts.prompt) {
+	for (const block of blocks) {
 		if (block.type === "image" && capabilities?.image !== true) {
 			throw new AntigravityAcpError("invalid_input", "This Antigravity ACP runtime did not advertise image input");
 		}
@@ -1666,7 +1724,15 @@ function adaptPromptToCapabilities(parts: PromptParts, initialize: InitializeRes
 		}
 		output.push(block);
 	}
-	return { ...parts, prompt: output };
+	return output;
+}
+
+function adaptPromptToCapabilities(parts: PromptParts, initialize: InitializeResponse): PromptParts {
+	return {
+		...parts,
+		warmupPrompts: parts.warmupPrompts.map((prompt) => adaptBlocksToCapabilities(prompt, initialize)),
+		prompt: adaptBlocksToCapabilities(parts.prompt, initialize),
+	};
 }
 
 function hasUsableLocalAuth(health: AntigravityAuthHealth): boolean {

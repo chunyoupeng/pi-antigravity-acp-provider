@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 
 import {
 	buildPromptParts,
+	MAX_PROMPT_BYTES,
+	MAX_REPLAY_BATCHES,
 	PI_READ_EXAMINE_RULE,
 } from "../src/stream/context.js";
 import { quotaFromPrompt } from "../src/status.js";
@@ -90,21 +92,21 @@ describe("prompt context", () => {
 		expect(serialized).not.toContain("Tool result (undefined)");
 	});
 
-	it("truncates only history while preserving instructions intact", () => {
+	it("truncates only history beyond total replay budget while preserving instructions intact", () => {
 		const instructions = `  Start instructions\n${"important rule\n".repeat(3_000)}End instructions  `;
 		const context = normalizeContext({
 			systemPrompt: instructions,
 			messages: [
-				{ role: "user", content: `Old history start${"x".repeat(610_000)}Recent history end`, timestamp: 1 },
+				{ role: "user", content: `Old history start${"x".repeat(MAX_PROMPT_BYTES * MAX_REPLAY_BATCHES + 32_000)}Recent history end`, timestamp: 1 },
 				{ role: "user", content: "new", timestamp: 2 },
 			],
 		});
 		const result = buildPromptParts(context, true);
-		expect(result.prompt[0]).toMatchObject({
+		expect(result.warmupPrompts[0]?.[0]).toMatchObject({
 			type: "resource",
 			resource: { text: expect.stringContaining(`# Pi session instructions\n\n${instructions}\n\n---`) },
 		});
-		const serialized = JSON.stringify(result.prompt);
+		const serialized = JSON.stringify([result.warmupPrompts, result.prompt]);
 		expect(serialized).toContain("[truncated older context]");
 		expect(serialized).toContain("Recent history end");
 		expect(serialized).not.toContain("Old history start");
@@ -235,10 +237,10 @@ describe("prompt context", () => {
 describe("instruction safety", () => {
 	it("preserves instructions and untrusted-history labels despite long history", () => {
 		const result = buildPromptParts({ systemPrompt: "  REQUIRED_PROJECT_RULE  ", messages: [
-			{ role: "user", content: "x".repeat(610_000), timestamp: 1 },
+			{ role: "user", content: "x".repeat(MAX_PROMPT_BYTES * MAX_REPLAY_BATCHES + 32_000), timestamp: 1 },
 			{ role: "user", content: "next", timestamp: 2 },
 		]}, true);
-		const text = JSON.stringify(result.prompt);
+		const text = JSON.stringify([result.warmupPrompts, result.prompt]);
 		expect(text).toContain("  REQUIRED_PROJECT_RULE  ");
 		expect(text).toContain("untrusted conversation data");
 		expect(text).toContain("truncated older context");

@@ -203,6 +203,104 @@ describe("abort cleanup", () => {
 		expect(decisions.some((entry) => entry.event === "exit" && entry.acp === decisions[0]?.acp)).toBe(true);
 	});
 
+	it("replays large history across silent batches on the turn after Esc abort without losing older context", async () => {
+		const fixture = setup();
+		const store = new AcpSessionStore(path.join(fixture.root, "sessions.json"));
+		const decisionFile = path.join(fixture.root, "bindings.jsonl");
+		const { runtime, entries } = setup(undefined, "yolo", store, new DecisionLog(decisionFile));
+		const earlyReplyText = "EARLY_HISTORY_HEAD_" + "a".repeat(120_000) + "_EARLY_HISTORY_TAIL";
+		const middleReplyText = "MIDDLE_HISTORY_HEAD_" + "b".repeat(120_000) + "_MIDDLE_HISTORY_TAIL";
+		const first = await turn(runtime, [user("step 1")], "esc-batch");
+		const firstWithLargeHistory = { ...first, content: [{ type: "text" as const, text: earlyReplyText }] };
+		const second = { ...first, content: [{ type: "text" as const, text: middleReplyText }] };
+
+		// Simulate pressing Esc during an active prompt.
+		const abortController = new AbortController();
+		const abortedTurn = drain(
+			runtime.stream(
+				model,
+				{ messages: [user("step 1"), first, user("hang", 2)] },
+				{ sessionId: "esc-batch", apiKey: "test-key", signal: abortController.signal },
+			),
+		);
+		await vi.waitFor(() => expect(entries().filter((entry) => entry.method === "session/prompt")).toHaveLength(2));
+		abortController.abort();
+		expect((await abortedTurn).stopReason).toBe("aborted");
+		expect(store.get("esc-batch")).toBeUndefined();
+
+		// Next message rebuilds in a new ACP session via silent warmup batches + active prompt.
+		const rebuilt = await turn(
+			runtime,
+			[user("step 1"), firstWithLargeHistory, user("step 2", 2), second, user("continue after Esc", 3)],
+			"esc-batch",
+		);
+		expect(rebuilt.stopReason).toBe("stop");
+		// Warmup "Hello" / "Checking" chunks must never leak into Pi's assistant message.
+		expect(rebuilt.content).toEqual([
+			{ type: "thinking", thinking: "Checking" },
+			{ type: "text", text: "Hello" },
+		]);
+		expect(store.get("esc-batch")).toBeDefined();
+
+		const rebuildPrompts = entries().filter((entry) => entry.method === "session/prompt").slice(2);
+		expect(rebuildPrompts.length).toBeGreaterThanOrEqual(2);
+		for (const sent of rebuildPrompts) {
+			const blocks = sent.prompt as Array<{ text?: string; resource?: { text?: string } }>;
+			const bytes = blocks.reduce((sum, block) => sum + Buffer.byteLength(block.text ?? block.resource?.text ?? "", "utf8"), 0);
+			expect(bytes).toBeLessThanOrEqual(MAX_PROMPT_BYTES);
+		}
+		const allSentText = JSON.stringify(rebuildPrompts);
+		expect(allSentText).toContain("EARLY_HISTORY_HEAD_");
+		expect(allSentText).toContain("_EARLY_HISTORY_TAIL");
+		expect(allSentText).toContain("MIDDLE_HISTORY_HEAD_");
+		expect(allSentText).toContain("_MIDDLE_HISTORY_TAIL");
+		expect(allSentText).not.toContain("[truncated older context]");
+
+		const decisions = fs.readFileSync(decisionFile, "utf8").trim().split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		expect(decisions.some((entry) => entry.event === "drop" && entry.reason === "prompt incomplete")).toBe(true);
+		const batched = decisions.filter((entry) => entry.event === "prompt" && typeof entry.batches === "number");
+		expect(batched.map((entry) => entry.batch)).toEqual(batched.map((_, index) => index + 1));
+	});
+
+	it("blocks stray tool calls during warmup replay and recovers if a warmup batch hits an execution error or Esc abort", async () => {
+		const largeMessages = [
+			user("a".repeat(120_000), 1),
+			user("b".repeat(120_000), 2),
+			user("final question", 3),
+		];
+
+		// 1. Stray bridge tool call during warmup is rejected in-turn without emitting toolUse to Pi.
+		const toolCase = setup("warmup-tool-attempt");
+		const guarded = await drain(
+			toolCase.runtime.stream(model, { tools, messages: largeMessages }, { sessionId: "warmup-guard", apiKey: "test-key" }),
+		);
+		expect(guarded.stopReason).toBe("stop");
+		expect(guarded.content.some((block) => block.type === "toolCall")).toBe(false);
+
+		// 2. Synthetic execution error during warmup batch 1 drops the broken session and retries cleanly.
+		const errFixture = setup();
+		const errStore = new AcpSessionStore(path.join(errFixture.root, "sessions.json"));
+		const errCase = setup("warmup-error-once", "yolo", errStore);
+		const healed = await turn(errCase.runtime, largeMessages, "warmup-heal");
+		expect(healed.stopReason).toBe("stop");
+		expect(errCase.connections).toHaveLength(2);
+		expect(errStore.get("warmup-heal")).toBeDefined();
+
+		// 3. Pressing Esc during warmup batch 1 aborts cleanly without persisting an incomplete session.
+		const abortFixture = setup();
+		const abortStore = new AcpSessionStore(path.join(abortFixture.root, "sessions.json"));
+		const abortCase = setup("warmup-hang", "yolo", abortStore);
+		const controller = new AbortController();
+		const pending = drain(
+			abortCase.runtime.stream(model, { messages: largeMessages }, { sessionId: "warmup-abort", apiKey: "test-key", signal: controller.signal }),
+		);
+		await vi.waitFor(() => expect(abortCase.entries().filter((entry) => entry.method === "session/prompt")).toHaveLength(1));
+		controller.abort();
+		expect((await pending).stopReason).toBe("aborted");
+		expect(abortStore.get("warmup-abort")).toBeUndefined();
+	});
+
 	it("cancels a parked turn before applying a new permission policy", async () => {
 		const { runtime } = setup();
 		await drain(runtime.stream(model, { tools, messages: [user("use bridge")] }, { sessionId: "mode-running", apiKey: "test-key" }));
@@ -315,20 +413,28 @@ describe("context handoff transport", () => {
 		const response = await drain(runtime.stream({ ...model, input: ["text", "image"] }, context, { sessionId: "handoff", apiKey: "test-key" }));
 		expect(response.stopReason).toBe("stop");
 		const prompts = entries().filter((entry) => entry.method === "session/prompt");
-		expect(prompts).toHaveLength(1);
-		const prompt = prompts[0]!.prompt as Array<{ type: string; resource?: { text?: string }; text?: string }>;
-		expect(prompt).toContainEqual({ type: "text", text: "ACTIVE_REQUEST" });
-		expect(prompt).toContainEqual(image);
-		const reconstruction = prompt[0]!.resource!.text!;
-		expect(reconstruction).toContain("BASE_RULE");
-		expect(reconstruction).toContain("NEW_RULE");
-		expect(reconstruction).toContain("UPDATED_RULE");
-		expect(reconstruction).not.toContain("OLD_RULE");
-		expect(reconstruction).toContain("[tool call read id=external-call]");
-		expect(reconstruction).toContain("## Tool result (read id=external-call)");
-		expect(reconstruction).toContain("RESULT_TAIL");
-		const bytes = prompt.reduce((total, block) => total + Buffer.byteLength(block.text ?? block.resource?.text ?? "", "utf8"), 0);
-		expect(bytes).toBeLessThanOrEqual(MAX_PROMPT_BYTES);
+		expect(prompts).toHaveLength(4);
+		for (const sent of prompts) {
+			const blocks = sent.prompt as Array<{ type: string; resource?: { text?: string }; text?: string }>;
+			const bytes = blocks.reduce((total, block) => total + Buffer.byteLength(block.text ?? block.resource?.text ?? "", "utf8"), 0);
+			expect(bytes).toBeLessThanOrEqual(MAX_PROMPT_BYTES);
+		}
+		const firstPrompt = prompts[0]!.prompt as Array<{ type: string; resource?: { text?: string }; text?: string }>;
+		const lastPrompt = prompts.at(-1)!.prompt as Array<{ type: string; resource?: { text?: string }; text?: string }>;
+		expect(lastPrompt).toContainEqual({ type: "text", text: "ACTIVE_REQUEST" });
+		expect(lastPrompt).toContainEqual(image);
+		const firstReconstruction = firstPrompt[0]!.resource!.text!;
+		expect(firstReconstruction).toContain("BASE_RULE");
+		expect(firstReconstruction).toContain("NEW_RULE");
+		expect(firstReconstruction).toContain("UPDATED_RULE");
+		expect(firstReconstruction).not.toContain("OLD_RULE");
+		expect(firstReconstruction).toContain("[tool call read id=external-call]");
+		const fullReconstruction = prompts
+			.flatMap((sent) => (sent.prompt as Array<{ resource?: { text?: string } }>).map((block) => block.resource?.text ?? ""))
+			.join("\n");
+		expect(fullReconstruction).not.toContain("[truncated older context]");
+		expect(fullReconstruction).toContain("## Tool result (read id=external-call) [part 1/4]");
+		expect(fullReconstruction).toContain("RESULT_TAIL");
 	});
 });
 

@@ -305,6 +305,25 @@ for await (const line of rl) {
 			send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
 			continue;
 		}
+		if (text.includes("[Pi context replay part ")) {
+			if (scenario === "warmup-hang") {
+				hangingPromptId = id;
+				continue;
+			}
+			if (scenario === "warmup-error-once") {
+				const sessionNewCount = process.env.FAKE_AGENT_LOG_FILE
+					? fs.readFileSync(process.env.FAKE_AGENT_LOG_FILE, "utf8").split("\n").filter((l) => l.includes('"session/new"')).length
+					: 1;
+				if (sessionNewCount < 2) {
+					reply(params.sessionId, id, "Internal error encountered.");
+					continue;
+				}
+			}
+			if (scenario === "warmup-tool-attempt" && mcpServer) {
+				void invokeMcpTool(mcpServer, "disallowed during warmup").then((res) => reply(params.sessionId, id, res));
+				continue;
+			}
+		}
 		if (text.includes("poisoned turn")) {
 			const sessionNewCount = process.env.FAKE_AGENT_LOG_FILE
 				? fs.readFileSync(process.env.FAKE_AGENT_LOG_FILE, "utf8").split("\n").filter((l) => l.includes('"session/new"')).length
