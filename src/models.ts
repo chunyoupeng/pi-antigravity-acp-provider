@@ -27,7 +27,7 @@ export const MCP_MAX_OUTPUT_BYTES = 1024 * 1024;
 export const MAX_TEXT_RESULT_BYTES = 46 * 1024;
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
-const EFFORTS = ["low", "medium", "high"] as const;
+const EFFORTS = ["low", "medium", "high", "xhigh"] as const;
 type Effort = (typeof EFFORTS)[number];
 type Variants = Partial<Record<Effort, string>>;
 
@@ -38,10 +38,21 @@ export const FALLBACK_MODELS: readonly Model<typeof API_ID>[] = [
 		medium: "gemini-3.8-flash-medium",
 		high: "gemini-3.8-flash-high",
 	}),
+	reasoningModel("gemini-4-carbon", "Gemini 4 Carbon", {
+		low: "gemini-4-carbon-low",
+		medium: "gemini-4-carbon-medium",
+		high: "gemini-4-carbon-high",
+	}),
 	reasoningModel("gemini-4-argon", "Gemini 4 Argon", {
 		low: "gemini-4-argon-low",
 		medium: "gemini-4-argon-medium",
 		high: "gemini-4-argon-high",
+	}),
+	reasoningModel("gemini-4-hydrogen", "Gemini 4 Hydrogen", {
+		low: "gemini-4-hydrogen-low",
+		medium: "gemini-4-hydrogen-medium",
+		high: "gemini-4-hydrogen-high",
+		xhigh: "gemini-4-hydrogen-xhigh",
 	}),
 	reasoningModel("gemini-3.7-flash", "Gemini 3.7 Flash", {
 		low: "gemini-3.7-flash-low",
@@ -110,13 +121,13 @@ export function projectModels(models: readonly AcpModelInfo[]): Model<typeof API
 	return projected;
 }
 
-export type ModelEffort = "low" | "medium" | "high";
+export type ModelEffort = (typeof EFFORTS)[number];
 
 /** Antigravity advertises effort-qualified ids (`gemini-3.8-flash-high`) while the
  * server's `model` config option takes only the base id and keeps the tier on a
  * selector of its own, so a qualified id has to be split before it is sent. */
 export function splitEffortSuffix(modelId: string): { base: string; effort: ModelEffort } | undefined {
-	const match = /^(.*)-(low|medium|high)$/u.exec(modelId);
+	const match = /^(.*)-(low|medium|high|xhigh)$/u.exec(modelId);
 	if (!match?.[1]) return undefined;
 	return { base: match[1], effort: match[2] as ModelEffort };
 }
@@ -147,15 +158,19 @@ function resolveEffort(model: Model<typeof API_ID>, reasoning: ThinkingLevel | u
 	const preferred: Effort =
 		reasoning === "minimal" || reasoning === "low"
 			? "low"
-			: reasoning === "high" || reasoning === "xhigh" || reasoning === "max"
-				? "high"
-				: "medium";
+			: reasoning === "xhigh" || reasoning === "max"
+				? "xhigh"
+				: reasoning === "high"
+					? "high"
+					: "medium";
 	const order: Effort[] =
 		preferred === "low"
-			? ["low", "medium", "high"]
-			: preferred === "high"
-				? ["high", "medium", "low"]
-				: ["medium", "high", "low"];
+			? ["low", "medium", "high", "xhigh"]
+			: preferred === "xhigh"
+				? ["xhigh", "high", "medium", "low"]
+				: preferred === "high"
+					? ["high", "medium", "xhigh", "low"]
+					: ["medium", "high", "low", "xhigh"];
 	return order.find((effort) => typeof map[effort] === "string" && map[effort] !== "");
 }
 
@@ -170,7 +185,7 @@ function reasoningModel(
 		low: variants.low ?? null,
 		medium: variants.medium ?? null,
 		high: variants.high ?? null,
-		xhigh: null,
+		xhigh: variants.xhigh ?? null,
 		max: null,
 	};
 	return baseModel(id, name, true, thinkingLevelMap);
@@ -210,10 +225,11 @@ function baseModel(
 	};
 }
 
-function effortFromName(name: string): { baseName: string; effort: Effort } | undefined {
-	const match = name.trim().match(/^(.+?)\s*\((low|medium|high)\)$/iu);
+export function effortFromName(name: string): { baseName: string; effort: Effort } | undefined {
+	const match = name.trim().match(/^(.+?)\s*\((low|medium|high|xhigh|extra(?:\s+high)?)\)$/iu);
 	if (!match?.[1] || !match[2]) return undefined;
-	return { baseName: match[1].trim(), effort: match[2].toLowerCase() as Effort };
+	const raw = match[2].toLowerCase();
+	return { baseName: match[1].trim(), effort: raw.startsWith("extra") ? "xhigh" : (raw as Effort) };
 }
 
 function effortFromId(id: string): { baseName: string; effort: Effort } | undefined {

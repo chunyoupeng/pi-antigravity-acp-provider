@@ -41,9 +41,10 @@ export interface TranscriptContextUsage {
 
 /** Context fill as Antigravity limits it: the larger of the real prompt size
  * and the harness's own count, plus the matched step's real token breakdown.
- * `usage_update.used` counts cached tokens twice (input + 2 × cacheRead +
- * output, verified 2026-10-17, server 1.4.0); the transcript step that
- * produced it gives the real size. An unexplained value stays as reported,
+ * Servers before 1.5.0 counted cached tokens twice in `usage_update.used`
+ * (input + 2 × cacheRead + output), while 1.5.0+ reports the true sum
+ * (input + cacheRead + output); matching either recovers the step's real
+ * breakdown without retry stalls. An unexplained value stays as reported,
  * which at worst makes Pi compact early, never late. */
 export async function contextUsageInUse(
 	sessionId: string,
@@ -64,9 +65,10 @@ export async function contextUsageInUse(
 		}
 		for (let index = scan.recent.length - 1; index >= 0; index--) {
 			const step = scan.recent[index]!;
-			if (step.input + 2 * step.cacheRead + step.output !== used) continue;
+			const actual = step.input + step.cacheRead + step.output;
+			if (actual !== used && actual + step.cacheRead !== used) continue;
 			const contextTokens = Math.max(
-				step.input + step.cacheRead + step.output,
+				actual,
 				Math.ceil(scan.bytes / HARNESS_BYTES_PER_TOKEN),
 			);
 			return {

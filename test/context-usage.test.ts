@@ -326,6 +326,27 @@ describe("usageFromPrompt", () => {
 		expect(withContextUsage(cumulative, undefined)).toBe(cumulative);
 	});
 
+	it("does not subtract cacheRead twice on 1.5.0 net inputTokens", () => {
+		const usage = usageFromPrompt({
+			stopReason: "end_turn",
+			usage: {
+				inputTokens: 3_212,
+				outputTokens: 709,
+				cachedReadTokens: 151_801,
+				cachedWriteTokens: 0,
+				thoughtTokens: 300,
+				totalTokens: 155_722,
+			},
+		});
+		expect(usage).toMatchObject({
+			input: 3_212,
+			output: 709,
+			cacheRead: 151_801,
+			reasoning: 300,
+			totalTokens: 155_722,
+		});
+	});
+
 	it("rejects malformed counts to zero", () => {
 		const usage = usageFromPrompt({
 			stopReason: "end_turn",

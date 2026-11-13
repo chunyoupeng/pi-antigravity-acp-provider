@@ -6,7 +6,7 @@ import type {
 } from "@agentclientprotocol/sdk";
 import { z } from "zod";
 
-import { splitEffortSuffix } from "../models.js";
+import { effortFromName, splitEffortSuffix } from "../models.js";
 import { AntigravityAcpError } from "./errors.js";
 
 /** Antigravity's pre-config-option model metadata remains on older ACP v1 servers. */
@@ -92,8 +92,11 @@ export function sessionModels(state: SessionState): { currentModelId: string; av
 				qualified(selector.currentValue) || !thoughtSelector.currentValue
 					? selector.currentValue
 					: `${selector.currentValue}-${thoughtSelector.currentValue}`;
-			// Live selectors are authoritative; retain legacy labels only for the
-			// same complete, duplicate-free inventory.
+			// Live selectors only expose thoughtOptions for the currently selected
+			// family, whereas other families in `state.models` may offer extra or
+			// fewer tiers (e.g. Hydrogen's `xhigh`, 3.1 Pro's `[low, high]`). Keep
+			// the legacy per-variant list whenever it is duplicate-free, covers
+			// every live model option, and agrees with the active family's tiers.
 			const synthesized = modelOptions.flatMap((modelOpt) =>
 				qualified(modelOpt.value)
 					? [{ modelId: modelOpt.value, name: modelOpt.name }]
@@ -102,14 +105,42 @@ export function sessionModels(state: SessionState): { currentModelId: string; av
 							name: `${modelOpt.name} (${thoughtOpt.name})`,
 						})),
 			);
-			const synthesizedIds = new Set(synthesized.map((m) => m.modelId));
 
 			const legacy = state.models?.availableModels;
+			const exactOptions = new Set(modelOptions.filter((opt) => qualified(opt.value)).map((opt) => opt.value));
+			const familyOptions = modelOptions.filter((opt) => !qualified(opt.value));
+			const familyIds = new Set(familyOptions.map((opt) => opt.value));
+			const familyByName = new Map(familyOptions.map((opt) => [opt.name.trim().toLowerCase(), opt.value]));
+			const legacyFamilyOf = (candidate: AcpModelInfo): string | undefined => {
+				const split = splitEffortSuffix(candidate.modelId);
+				if (split && familyIds.has(split.base)) return split.base;
+				for (const opt of thoughtOptions) {
+					if (opt.value.length > 0 && candidate.modelId.endsWith(`-${opt.value}`)) {
+						const base = candidate.modelId.slice(0, -(opt.value.length + 1));
+						if (familyIds.has(base)) return base;
+					}
+				}
+				const named = effortFromName(candidate.name);
+				return named ? familyByName.get(named.baseName.toLowerCase()) : undefined;
+			};
+			const legacyIds = new Set(legacy?.map((model) => model.modelId));
+			const coveredFamilies = new Set<string>();
 			const isLegacyCompatible =
 				legacy !== undefined &&
-				legacy.length === synthesizedIds.size &&
-				new Set(legacy.map((model) => model.modelId)).size === synthesizedIds.size &&
-				legacy.every((m) => synthesizedIds.has(m.modelId));
+				legacy.length > 0 &&
+				legacyIds.size === legacy.length &&
+				legacy.every((m) => {
+					if (exactOptions.has(m.modelId)) return true;
+					const fam = legacyFamilyOf(m);
+					if (!fam) return false;
+					coveredFamilies.add(fam);
+					return true;
+				}) &&
+				[...exactOptions].every((id) => legacyIds.has(id)) &&
+				[...familyIds].every((id) => coveredFamilies.has(id)) &&
+				(!familyIds.has(selector.currentValue) ||
+					thoughtOptions.every((opt) => legacyIds.has(`${selector.currentValue}-${opt.value}`)) ||
+					legacy.filter((m) => legacyFamilyOf(m) === selector.currentValue).length === thoughtOptions.length);
 
 			return {
 				currentModelId,

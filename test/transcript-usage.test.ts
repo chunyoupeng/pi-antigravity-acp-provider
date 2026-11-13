@@ -43,6 +43,19 @@ describe("contextTokensInUse", () => {
 		await expect(contextTokensInUse(sessionId, 48192, profile, [])).resolves.toBe(48192);
 	});
 
+	it("matches 1.5.0 non-doubled usage_update counts without retry stalls", async () => {
+		const profile = profileWith([
+			JSON.stringify({ step_index: 0, type: "USER_INPUT", content: "hi" }),
+			planner(1, 3212, 151801, 709),
+		]);
+		await expect(contextUsageInUse(sessionId, 3212 + 151801 + 709, profile, [])).resolves.toEqual({
+			contextTokens: 155722,
+			input: 3212,
+			cacheRead: 151801,
+			output: 709,
+		});
+	});
+
 	it("matches an earlier step when a later one is already written", async () => {
 		const profile = profileWith([planner(1, 2988, 11414, 277), planner(3, 8257, 14490, 256)]);
 		await expect(contextTokensInUse(sessionId, 2988 + 2 * 11414 + 277, profile, [])).resolves.toBe(2988 + 11414 + 277);

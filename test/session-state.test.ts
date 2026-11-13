@@ -134,6 +134,49 @@ describe("ACP session compatibility", () => {
 		expect(sessionModels(state)?.availableModels.map((model) => model.modelId)).toEqual(["gemini-a-off", "gemini-a-low", "gemini-a-medium", "gemini-a-high"]);
 	});
 
+	it("preserves per-family extra tiers like Hydrogen xhigh when active family only offers low/medium/high", () => {
+		const state = decodeSessionState({
+			models: {
+				currentModelId: "gemini-4-carbon-medium",
+				availableModels: [
+					{ modelId: "gemini-4-carbon-medium", name: "Gemini 4 Carbon (Medium)" },
+					{ modelId: "gemini-4-carbon-high", name: "Gemini 4 Carbon (High)" },
+					{ modelId: "gemini-4-carbon-low", name: "Gemini 4 Carbon (Low)" },
+					{ modelId: "gemini-4-hydrogen-high", name: "Gemini 4 Hydrogen (High)" },
+					{ modelId: "gemini-4-hydrogen-xhigh", name: "Gemini 4 Hydrogen (XHigh)" },
+					{ modelId: "gemini-4-hydrogen-medium", name: "Gemini 4 Hydrogen (Medium)" },
+					{ modelId: "gemini-4-hydrogen-low", name: "Gemini 4 Hydrogen (Low)" },
+				],
+			},
+			configOptions: [
+				{
+					id: "model",
+					name: "Model",
+					category: "model",
+					type: "select",
+					currentValue: "gemini-4-carbon",
+					options: [
+						{ value: "gemini-4-carbon", name: "Gemini 4 Carbon" },
+						{ value: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen" },
+					],
+				},
+				{
+					id: "thinking_level",
+					name: "Thinking Level",
+					category: "thought_level",
+					type: "select",
+					currentValue: "medium",
+					options: [
+						{ value: "low", name: "Low" },
+						{ value: "medium", name: "Medium" },
+						{ value: "high", name: "High" },
+					],
+				},
+			],
+		});
+		expect(sessionModels(state)?.availableModels.map((m) => m.modelId)).toContain("gemini-4-hydrogen-xhigh");
+	});
+
 	it("retains legacy labels only for a complete compatible inventory", () => {
 		const state = splitState();
 		const legacy = sessionModels(state)!.availableModels.map((model) => ({ ...model, name: `Legacy ${model.name}` })).reverse();

@@ -9,7 +9,7 @@ describe("projectModels", () => {
 		expect(FALLBACK_MODELS.some((model) => model.id === "gemini-4-argon")).toBe(true);
 	});
 
-	it.each(["low", "medium", "high"])("splits a known %s suffix without truncating the base", (effort) => {
+	it.each(["low", "medium", "high", "xhigh"])("splits a known %s suffix without truncating the base", (effort) => {
 		expect(splitEffortSuffix(`gemini-hyphenated-base-${effort}`)).toEqual({ base: "gemini-hyphenated-base", effort });
 	});
 
@@ -62,6 +62,24 @@ describe("projectModels", () => {
 			expect(resolveAcpModelId(models[0]!, level === "off" ? undefined : level)).toBe(id);
 		}
 		expect(resolveAcpModelId(models[0]!, undefined)).toBe(id);
+	});
+
+	it("projects xhigh variants such as Gemini 4 Hydrogen (XHigh) and clamps when absent", () => {
+		const models = projectModels([
+			{ modelId: "gemini-4-hydrogen-high", name: "Gemini 4 Hydrogen (High)" },
+			{ modelId: "gemini-4-hydrogen-xhigh", name: "Gemini 4 Hydrogen (XHigh)" },
+			{ modelId: "gemini-4-hydrogen-medium", name: "Gemini 4 Hydrogen (Medium)" },
+			{ modelId: "gemini-4-hydrogen-low", name: "Gemini 4 Hydrogen (Low)" },
+			{ modelId: "gemini-4-carbon-medium", name: "Gemini 4 Carbon (Medium)" },
+			{ modelId: "gemini-4-carbon-high", name: "Gemini 4 Carbon (High)" },
+		]);
+		const hydrogen = models.find((model) => model.id === "gemini-4-hydrogen")!;
+		const carbon = models.find((model) => model.id === "gemini-4-carbon")!;
+		expect(hydrogen.thinkingLevelMap?.xhigh).toBe("gemini-4-hydrogen-xhigh");
+		expect(resolveAcpModelId(hydrogen, "xhigh")).toBe("gemini-4-hydrogen-xhigh");
+		expect(resolveAcpModelId(hydrogen, "max")).toBe("gemini-4-hydrogen-xhigh");
+		expect(carbon.thinkingLevelMap?.xhigh).toBeNull();
+		expect(resolveAcpModelId(carbon, "xhigh")).toBe("gemini-4-carbon-high");
 	});
 
 	it("exposes additional Argon tiers only when the server advertises them", () => {
