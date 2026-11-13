@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { FALLBACK_MODELS, MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, projectModels, resolveAcpModelId, splitEffortSuffix } from "../src/models.js";
-import { createAntigravityProvider } from "../src/provider.js";
+import { createAntigravityProvider, MODEL_CATALOG_SCHEMA_TAG } from "../src/provider.js";
 
 describe("projectModels", () => {
 	it("keeps Flash as the conservative offline default while allowing explicit Argon selection", () => {
@@ -152,6 +152,7 @@ describe("projectModels", () => {
 			});
 			expect(persistedModels).toMatchObject({
 				models: [expect.objectContaining({ id: "gemini-4-argon", provider: "antigravity-acp" })],
+				etag: MODEL_CATALOG_SCHEMA_TAG,
 			});
 
 			let discoverCalls = 0;
@@ -167,7 +168,7 @@ describe("projectModels", () => {
 				allowNetwork: true,
 				signal: new AbortController().signal,
 				credential: { type: "oauth", refresh: "r", access: "a", expires: 999999 },
-				stored: { models: [storedModel], checkedAt: Date.now() },
+				stored: { models: [storedModel], checkedAt: Date.now(), etag: MODEL_CATALOG_SCHEMA_TAG },
 				publish: async ({ update }) => {
 					update?.();
 					return true;
@@ -175,6 +176,32 @@ describe("projectModels", () => {
 			});
 			expect(discoverCalls).toBe(0);
 			expect(prewarmCalls).toBe(1);
+
+			// Stale schema tag or force=true bypasses the TTL shortcut.
+			await provider.refreshModels?.({
+				allowNetwork: true,
+				signal: new AbortController().signal,
+				credential: { type: "oauth", refresh: "r", access: "a", expires: 999999 },
+				stored: { models: [storedModel], checkedAt: Date.now() },
+				publish: async ({ update }) => {
+					update?.();
+					return true;
+				},
+			});
+			expect(discoverCalls).toBe(1);
+
+			await provider.refreshModels?.({
+				allowNetwork: true,
+				force: true,
+				signal: new AbortController().signal,
+				credential: { type: "oauth", refresh: "r", access: "a", expires: 999999 },
+				stored: { models: [storedModel], checkedAt: Date.now(), etag: MODEL_CATALOG_SCHEMA_TAG },
+				publish: async ({ update }) => {
+					update?.();
+					return true;
+				},
+			});
+			expect(discoverCalls).toBe(2);
 		} finally {
 			await runtime.close();
 		}
