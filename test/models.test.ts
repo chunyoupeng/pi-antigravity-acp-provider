@@ -4,8 +4,9 @@ import { FALLBACK_MODELS, MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, projectModels, r
 import { createAntigravityProvider, MODEL_CATALOG_SCHEMA_TAG } from "../src/provider.js";
 
 describe("projectModels", () => {
-	it("keeps Flash as the conservative offline default while allowing explicit Argon selection", () => {
+	it("keeps Flash as the conservative offline default while allowing explicit Carbon and Argon selection", () => {
 		expect(FALLBACK_MODELS[0]?.id).toBe("gemini-3.8-flash");
+		expect(FALLBACK_MODELS.some((model) => model.id === "gemini-4-carbon")).toBe(true);
 		expect(FALLBACK_MODELS.some((model) => model.id === "gemini-4-argon")).toBe(true);
 	});
 
