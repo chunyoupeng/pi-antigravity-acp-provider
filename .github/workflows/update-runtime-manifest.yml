@@ -11,8 +11,6 @@ on:
         description: "Also merge the whitespace-only publication check through normal protection"
         type: boolean
         default: false
-  schedule:
-    - cron: "17 6 * * *"
 
 permissions:
   contents: write
