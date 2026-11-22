@@ -53,6 +53,20 @@ async function listenServer<T extends http.Server | https.Server | net.Server>(s
 	return { server, port: address.port };
 }
 
+function createSelfSignedCert(): { keyPath: string; certPath: string } {
+	const certDir = fs.mkdtempSync(path.join(os.tmpdir(), "ccpa-relay-tls-"));
+	tempDirs.push(certDir);
+	const keyPath = path.join(certDir, "key.pem");
+	const certPath = path.join(certDir, "cert.pem");
+	execFileSync(
+		"openssl",
+		["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", keyPath, "-out", certPath, "-days", "1",
+			"-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost"],
+		{ stdio: "ignore" },
+	);
+	return { keyPath, certPath };
+}
+
 describe("CCPA Keep-Alive and Retry Relay", () => {
 	it("reuses Keep-Alive for non-streaming calls but uses fresh connections for SSE streams", async () => {
 		let connectionCount = 0;
@@ -160,6 +174,77 @@ describe("CCPA Keep-Alive and Retry Relay", () => {
 		expect(response.status).toBe(200);
 		await expect(response.text()).rejects.toThrow();
 		expect(logs.some((line) => line.includes("failed network error (Upstream stream timed out after 60ms without data)"))).toBe(true);
+	});
+
+	it("cuts a stalled TLS handshake short and retries on a fresh connection", async () => {
+		const { keyPath, certPath } = createSelfSignedCert();
+		const logs: string[] = [];
+		const httpsUpstream = https.createServer({ key: fs.readFileSync(keyPath), cert: fs.readFileSync(certPath) }, (_req, res) => {
+			res.writeHead(200, { "content-type": "text/event-stream" });
+			res.end('data: {"response":{"recovered":true}}\n\n');
+		});
+		let connections = 0;
+		const frontSockets: net.Socket[] = [];
+		const front = net.createServer((socket) => {
+			connections += 1;
+			frontSockets.push(socket);
+			// First connection accepts TCP but never answers the TLS ClientHello.
+			if (connections === 1) return;
+			httpsUpstream.emit("connection", socket);
+		});
+		const { port } = await listenServer(front);
+
+		const relay = await startCcpaRelay({
+			upstreamUrl: `https://localhost:${port}`,
+			env: { SSL_CERT_FILE: certPath },
+			maxRetries: 2,
+			baseDelayMs: 5,
+			connectTimeoutMs: 100,
+			firstByteTimeoutMs: 10_000,
+			onLog: (msg) => logs.push(msg),
+		});
+		relays.push(relay);
+
+		const response = await fetch(`${relay.baseUrl}/v1internal:streamGenerateContent?alt=sse`, { method: "POST", body: "{}" });
+		expect(response.status).toBe(200);
+		expect(await response.text()).toContain('"recovered":true');
+		expect(connections).toBe(2);
+		expect(logs.some((line) => line.includes("connect/TLS handshake timed out after 100ms"))).toBe(true);
+		for (const socket of frontSockets) socket.destroy();
+	});
+
+	it("does not crash on a late socket error after the agent declines to pool a finished socket", async () => {
+		const upstream = http.createServer((_req, res) => {
+			res.writeHead(200, { "content-type": "text/event-stream" });
+			res.write('data: {"chunk":1}\n\n');
+			setTimeout(() => res.end('data: {"chunk":2}\n\n'), 5);
+		});
+		const { port } = await listenServer(upstream);
+		const sockets: net.Socket[] = [];
+		class RecordingAgent extends http.Agent {
+			override createConnection(...args: Parameters<http.Agent["createConnection"]>) {
+				const socket = super.createConnection(...args) as net.Socket;
+				sockets.push(socket);
+				return socket;
+			}
+			// Same path as an upstream "Connection: close": Node already detached its listener.
+			override keepSocketAlive() {
+				return false;
+			}
+		}
+		const relay = await startCcpaRelay({
+			upstreamUrl: `http://127.0.0.1:${port}`,
+			agent: new RecordingAgent({ keepAlive: true }),
+			onLog: () => undefined,
+		});
+		relays.push(relay);
+
+		const response = await fetch(`${relay.baseUrl}/v1internal:streamGenerateContent?alt=sse`, { method: "POST", body: "{}" });
+		expect(await response.text()).toContain('"chunk":2');
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(sockets).toHaveLength(1);
+		// Simulates a late TLS alert (e.g. "bad record mac") after Node detached its own listener.
+		expect(() => sockets[0]?.emit("error", new Error("ssl/tls alert bad record mac"))).not.toThrow();
 	});
 
 	it("retries transient HTTP 500/502/503/504 responses with exponential backoff before streaming", async () => {

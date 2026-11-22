@@ -142,6 +142,12 @@ for await (const line of rl) {
 		send({ jsonrpc: "2.0", id, result: {} });
 	} else if (method === "session/new") {
 		if (scenario === "session-timeout") continue;
+		if (scenario === "session-timeout-once") {
+			const sessionNewCount = process.env.FAKE_AGENT_LOG_FILE
+				? fs.readFileSync(process.env.FAKE_AGENT_LOG_FILE, "utf8").split("\n").filter((l) => l.includes('"session/new"')).length
+				: 1;
+			if (sessionNewCount < 2) continue;
+		}
 		if (scenario === "internal-error") {
 			send({
 				jsonrpc: "2.0",

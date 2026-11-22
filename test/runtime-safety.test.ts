@@ -580,3 +580,59 @@ describe("warm connection pool and idle binding hibernation", () => {
 		expect(canCompactBranch(sm.getBranch(), 1)).toBe(true);
 	});
 });
+
+describe("session/new stall recovery", () => {
+	function setupWithSessionNewTimeout(scenario: string) {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-runtime-session-new-")); roots.push(root);
+		const log = path.join(root, "calls.jsonl"); fs.writeFileSync(log, "");
+		const connections: AntigravityAcpConnection[] = [];
+		const runtime = new AntigravityRuntime((options) => {
+			const connection = new AntigravityAcpConnection({ ...options, command: process.execPath, sessionNewTimeoutMs: 150,
+				args: [fakeAgent, scenario], env: { ...process.env, FAKE_AGENT_LOG_FILE: log } });
+			connections.push(connection); return connection;
+		}, "yolo", undefined, undefined, "pi");
+		runtimes.push(runtime);
+		const sessionNews = () => fs.readFileSync(log, "utf8").split("\n").filter((line) => line.includes('"session/new"')).length;
+		return { runtime, connections, sessionNews };
+	}
+
+	it("respawns the process and retries when session/new stalls", async () => {
+		const { runtime, connections, sessionNews } = setupWithSessionNewTimeout("session-timeout-once");
+		const message = await turn(runtime, [user("hello")]);
+		expect(message.stopReason).toBe("stop");
+		expect(sessionNews()).toBe(2);
+		expect(connections[0]?.process.alive).toBe(false);
+	});
+
+	it("prewarm runs the first session/new in the background and retries a stalled one", async () => {
+		const { runtime, connections, sessionNews } = setupWithSessionNewTimeout("session-timeout-once");
+		await runtime.prewarm("test-key");
+		expect(sessionNews()).toBe(2);
+		expect(connections).toHaveLength(2);
+		expect(connections[0]?.process.alive).toBe(false);
+		const message = await turn(runtime, [user("hello")]);
+		expect(message.stopReason).toBe("stop");
+		// The turn reused the warm process; no extra spawn was needed.
+		expect(connections).toHaveLength(2);
+	});
+
+	it("keeps a spare warm process after a binding consumes one", async () => {
+		const { runtime, connections, sessionNews } = setupWithSessionNewTimeout("session-timeout-once");
+		runtime.setWarmReplenishment(true);
+		const message = await turn(runtime, [user("hello")]);
+		expect(message.stopReason).toBe("stop");
+		expect(connections).toHaveLength(2);
+		await vi.waitFor(() => expect(connections).toHaveLength(3), { timeout: 6_000 });
+		await vi.waitFor(() => expect(sessionNews()).toBe(3), { timeout: 6_000 });
+		expect(connections[2]?.process.alive).toBe(true);
+	}, 10_000);
+
+	it("gives up after bounded attempts when session/new keeps stalling", async () => {
+		const { runtime, connections, sessionNews } = setupWithSessionNewTimeout("session-timeout");
+		const message = await turn(runtime, [user("hello")]);
+		expect(message.stopReason).toBe("error");
+		expect(message.errorMessage).toContain("session/new timed out after 150ms");
+		expect(sessionNews()).toBe(3);
+		await vi.waitFor(() => expect(connections.every((connection) => !connection.process.alive)).toBe(true));
+	});
+});

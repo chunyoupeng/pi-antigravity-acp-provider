@@ -34,6 +34,20 @@ import {
 } from "./session-state.js";
 
 const DEFAULT_OPERATION_TIMEOUT_MS = 120_000;
+/**
+ * A healthy session/new (OAuth refresh + loadCodeAssist + harness start) finishes in under ~20s.
+ * Those first calls go straight to Google from the bundled server and bypass the CCPA relay, so a
+ * silently dropped connection there can only be recovered by giving up early and respawning.
+ */
+export const DEFAULT_SESSION_NEW_TIMEOUT_MS = 40_000;
+const SESSION_NEW_PHASE = "session/new";
+
+/** True for a session/new that exceeded its deadline (the connection has already been closed). */
+export function isSessionNewTimeout(error: unknown): boolean {
+	return error instanceof AntigravityAcpError &&
+		error.code === "timeout" &&
+		error.message.startsWith(`Antigravity ACP ${SESSION_NEW_PHASE} timed out`);
+}
 
 export interface PromptStallInfo {
 	busy: boolean;
@@ -61,6 +75,8 @@ export interface AntigravityConnectionOptions extends AntigravityProcessOptions 
 	clientFs?: boolean;
 	initializeTimeoutMs?: number;
 	operationTimeoutMs?: number;
+	/** Deadline for session/new (default min(operationTimeoutMs, 40 seconds)). */
+	sessionNewTimeoutMs?: number;
 	/** No inbound progress while the model is idle (default 10 minutes). */
 	promptIdleTimeoutMs?: number;
 	/** No inbound progress while a tool/permission is outstanding (default 60 minutes). */
@@ -77,6 +93,7 @@ export class AntigravityAcpConnection {
 	readonly initialized: Promise<InitializeResponse>;
 	private readonly connection: ClientSideConnection;
 	private readonly operationTimeoutMs: number;
+	private readonly sessionNewTimeoutMs: number;
 	private readonly promptIdleTimeoutMs: number;
 	private readonly promptWorkIdleTimeoutMs: number;
 	private readonly promptStallWarnMs: number;
@@ -91,6 +108,8 @@ export class AntigravityAcpConnection {
 	constructor(options: AntigravityConnectionOptions) {
 		this.handlers = options.handlers ?? {};
 		this.operationTimeoutMs = options.operationTimeoutMs ?? DEFAULT_OPERATION_TIMEOUT_MS;
+		this.sessionNewTimeoutMs = options.sessionNewTimeoutMs ??
+			Math.min(this.operationTimeoutMs, DEFAULT_SESSION_NEW_TIMEOUT_MS);
 		this.promptIdleTimeoutMs = options.promptIdleTimeoutMs ?? 10 * 60_000;
 		this.promptWorkIdleTimeoutMs = options.promptWorkIdleTimeoutMs ?? 60 * 60_000;
 		this.promptStallWarnMs = options.promptStallWarnMs ?? 90_000;
@@ -227,8 +246,8 @@ export class AntigravityAcpConnection {
 					...(supportsAdditionalDirs && additionalDirectories?.length ? { additionalDirectories } : {}),
 					...(meta ? { _meta: meta } : {}),
 				}),
-				this.operationTimeoutMs,
-				"session/new",
+				this.sessionNewTimeoutMs,
+				SESSION_NEW_PHASE,
 			),
 			signal,
 		);

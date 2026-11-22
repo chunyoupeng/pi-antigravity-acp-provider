@@ -22,6 +22,7 @@ export const CCPA_CACHE_FILE_ENV = "PI_ANTIGRAVITY_CCPA_CACHE_FILE";
 export const CCPA_CACHE_TTL_MS_ENV = "PI_ANTIGRAVITY_CCPA_CACHE_TTL_MS";
 export const CCPA_FIRST_BYTE_TIMEOUT_MS_ENV = "PI_ANTIGRAVITY_CCPA_FIRST_BYTE_TIMEOUT_MS";
 export const CCPA_STREAM_IDLE_TIMEOUT_MS_ENV = "PI_ANTIGRAVITY_CCPA_STREAM_IDLE_TIMEOUT_MS";
+export const CCPA_CONNECT_TIMEOUT_MS_ENV = "PI_ANTIGRAVITY_CCPA_CONNECT_TIMEOUT_MS";
 
 export const DEFAULT_CCPA_UPSTREAM_URL = "https://daily-cloudcode-pa.googleapis.com";
 export const DEFAULT_MAX_RETRIES = 4;
@@ -29,6 +30,8 @@ export const DEFAULT_RETRY_BASE_MS = 1_000;
 export const DEFAULT_CCPA_CACHE_TTL_MS = 30 * 60_000;
 export const DEFAULT_FIRST_BYTE_TIMEOUT_MS = 210_000;
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
+/** Bounds TCP connect + TLS handshake of a fresh upstream socket, well inside the 180s prompt watchdog. */
+export const DEFAULT_CONNECT_TIMEOUT_MS = 20_000;
 
 const RETRYABLE_STATUS_CODES = new Set([500, 502, 503, 504]);
 const SUPPORTED_PROXY_PROTOCOLS = new Set(["http:", "https:", "socks5:", "socks5h:", "socks:"]);
@@ -50,6 +53,22 @@ const MAX_CACHEABLE_BODY_BYTES = 512 * 1024;
 const SYSTEM_PROXY_CACHE_TTL_MS = 10_000;
 
 let cachedSystemProxy = { timestamp: 0, url: undefined };
+
+const guardedSockets = new WeakSet();
+
+/**
+ * When a keep-alive request finishes, Node's HTTP client detaches its socketErrorListener and
+ * expects the Agent to attach freeSocketErrorListener on pooling. If the Agent declines to pool the
+ * socket instead (Connection: close, free pool full, ...), the socket is left with no 'error'
+ * listener, and a late TLS alert during teardown (e.g. "bad record mac") becomes an unhandled
+ * 'error' event that kills the whole relay process. In-flight errors still reach the request
+ * through Node's own listener; this one only keeps late errors from crashing.
+ */
+function guardLateSocketErrors(socket) {
+	if (guardedSockets.has(socket)) return;
+	guardedSockets.add(socket);
+	socket.on("error", () => socket.destroy());
+}
 
 export function shouldStartCcpaRelay(env = process.env) {
 	if (env[CCPA_BASE_URL_ENV]?.trim()) return false;
@@ -248,6 +267,9 @@ export class ProxiedHttpsKeepAliveAgent extends https.Agent {
 				servername: targetHost,
 				...(this.options.ca ? { ca: this.options.ca } : {}),
 			});
+			// The tunnel's listeners were removed above; keep a late error on the raw socket
+			// from becoming an unhandled 'error' event and just tear the TLS layer down.
+			proxySocket.on("error", () => tlsSocket.destroy());
 			oncreate(null, tlsSocket);
 		};
 
@@ -607,6 +629,11 @@ export async function startCcpaRelay(options = {}) {
 		(env[CCPA_STREAM_IDLE_TIMEOUT_MS_ENV] !== undefined
 			? Math.max(0, Number(env[CCPA_STREAM_IDLE_TIMEOUT_MS_ENV]) || 0)
 			: DEFAULT_STREAM_IDLE_TIMEOUT_MS);
+	const connectTimeoutMs =
+		options.connectTimeoutMs ??
+		(env[CCPA_CONNECT_TIMEOUT_MS_ENV] !== undefined
+			? Math.max(0, Number(env[CCPA_CONNECT_TIMEOUT_MS_ENV]) || 0)
+			: DEFAULT_CONNECT_TIMEOUT_MS);
 	const log = options.onLog ?? ((message) => process.stderr.write(`${message}\n`));
 	const heartbeatMs = options.heartbeatMs ?? INFERENCE_HEARTBEAT_MS;
 	const ca = options.tlsOptions?.ca ?? resolveCustomCa(env);
@@ -827,6 +854,7 @@ export async function startCcpaRelay(options = {}) {
 				isStream,
 				firstByteTimeoutMs,
 				streamIdleTimeoutMs,
+				connectTimeoutMs,
 				clientRes,
 				isClientClosed: () => clientClosed,
 				onStreamCommitted: isStream ? trackStream : undefined,
@@ -988,6 +1016,7 @@ function attemptUpstreamRequest({
 	isStream,
 	firstByteTimeoutMs,
 	streamIdleTimeoutMs,
+	connectTimeoutMs,
 	clientRes,
 	isClientClosed,
 	onSuccessBody,
@@ -1000,6 +1029,12 @@ function attemptUpstreamRequest({
 		let stream;
 		let firstByteTimer;
 		let streamIdleTimer;
+		let connectTimer;
+		const clearConnectTimer = () => {
+			if (!connectTimer) return;
+			clearTimeout(connectTimer);
+			connectTimer = undefined;
+		};
 		const clearFirstByteTimer = () => {
 			if (!firstByteTimer) return;
 			clearTimeout(firstByteTimer);
@@ -1017,6 +1052,7 @@ function attemptUpstreamRequest({
 		const finish = (result) => {
 			if (settled) return;
 			settled = true;
+			clearConnectTimer();
 			clearFirstByteTimer();
 			clearStreamIdleTimer();
 			stream?.end();
@@ -1195,13 +1231,32 @@ function attemptUpstreamRequest({
 		onCancelRegister(abortUpstream, true);
 
 		upReq.once("socket", (socket) => {
+			guardLateSocketErrors(socket);
 			socket.setKeepAlive?.(true, 30_000);
-			if (!onStreamCommitted) return;
-			if (socket.connecting || socket.secureConnecting) {
-				socket.once("encrypted" in socket ? "secureConnect" : "connect", startStream);
+			if (!(socket.connecting || socket.secureConnecting)) {
+				startStream();
 				return;
 			}
-			startStream();
+			// A fresh socket emits no heartbeat until its handshake completes, so a handshake that
+			// stalls silently must be cut short here and retried rather than left for the prompt
+			// watchdog (180s) to kill the whole ACP process before firstByteTimeoutMs ever fires.
+			if (connectTimeoutMs > 0) {
+				connectTimer = setTimeout(() => {
+					connectTimer = undefined;
+					if (settled) return;
+					const timeoutErr = Object.assign(
+						new Error(`Upstream connect/TLS handshake timed out after ${connectTimeoutMs}ms`),
+						{ code: "ETIMEDOUT" },
+					);
+					finish({ kind: "network_error", error: timeoutErr, reusedSocket: false });
+					upReq.destroy();
+				}, connectTimeoutMs);
+				connectTimer.unref?.();
+			}
+			socket.once("encrypted" in socket ? "secureConnect" : "connect", () => {
+				clearConnectTimer();
+				startStream();
+			});
 		});
 
 		upReq.once("error", (err) => {

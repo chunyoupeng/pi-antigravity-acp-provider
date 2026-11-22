@@ -33,10 +33,16 @@ import {
 import { clientFileRoots, readClientTextFile, writeClientTextFile } from "./acp/client-fs.js";
 import {
 	AntigravityAcpConnection,
+	isSessionNewTimeout,
 	type AntigravityConnectionOptions,
 	type PromptStallInfo,
 	type SessionMeta,
 } from "./acp/connection.js";
+
+/** session/new attempts per binding; each timed-out attempt respawns the Antigravity process. */
+const SESSION_NEW_ATTEMPTS = 3;
+/** Delay before spawning a spare warm process, so it does not compete with the turn that needed one. */
+const WARM_REPLENISH_DELAY_MS = 2_000;
 import { DecisionLog, type DecisionFields } from "./acp/decision-log.js";
 import { describeBackendSilence } from "./acp/backend-diagnostics.js";
 import { abortError, AntigravityAcpError, errorMessage } from "./acp/errors.js";
@@ -181,6 +187,8 @@ interface Binding {
 interface WarmConnection {
 	connection: AntigravityAcpConnection;
 	initialize: InitializeResponse;
+	/** Throwaway session that already ran the server's one-time OAuth refresh + loadCodeAssist. */
+	session: AcpNewSessionResponse | undefined;
 	apiKey: string | undefined;
 	clientFs: boolean;
 	cwd: string;
@@ -259,6 +267,8 @@ export class AntigravityRuntime {
 	private toolOwner: ToolOwner;
 	private warmConnection: WarmConnection | undefined;
 	private prewarmInFlight: PrewarmInFlight | undefined;
+	private warmReplenishment: boolean;
+	private replenishTimer: ReturnType<typeof setTimeout> | undefined;
 	private onIdleCompact?: (piSessionId: string, contextTokens: number) => void;
 
 	constructor(
@@ -274,6 +284,7 @@ export class AntigravityRuntime {
 		this.toolOwner = toolOwner;
 		this.connectionFactory = connectionFactory ?? ((options) => new AntigravityAcpConnection(options));
 		this.ensureAgent = connectionFactory === undefined;
+		this.warmReplenishment = this.ensureAgent;
 		this.permissionMode = permissionMode;
 		this.sessionStore = sessionStore ?? (this.ensureAgent ? new AcpSessionStore() : undefined);
 		this.decisions = decisionLog ?? (this.ensureAgent ? new DecisionLog() : undefined);
@@ -281,6 +292,12 @@ export class AntigravityRuntime {
 
 	setIdleCompactHandler(handler: (piSessionId: string, contextTokens: number) => void): void {
 		this.onIdleCompact = handler;
+	}
+
+	/** Keep a spare warm process after one is consumed or a session's process dies (on by default for the real agent). */
+	setWarmReplenishment(enabled: boolean): void {
+		this.warmReplenishment = enabled;
+		if (!enabled) this.clearReplenishTimer();
 	}
 
 	stream(model: AntigravityModel, context: Context, options: SimpleStreamOptions = {}): PiEventWriter {
@@ -316,7 +333,7 @@ export class AntigravityRuntime {
 		const warm = await this.acquireWarmConnection(apiKey, signal);
 		const epoch = this.bindingEpoch;
 		try {
-			const session = await warm.connection.newSession(warm.cwd, signal);
+			const session = warm.session ?? await warm.connection.newSession(warm.cwd, signal);
 			this.assertEpoch(epoch);
 			this.scheduleWarmIdleTimer(warm);
 			return sessionModels(session)?.availableModels ?? [];
@@ -570,6 +587,7 @@ export class AntigravityRuntime {
 
 	private async closeBindings(): Promise<void> {
 		this.bindingEpoch += 1;
+		this.clearReplenishTimer();
 		if (this.warmConnection) {
 			this.clearWarmIdleTimer(this.warmConnection);
 			this.warmConnection = undefined;
@@ -1035,12 +1053,44 @@ export class AntigravityRuntime {
 			this.clearBindingIdleTimer(resolved);
 			return resolved;
 		}
-		const created = this.createBinding(key, model, acpModelId, apiKey, writer, tools ?? [], signal).catch((error) => {
+		const created = this.createBindingWithRetry(key, model, acpModelId, apiKey, writer, tools ?? [], signal).catch((error) => {
 			if (this.bindings.get(key) === created) this.bindings.delete(key);
 			throw error;
 		});
 		this.bindings.set(key, created);
 		return created;
+	}
+
+	/**
+	 * The bundled server's first calls (OAuth refresh, loadCodeAssist) reach Google directly,
+	 * bypassing the CCPA relay, so a silently stalled connection there hangs session/new. A fresh
+	 * process almost always gets through, so retry on a new one instead of surfacing the stall.
+	 */
+	private async createBindingWithRetry(
+		key: string,
+		model: AntigravityModel,
+		acpModelId: string,
+		apiKey: string | undefined,
+		writer: PiEventWriter,
+		tools: NonNullable<Context["tools"]>,
+		signal?: AbortSignal,
+	): Promise<Binding> {
+		const epoch = this.bindingEpoch;
+		for (let attempt = 1; ; attempt += 1) {
+			try {
+				return await this.createBinding(key, model, acpModelId, apiKey, writer, tools, signal);
+			} catch (error) {
+				if (
+					attempt >= SESSION_NEW_ATTEMPTS ||
+					signal?.aborted ||
+					this.disposed ||
+					epoch !== this.bindingEpoch ||
+					!isSessionNewTimeout(error)
+				) {
+					throw error;
+				}
+			}
+		}
 	}
 
 	private async createBinding(
@@ -1216,6 +1266,9 @@ export class AntigravityRuntime {
 			this.persistBinding(createdBinding);
 			this.resolvedBindings.add(createdBinding);
 			void connection.process.exited.then((exit) => {
+				// Deliberate drops/shutdown remove the binding first; still being resolved here means
+				// the process died under it, and the next turn should not pay a cold start too.
+				const unexpected = this.resolvedBindings.has(createdBinding);
 				this.clearBindingIdleTimer(createdBinding);
 				this.decide(createdBinding, "exit", { code: exit.code ?? undefined, signal: exit.signal ?? undefined });
 				cancelPermission(createdBinding);
@@ -1226,7 +1279,9 @@ export class AntigravityRuntime {
 				if (current) void current.then((value) => {
 					if (value === createdBinding && this.bindings.get(key) === current) this.bindings.delete(key);
 				}).catch(() => undefined);
+				if (unexpected) this.scheduleWarmReplenish(apiKey);
 			}).catch(() => undefined);
+			this.scheduleWarmReplenish(apiKey);
 			return createdBinding;
 		} catch (error) {
 			await Promise.allSettled([connection.close(), bridge?.close() ?? Promise.resolve()]);
@@ -1509,35 +1564,55 @@ export class AntigravityRuntime {
 				.catch(() => undefined);
 		}
 		this.assertEpoch(epoch);
-		const connection = this.createConnection({ cwd, clientFs });
+		let connection = this.createConnection({ cwd, clientFs });
 		let promise!: Promise<WarmConnection>;
 		promise = (async (): Promise<WarmConnection> => {
 			try {
-				const initialize = await connection.initialize(signal);
-				this.assertEpoch(epoch);
-				await authenticateForCredential(connection, initialize, apiKey, signal);
-				this.assertEpoch(epoch);
-				const warm: WarmConnection = {
-					connection,
-					initialize,
-					apiKey,
-					clientFs,
-					cwd,
-					idleTimer: undefined,
-				};
-				this.warmConnection = warm;
-				void connection.process.exited
-					.then(() => {
-						if (this.warmConnection === warm) {
-							this.clearWarmIdleTimer(warm);
-							this.warmConnection = undefined;
+				for (let attempt = 1; ; attempt += 1) {
+					try {
+						const initialize = await connection.initialize(signal);
+						this.assertEpoch(epoch);
+						await authenticateForCredential(connection, initialize, apiKey, signal);
+						this.assertEpoch(epoch);
+						// The server runs its OAuth refresh and loadCodeAssist on the first session/new,
+						// straight to Google and outside the CCPA relay. Pay that here, off the turn's
+						// critical path, so a stalled attempt is retried before anyone waits on it.
+						const session = await connection.newSession(cwd, signal);
+						this.assertEpoch(epoch);
+						const warm: WarmConnection = {
+							connection,
+							initialize,
+							session,
+							apiKey,
+							clientFs,
+							cwd,
+							idleTimer: undefined,
+						};
+						this.warmConnection = warm;
+						const warmProcess = connection.process;
+						void warmProcess.exited
+							.then(() => {
+								if (this.warmConnection === warm) {
+									this.clearWarmIdleTimer(warm);
+									this.warmConnection = undefined;
+								}
+							})
+							.catch(() => undefined);
+						return warm;
+					} catch (error) {
+						await connection.close();
+						if (
+							attempt >= SESSION_NEW_ATTEMPTS ||
+							signal?.aborted ||
+							this.disposed ||
+							epoch !== this.bindingEpoch ||
+							!isSessionNewTimeout(error)
+						) {
+							throw error;
 						}
-					})
-					.catch(() => undefined);
-				return warm;
-			} catch (error) {
-				await connection.close();
-				throw error;
+						connection = this.createConnection({ cwd, clientFs });
+					}
+				}
 			} finally {
 				if (this.prewarmInFlight?.promise === promise) {
 					this.prewarmInFlight = undefined;
@@ -1600,6 +1675,24 @@ export class AntigravityRuntime {
 		if (!warm.idleTimer) return;
 		clearTimeout(warm.idleTimer);
 		warm.idleTimer = undefined;
+	}
+
+	/** Spawn a spare warm process shortly, unless one already exists or is on its way. */
+	private scheduleWarmReplenish(apiKey: string | undefined): void {
+		if (!this.warmReplenishment || this.disposed || this.replenishTimer) return;
+		const timer = setTimeout(() => {
+			this.replenishTimer = undefined;
+			if (!this.warmReplenishment || this.disposed || this.warmConnection || this.prewarmInFlight) return;
+			void this.prewarm(apiKey).catch(() => undefined);
+		}, WARM_REPLENISH_DELAY_MS);
+		timer.unref();
+		this.replenishTimer = timer;
+	}
+
+	private clearReplenishTimer(): void {
+		if (!this.replenishTimer) return;
+		clearTimeout(this.replenishTimer);
+		this.replenishTimer = undefined;
 	}
 
 	private scheduleBindingIdleTimer(binding: Binding): void {

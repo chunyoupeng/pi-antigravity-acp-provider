@@ -13,6 +13,7 @@ export const CCPA_CACHE_FILE_ENV: "PI_ANTIGRAVITY_CCPA_CACHE_FILE";
 export const CCPA_CACHE_TTL_MS_ENV: "PI_ANTIGRAVITY_CCPA_CACHE_TTL_MS";
 export const CCPA_FIRST_BYTE_TIMEOUT_MS_ENV: "PI_ANTIGRAVITY_CCPA_FIRST_BYTE_TIMEOUT_MS";
 export const CCPA_STREAM_IDLE_TIMEOUT_MS_ENV: "PI_ANTIGRAVITY_CCPA_STREAM_IDLE_TIMEOUT_MS";
+export const CCPA_CONNECT_TIMEOUT_MS_ENV: "PI_ANTIGRAVITY_CCPA_CONNECT_TIMEOUT_MS";
 
 export const DEFAULT_CCPA_UPSTREAM_URL: string;
 export const DEFAULT_MAX_RETRIES: number;
@@ -20,6 +21,7 @@ export const DEFAULT_RETRY_BASE_MS: number;
 export const DEFAULT_CCPA_CACHE_TTL_MS: number;
 export const DEFAULT_FIRST_BYTE_TIMEOUT_MS: number;
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS: number;
+export const DEFAULT_CONNECT_TIMEOUT_MS: number;
 
 export interface ResolveProxyOptions {
 	platform?: NodeJS.Platform;
@@ -59,6 +61,7 @@ export interface CcpaRelayOptions {
 	heartbeatMs?: number;
 	firstByteTimeoutMs?: number;
 	streamIdleTimeoutMs?: number;
+	connectTimeoutMs?: number;
 }
 
 export interface CcpaRelayHandle {
