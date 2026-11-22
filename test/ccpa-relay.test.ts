@@ -54,13 +54,18 @@ async function listenServer<T extends http.Server | https.Server | net.Server>(s
 }
 
 describe("CCPA Keep-Alive and Retry Relay", () => {
-	it("reuses a single Keep-Alive upstream connection across consecutive requests", async () => {
+	it("reuses Keep-Alive for non-streaming calls but uses fresh connections for SSE streams", async () => {
 		let connectionCount = 0;
 		let requestCount = 0;
 		const upstream = http.createServer((req, res) => {
 			requestCount += 1;
-			res.writeHead(200, { "content-type": "text/event-stream" });
-			res.end(`data: {"response":{"step":${requestCount},"url":${JSON.stringify(req.url)}}}\n\n`);
+			if (req.url?.includes("streamGenerateContent")) {
+				res.writeHead(200, { "content-type": "text/event-stream" });
+				res.end(`data: {"response":{"step":${requestCount},"url":${JSON.stringify(req.url)}}}\n\n`);
+				return;
+			}
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end(JSON.stringify({ step: requestCount, url: req.url }));
 		});
 		upstream.on("connection", () => {
 			connectionCount += 1;
@@ -74,6 +79,18 @@ describe("CCPA Keep-Alive and Retry Relay", () => {
 		relays.push(relay);
 
 		for (let step = 1; step <= 3; step += 1) {
+			const response = await fetch(`${relay.baseUrl}/v1internal:generateContent`, {
+				method: "POST",
+				headers: { "content-type": "application/json", authorization: "Bearer test-token" },
+				body: JSON.stringify({ project: "test-proj", model: "gemini-test", request: { step } }),
+			});
+			expect(response.status).toBe(200);
+			expect(await response.json()).toMatchObject({ step });
+		}
+		expect(requestCount).toBe(3);
+		expect(connectionCount).toBe(1);
+
+		for (let step = 4; step <= 6; step += 1) {
 			const response = await fetch(`${relay.baseUrl}/v1internal:streamGenerateContent?alt=sse`, {
 				method: "POST",
 				headers: { "content-type": "application/json", authorization: "Bearer test-token" },
@@ -83,9 +100,66 @@ describe("CCPA Keep-Alive and Retry Relay", () => {
 			const text = await response.text();
 			expect(text).toContain(`"step":${step}`);
 		}
+		expect(requestCount).toBe(6);
+		expect(connectionCount).toBe(4);
+	});
 
-		expect(requestCount).toBe(3);
-		expect(connectionCount).toBe(1);
+	it("retries transparently when an upstream request stalls before first byte", async () => {
+		const logs: string[] = [];
+		let attempts = 0;
+		const upstream = http.createServer((_req, res) => {
+			attempts += 1;
+			if (attempts === 1) {
+				// Intentionally hang before sending response headers/first byte.
+				return;
+			}
+			res.writeHead(200, { "content-type": "text/event-stream" });
+			res.end('data: {"response":{"recovered":true}}\n\n');
+		});
+		const { port } = await listenServer(upstream);
+
+		const relay = await startCcpaRelay({
+			upstreamUrl: `http://127.0.0.1:${port}`,
+			maxRetries: 2,
+			baseDelayMs: 5,
+			firstByteTimeoutMs: 60,
+			onLog: (msg) => logs.push(msg),
+		});
+		relays.push(relay);
+
+		const response = await fetch(`${relay.baseUrl}/v1internal:streamGenerateContent?alt=sse`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(response.status).toBe(200);
+		expect(await response.text()).toContain('"recovered":true');
+		expect(attempts).toBe(2);
+		expect(logs.some((line) => line.includes("timed out before first byte"))).toBe(true);
+	});
+
+	it("aborts a mid-stream stall after streamIdleTimeoutMs instead of hanging until downstream timeout", async () => {
+		const logs: string[] = [];
+		const upstream = http.createServer((_req, res) => {
+			res.writeHead(200, { "content-type": "text/event-stream" });
+			res.write('data: {"partial":1}\n\n');
+			// Intentionally stall mid-stream without ending the response.
+		});
+		const { port } = await listenServer(upstream);
+
+		const relay = await startCcpaRelay({
+			upstreamUrl: `http://127.0.0.1:${port}`,
+			streamIdleTimeoutMs: 60,
+			onLog: (msg) => logs.push(msg),
+		});
+		relays.push(relay);
+
+		const response = await fetch(`${relay.baseUrl}/v1internal:streamGenerateContent?alt=sse`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(response.status).toBe(200);
+		await expect(response.text()).rejects.toThrow();
+		expect(logs.some((line) => line.includes("failed network error (Upstream stream timed out after 60ms without data)"))).toBe(true);
 	});
 
 	it("retries transient HTTP 500/502/503/504 responses with exponential backoff before streaming", async () => {

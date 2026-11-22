@@ -21,9 +21,17 @@ export class BackendDiagnostics {
 			if (!this.oversized && line.length <= MAX_LINE_LENGTH) {
 				const heartbeat = HEARTBEAT.exec(line);
 				if (heartbeat) {
-					this.streamSeenAt = Date.now();
-					this.streamBytes = Number(heartbeat[1]);
-					this.lastError = undefined;
+					const bytes = Number(heartbeat[1]);
+					// Pre-first-byte waits legitimately stay at 0 bytes while the model thinks
+					// (bounded by relay firstByteTimeoutMs), whereas an unchanged non-zero byte
+					// count means a mid-stream stall and must not refresh streamSeenAt.
+					const progressed =
+						this.streamSeenAt === undefined || bytes === 0 || bytes !== this.streamBytes;
+					if (progressed) {
+						this.streamSeenAt = Date.now();
+						this.streamBytes = bytes;
+						this.lastError = undefined;
+					}
 				} else {
 					const error = classifyBackendError(line);
 					if (error) {

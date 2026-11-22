@@ -20,11 +20,15 @@ export const CCPA_MAX_RETRIES_ENV = "PI_ANTIGRAVITY_CCPA_MAX_RETRIES";
 export const CCPA_RETRY_BASE_MS_ENV = "PI_ANTIGRAVITY_CCPA_RETRY_BASE_MS";
 export const CCPA_CACHE_FILE_ENV = "PI_ANTIGRAVITY_CCPA_CACHE_FILE";
 export const CCPA_CACHE_TTL_MS_ENV = "PI_ANTIGRAVITY_CCPA_CACHE_TTL_MS";
+export const CCPA_FIRST_BYTE_TIMEOUT_MS_ENV = "PI_ANTIGRAVITY_CCPA_FIRST_BYTE_TIMEOUT_MS";
+export const CCPA_STREAM_IDLE_TIMEOUT_MS_ENV = "PI_ANTIGRAVITY_CCPA_STREAM_IDLE_TIMEOUT_MS";
 
 export const DEFAULT_CCPA_UPSTREAM_URL = "https://daily-cloudcode-pa.googleapis.com";
 export const DEFAULT_MAX_RETRIES = 4;
 export const DEFAULT_RETRY_BASE_MS = 1_000;
 export const DEFAULT_CCPA_CACHE_TTL_MS = 30 * 60_000;
+export const DEFAULT_FIRST_BYTE_TIMEOUT_MS = 210_000;
+export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
 
 const RETRYABLE_STATUS_CODES = new Set([500, 502, 503, 504]);
 const SUPPORTED_PROXY_PROTOCOLS = new Set(["http:", "https:", "socks5:", "socks5h:", "socks:"]);
@@ -593,6 +597,16 @@ export async function startCcpaRelay(options = {}) {
 							"antigravity-acp",
 							"ccpa-models-cache.json",
 						));
+	const firstByteTimeoutMs =
+		options.firstByteTimeoutMs ??
+		(env[CCPA_FIRST_BYTE_TIMEOUT_MS_ENV] !== undefined
+			? Math.max(0, Number(env[CCPA_FIRST_BYTE_TIMEOUT_MS_ENV]) || 0)
+			: DEFAULT_FIRST_BYTE_TIMEOUT_MS);
+	const streamIdleTimeoutMs =
+		options.streamIdleTimeoutMs ??
+		(env[CCPA_STREAM_IDLE_TIMEOUT_MS_ENV] !== undefined
+			? Math.max(0, Number(env[CCPA_STREAM_IDLE_TIMEOUT_MS_ENV]) || 0)
+			: DEFAULT_STREAM_IDLE_TIMEOUT_MS);
 	const log = options.onLog ?? ((message) => process.stderr.write(`${message}\n`));
 	const heartbeatMs = options.heartbeatMs ?? INFERENCE_HEARTBEAT_MS;
 	const ca = options.tlsOptions?.ca ?? resolveCustomCa(env);
@@ -678,13 +692,15 @@ export async function startCcpaRelay(options = {}) {
 		}
 	};
 
-	const getAgent = (forceDirect = false, forceRefreshProxy = false) => {
+	const getAgent = (forceDirect = false, forceRefreshProxy = false, keepAlive = true) => {
 		if (options.agent) return options.agent;
+		const agentOpts = keepAlive ? baseAgentOptions : { ...baseAgentOptions, keepAlive: false };
 		if (upstreamUrl.protocol === "http:") {
-			let httpAgent = agentPool.get("http-direct");
+			const key = keepAlive ? "http-direct" : "http-direct-fresh";
+			let httpAgent = agentPool.get(key);
 			if (!httpAgent) {
-				httpAgent = new http.Agent(baseAgentOptions);
-				agentPool.set("http-direct", httpAgent);
+				httpAgent = new http.Agent(agentOpts);
+				agentPool.set(key, httpAgent);
 			}
 			return httpAgent;
 		}
@@ -695,12 +711,12 @@ export async function startCcpaRelay(options = {}) {
 						readSystemProxy: options.readSystemProxy,
 						forceRefreshSystemProxy: forceRefreshProxy,
 					});
-		const key = proxyUrl ? proxyUrl.href : "https-direct";
+		const key = `${proxyUrl ? proxyUrl.href : "https-direct"}:${keepAlive ? "ka" : "fresh"}`;
 		let agent = agentPool.get(key);
 		if (!agent) {
 			agent = proxyUrl
-				? new ProxiedHttpsKeepAliveAgent(proxyUrl, baseAgentOptions)
-				: new https.Agent(baseAgentOptions);
+				? new ProxiedHttpsKeepAliveAgent(proxyUrl, agentOpts)
+				: new https.Agent(agentOpts);
 			agentPool.set(key, agent);
 		}
 		return agent;
@@ -795,7 +811,9 @@ export async function startCcpaRelay(options = {}) {
 		for (let attempt = 1; attempt <= maxRetries + 1; ) {
 			if (clientClosed) return;
 
-			const activeAgent = getAgent(forceDirectThisRequest, forceRefreshProxy);
+			// Avoid reusing pooled HTTP/1.1 sockets for SSE inference streams: proxies/GFE
+			// frequently half-close post-SSE connections silently, causing 300s hangs.
+			const activeAgent = getAgent(forceDirectThisRequest, forceRefreshProxy, !isStream);
 			forceRefreshProxy = false;
 
 			const outcome = await attemptUpstreamRequest({
@@ -807,9 +825,17 @@ export async function startCcpaRelay(options = {}) {
 				body,
 				agent: activeAgent,
 				isStream,
+				firstByteTimeoutMs,
+				streamIdleTimeoutMs,
 				clientRes,
 				isClientClosed: () => clientClosed,
 				onStreamCommitted: isStream ? trackStream : undefined,
+				onStreamStall: isStream
+					? (idleMs) =>
+						log(
+							`Antigravity CCPA relay: failed network error (Upstream stream timed out after ${idleMs}ms without data) on ${method} ${targetPath}`,
+						)
+					: undefined,
 				onSuccessBody: cacheKey
 					? (statusCode, resHeaders, resBody) => {
 							if (statusCode === 200 && !resHeaders["content-encoding"]) {
@@ -960,15 +986,30 @@ function attemptUpstreamRequest({
 	body,
 	agent,
 	isStream,
+	firstByteTimeoutMs,
+	streamIdleTimeoutMs,
 	clientRes,
 	isClientClosed,
 	onSuccessBody,
 	onStreamCommitted,
+	onStreamStall,
 	onCancelRegister,
 }) {
 	return new Promise((resolve) => {
 		let settled = false;
 		let stream;
+		let firstByteTimer;
+		let streamIdleTimer;
+		const clearFirstByteTimer = () => {
+			if (!firstByteTimer) return;
+			clearTimeout(firstByteTimer);
+			firstByteTimer = undefined;
+		};
+		const clearStreamIdleTimer = () => {
+			if (!streamIdleTimer) return;
+			clearTimeout(streamIdleTimer);
+			streamIdleTimer = undefined;
+		};
 		const startStream = () => {
 			if (settled || stream || !onStreamCommitted) return;
 			stream = onStreamCommitted();
@@ -976,6 +1017,8 @@ function attemptUpstreamRequest({
 		const finish = (result) => {
 			if (settled) return;
 			settled = true;
+			clearFirstByteTimer();
+			clearStreamIdleTimer();
 			stream?.end();
 			onCancelRegister(abortUpstream, false);
 			resolve(result);
@@ -997,6 +1040,7 @@ function attemptUpstreamRequest({
 					stream?.end();
 				}
 				if (RETRYABLE_STATUS_CODES.has(statusCode)) {
+					clearFirstByteTimer();
 					const errBody = await readErrorBody(upRes);
 					finish({
 						kind: "http_error",
@@ -1011,6 +1055,7 @@ function attemptUpstreamRequest({
 				// so a pre-first-token stream drop or SSE 500 error can still be retried.
 				let committed = false;
 				const onFirstData = (firstChunk) => {
+					clearFirstByteTimer();
 					cleanupPreCommit();
 					const buf = Buffer.isBuffer(firstChunk) ? firstChunk : Buffer.from(firstChunk);
 					if (isStream && statusCode === 200) {
@@ -1034,9 +1079,31 @@ function attemptUpstreamRequest({
 					}
 					clientRes.writeHead(statusCode, sanitizeResponseHeaders(upRes.headers));
 					clientRes.write(buf);
+					const armStreamIdleTimer = () => {
+						if (!isStream || !(streamIdleTimeoutMs > 0) || settled) return;
+						clearStreamIdleTimer();
+						streamIdleTimer = setTimeout(() => {
+							streamIdleTimer = undefined;
+							if (settled) return;
+							onStreamStall?.(streamIdleTimeoutMs);
+							upRes.unpipe(clientRes);
+							upRes.destroy();
+							clientRes.destroy();
+							finish({ kind: "completed" });
+						}, streamIdleTimeoutMs);
+						streamIdleTimer.unref?.();
+					};
 					if (statusCode === 200 && onStreamCommitted) {
 						startStream();
 						stream.received(buf.length);
+					}
+					if (isStream && statusCode === 200) {
+						armStreamIdleTimer();
+						upRes.on("data", (chunk) => {
+							stream?.received(chunk.length);
+							armStreamIdleTimer();
+						});
+					} else if (statusCode === 200 && onStreamCommitted) {
 						upRes.on("data", (chunk) => stream.received(chunk.length));
 					}
 					const shouldCapture = typeof onSuccessBody === "function" && statusCode === 200;
@@ -1075,6 +1142,7 @@ function attemptUpstreamRequest({
 				};
 
 				const onEmptyEnd = () => {
+					clearFirstByteTimer();
 					cleanupPreCommit();
 					committed = true;
 					if (!isClientClosed() && !clientRes.headersSent) {
@@ -1126,15 +1194,15 @@ function attemptUpstreamRequest({
 		};
 		onCancelRegister(abortUpstream, true);
 
-		if (onStreamCommitted) {
-			upReq.once("socket", (socket) => {
-				if (socket.connecting || socket.secureConnecting) {
-					socket.once("encrypted" in socket ? "secureConnect" : "connect", startStream);
-					return;
-				}
-				startStream();
-			});
-		}
+		upReq.once("socket", (socket) => {
+			socket.setKeepAlive?.(true, 30_000);
+			if (!onStreamCommitted) return;
+			if (socket.connecting || socket.secureConnecting) {
+				socket.once("encrypted" in socket ? "secureConnect" : "connect", startStream);
+				return;
+			}
+			startStream();
+		});
 
 		upReq.once("error", (err) => {
 			finish({
@@ -1143,6 +1211,24 @@ function attemptUpstreamRequest({
 				reusedSocket: Boolean(upReq.reusedSocket),
 			});
 		});
+
+		if (firstByteTimeoutMs > 0) {
+			firstByteTimer = setTimeout(() => {
+				firstByteTimer = undefined;
+				if (settled) return;
+				const timeoutErr = Object.assign(
+					new Error(`Upstream timed out before first byte after ${firstByteTimeoutMs}ms`),
+					{ code: "ETIMEDOUT" },
+				);
+				finish({
+					kind: "network_error",
+					error: timeoutErr,
+					reusedSocket: Boolean(upReq.reusedSocket),
+				});
+				upReq.destroy();
+			}, firstByteTimeoutMs);
+			firstByteTimer.unref?.();
+		}
 
 		upReq.end(body);
 	});

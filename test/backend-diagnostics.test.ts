@@ -27,6 +27,37 @@ describe("backend silence diagnostics", () => {
 		expect(diagnostics.streamingBytes).toBeUndefined();
 	});
 
+	it("stops treating unchanged non-zero heartbeat bytes as active streaming", () => {
+		vi.useFakeTimers();
+		const diagnostics = new BackendDiagnostics();
+		diagnostics.write(`${formatInferenceHeartbeat(1, 2048)}\n`);
+		expect(diagnostics.streamingBytes).toBe(2048);
+
+		// Advancing bytes keeps the stream fresh.
+		vi.advanceTimersByTime(INFERENCE_HEARTBEAT_MS);
+		diagnostics.write(`${formatInferenceHeartbeat(1, 4096)}\n`);
+		expect(diagnostics.streamingBytes).toBe(4096);
+
+		// Repeating identical non-zero bytes (mid-stream stall) must not refresh freshness.
+		vi.advanceTimersByTime(INFERENCE_HEARTBEAT_MS);
+		diagnostics.write(`${formatInferenceHeartbeat(1, 4096)}\n`);
+		expect(diagnostics.streamingBytes).toBe(4096);
+		vi.advanceTimersByTime(INFERENCE_HEARTBEAT_MS * 1.5 + 1);
+		diagnostics.write(`${formatInferenceHeartbeat(1, 4096)}\n`);
+		expect(diagnostics.streamingBytes).toBeUndefined();
+
+		// Subsequent byte progress resumes active streaming.
+		diagnostics.write(`${formatInferenceHeartbeat(1, 8192)}\n`);
+		expect(diagnostics.streamingBytes).toBe(8192);
+
+		// Mid-stream timeout log from ccpa-relay clears streaming and records timeout error.
+		diagnostics.write(
+			"Antigravity CCPA relay: failed network error (Upstream stream timed out after 120000ms without data) on POST /v1internal:streamGenerateContent?alt=sse\n",
+		);
+		expect(diagnostics.streamingBytes).toBeUndefined();
+		expect(diagnostics.error).toBe("network request timed out");
+	});
+
 	it.each([
 		["HTTP 503 (No capacity available)", "HTTP 503: model capacity unavailable on the server"],
 		["HTTP 503", "HTTP 503: service unavailable"],
