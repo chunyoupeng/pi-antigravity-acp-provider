@@ -88,15 +88,12 @@ export function sessionModels(state: SessionState): { currentModelId: string; av
 		const qualified = (id: string) => splitEffortSuffix(id) !== undefined ||
 			thoughtOptions.some((option) => option.value.length > 0 && id.endsWith(`-${option.value}`));
 		if (thoughtOptions.length > 0 && modelOptions.some((option) => !qualified(option.value))) {
-			const currentModelId =
-				qualified(selector.currentValue) || !thoughtSelector.currentValue
-					? selector.currentValue
-					: `${selector.currentValue}-${thoughtSelector.currentValue}`;
 			// Live selectors only expose thoughtOptions for the currently selected
 			// family, whereas other families in `state.models` may offer extra or
-			// fewer tiers (e.g. Hydrogen's `xhigh`, 3.1 Pro's `[low, high]`). Keep
-			// the legacy per-variant list whenever it is duplicate-free, covers
-			// every live model option, and agrees with the active family's tiers.
+			// fewer tiers (e.g. Hydrogen's `xhigh`, 3.1 Pro's `[low, high]`) or no
+			// thinking selector at all (e.g. orchestrator models). Keep the legacy
+			// per-variant list whenever it is duplicate-free, covers every live
+			// model option, and agrees with the active family's tiers.
 			const synthesized = modelOptions.flatMap((modelOpt) =>
 				qualified(modelOpt.value)
 					? [{ modelId: modelOpt.value, name: modelOpt.name }]
@@ -112,6 +109,7 @@ export function sessionModels(state: SessionState): { currentModelId: string; av
 			const familyIds = new Set(familyOptions.map((opt) => opt.value));
 			const familyByName = new Map(familyOptions.map((opt) => [opt.name.trim().toLowerCase(), opt.value]));
 			const legacyFamilyOf = (candidate: AcpModelInfo): string | undefined => {
+				if (familyIds.has(candidate.modelId)) return candidate.modelId;
 				const split = splitEffortSuffix(candidate.modelId);
 				if (split && familyIds.has(split.base)) return split.base;
 				for (const opt of thoughtOptions) {
@@ -141,6 +139,13 @@ export function sessionModels(state: SessionState): { currentModelId: string; av
 				(!familyIds.has(selector.currentValue) ||
 					thoughtOptions.every((opt) => legacyIds.has(`${selector.currentValue}-${opt.value}`)) ||
 					legacy.filter((m) => legacyFamilyOf(m) === selector.currentValue).length === thoughtOptions.length);
+
+			const currentModelId =
+				qualified(selector.currentValue) ||
+				!thoughtSelector.currentValue ||
+				(isLegacyCompatible && legacyIds.has(selector.currentValue))
+					? selector.currentValue
+					: `${selector.currentValue}-${thoughtSelector.currentValue}`;
 
 			return {
 				currentModelId,

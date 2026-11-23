@@ -4,10 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import zlib from "node:zlib";
-import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 
-import { createSafeReadToolDefinition } from "../extensions/safe-read.js";
 import { AntigravityAcpConnection } from "../src/acp/connection.js";
 import { projectModels } from "../src/models.js";
 import { AntigravityRuntime, MANAGED_AUTH_MARKER } from "../src/runtime.js";
@@ -22,7 +20,7 @@ const model: Model<"antigravity-acp"> = {
 	reasoning: false,
 	input: ["text", "image"],
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-	contextWindow: 1_000_000,
+	contextWindow: 512_000,
 	maxTokens: 65_536,
 };
 
@@ -43,17 +41,17 @@ function solidPng(size: number, rgb: [number, number, number]): Buffer {
 	return Buffer.concat([
 		Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
 		chunk("IHDR", header),
-		// Stored, not compressed, so a 64px image exceeds the 4 KiB MCP default.
 		chunk("IDAT", zlib.deflateSync(Buffer.concat(Array.from({ length: size }, () => row)), { level: 0 })),
 		chunk("IEND", Buffer.alloc(0)),
 	]);
 }
 
-describe.skipIf(!enabled)("authenticated Google Antigravity ACP server", () => {
+describe.skipIf(!enabled)("authenticated Google Antigravity ACP CLI", () => {
 	it("creates a session and completes a harmless prompt", async () => {
 		const updates: string[] = [];
 		const connection = new AntigravityAcpConnection({
 			cwd: process.cwd(),
+			dangerouslySkipPermissions: true,
 			operationTimeoutMs: 120_000,
 			handlers: {
 				onUpdate: (notification) => {
@@ -71,7 +69,7 @@ describe.skipIf(!enabled)("authenticated Google Antigravity ACP server", () => {
 		});
 		try {
 			const initialize = await connection.initialize();
-			expect(initialize.agentInfo?.name).toBe("antigravity-acp");
+			expect(initialize.agentInfo?.name).toBe("Antigravity ACP Server");
 			const session = await connection.newSession(process.cwd());
 			expect(session.sessionId).toBeTruthy();
 			const response = await connection.prompt({
@@ -85,61 +83,38 @@ describe.skipIf(!enabled)("authenticated Google Antigravity ACP server", () => {
 		}
 	}, 180_000);
 
-	// A Pi read result past the old 4 KiB MCP threshold reaches the model inline
-	// once mcpMaxOutputBytes is raised; native view_file is disabled.
-	it("reads a 30 KB text file with one Pi read call", async () => {
+	it("reads a 30 KB text file with native read_file", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "agy-live-read-"));
 		const marker = randomUUID();
 		const filler = Array.from({ length: 400 }, (_, index) => `filler line ${index}: ${"x".repeat(60)}`);
 		const textPath = path.join(cwd, "large.txt");
 		fs.writeFileSync(textPath, [...filler, `LIVE_MARKER=${marker}`, ""].join("\n"));
-		const read = createSafeReadToolDefinition(cwd);
-		type ReadContext = Parameters<typeof read.execute>[4];
-		const tools = [{ name: read.name, description: read.description, parameters: read.parameters }];
 		const messages: Message[] = [
 			{
 				role: "user",
 				content:
-					`Read ${textPath} in full. Do not use subagents or commands. ` +
+					`Read ${textPath} in full using read_file. ` +
 					"Reply with exactly: MARKER=<the value after LIVE_MARKER= on the last line>",
 				timestamp: 1,
 			},
 		];
-		const runtime = new AntigravityRuntime(undefined, "yolo", undefined, undefined, "pi");
-		const transcript: string[] = [];
+		const runtime = new AntigravityRuntime(undefined, "yolo");
 		try {
-			for (let turn = 0; turn < 6; turn++) {
-				const writer = runtime.stream(model, { tools, messages }, { apiKey: MANAGED_AUTH_MARKER });
-				for await (const _event of writer.stream) void _event;
-				const message = writer.message;
-				messages.push(message);
-				transcript.push(JSON.stringify(message.content));
-				if (message.stopReason !== "toolUse") break;
-				for (const block of message.content) {
-					if (block.type !== "toolCall") continue;
-					const result = await read.execute(block.id, block.arguments as { path: string }, undefined, undefined, { cwd, model } as unknown as ReadContext);
-					messages.push({ role: "toolResult", toolCallId: block.id, toolName: block.name, content: result.content, isError: false, timestamp: messages.length + 1 });
-				}
-			}
-			const reads = messages.flatMap((message) =>
-				message.role === "assistant" ? message.content.filter((block) => block.type === "toolCall") : [],
-			);
-			const last = messages.at(-1);
-			const reply = last?.role === "assistant" ? last.content.map((block) => (block.type === "text" ? block.text : "")).join("") : "";
-			expect(reads, transcript.join("\n")).toHaveLength(1);
-			expect(reply, transcript.join("\n")).toContain(`MARKER=${marker}`);
+			const writer = runtime.stream(model, { messages }, { apiKey: MANAGED_AUTH_MARKER });
+			for await (const _event of writer.stream) void _event;
+			const reply = writer.message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+			expect(reply).toContain(`MARKER=${marker}`);
 		} finally {
 			await runtime.close();
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}
 	}, 300_000);
 
-	// The image exists only in the prompt, so a tool or subagent cannot
-	// substitute for the model seeing it.
 	it("sees an image sent as a prompt block", async () => {
 		const messages: string[] = [];
 		const connection = new AntigravityAcpConnection({
 			cwd: process.cwd(),
+			dangerouslySkipPermissions: true,
 			operationTimeoutMs: 120_000,
 			handlers: {
 				onUpdate: (notification) => {
@@ -169,70 +144,8 @@ describe.skipIf(!enabled)("authenticated Google Antigravity ACP server", () => {
 		}
 	}, 180_000);
 
-	// The image exists only in the Pi tool result, so the model can answer only
-	// if the provider delivers it as a follow-up prompt.
-	it("sees an image returned by a bridged Pi tool", async () => {
-		const imagePath = "/virtual/swatch.png";
-		const tools = [
-			{
-				name: "read",
-				description: "Read a file. Supports text and images (png, jpg); images are returned as attachments.",
-				parameters: Type.Object({ path: Type.String() }),
-			},
-		];
-		const messages: Message[] = [
-			{
-				role: "user",
-				content:
-					`Use the read tool on ${imagePath}. It exists only through that tool. ` +
-					"Then reply with exactly: COLOR=<the single color filling the image>",
-				timestamp: 1,
-			},
-		];
-		const runtime = new AntigravityRuntime(undefined, "yolo", undefined, undefined, "pi");
-		const transcript: string[] = [];
-		try {
-			for (let turn = 0; turn < 6; turn++) {
-				const writer = runtime.stream(model, { tools, messages }, { apiKey: MANAGED_AUTH_MARKER });
-				for await (const _event of writer.stream) void _event;
-				const message = writer.message;
-				messages.push(message);
-				transcript.push(JSON.stringify(message.content));
-				if (message.stopReason !== "toolUse") break;
-				for (const block of message.content) {
-					if (block.type !== "toolCall") continue;
-					const isImage = block.name === "read" && block.arguments.path === imagePath;
-					messages.push({
-						role: "toolResult",
-						toolCallId: block.id,
-						toolName: block.name,
-						content: isImage
-							? [
-									{ type: "text", text: "Read image file [image/png]" },
-									{ type: "image", data: solidPng(64, [0, 160, 0]).toString("base64"), mimeType: "image/png" },
-								]
-							: [{ type: "text", text: "Not available in this test" }],
-						isError: !isImage,
-						timestamp: messages.length + 1,
-					});
-				}
-			}
-			const last = messages.at(-1);
-			const reply =
-				last?.role === "assistant"
-					? last.content.map((block) => (block.type === "text" ? block.text : "")).join("")
-					: "";
-			expect(last?.role === "assistant" ? last.stopReason : undefined, transcript.join("\n")).toBe("stop");
-			expect(reply, transcript.join("\n")).toMatch(/COLOR=\s*green/iu);
-		} finally {
-			await runtime.close();
-		}
-	}, 300_000);
-
-	// Antigravity 1.4 folds thinking-level variants into a model family plus a
-	// thought_level selector; each level must be selected and confirmed.
 	it("discovers thinking levels and switches between them", async () => {
-		const runtime = new AntigravityRuntime(undefined, "yolo", undefined, undefined, "pi");
+		const runtime = new AntigravityRuntime(undefined, "yolo");
 		try {
 			const models = projectModels(await runtime.discoverModels(MANAGED_AUTH_MARKER));
 			const family = models.find((candidate) => candidate.thinkingLevelMap?.low && candidate.thinkingLevelMap.high);

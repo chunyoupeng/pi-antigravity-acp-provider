@@ -8,13 +8,9 @@ import {
 	type McpServer,
 	type PromptRequest,
 	type PromptResponse,
-	type ReadTextFileRequest,
-	type ReadTextFileResponse,
 	type RequestPermissionRequest,
 	type RequestPermissionResponse,
 	type SessionNotification,
-	type WriteTextFileRequest,
-	type WriteTextFileResponse,
 } from "@agentclientprotocol/sdk";
 
 import { PACKAGE_VERSION } from "../constants.js";
@@ -63,16 +59,12 @@ export interface AntigravityConnectionHandlers {
 	/** Fires once per silence streak while a prompt waits on a mute backend. abortInMs is set when the idle prompt will abort itself afterwards. */
 	onStall?: (info: PromptStallInfo) => void;
 	onPermission?: (request: RequestPermissionRequest) => Promise<RequestPermissionResponse>;
-	onReadTextFile?: (request: ReadTextFileRequest) => Promise<ReadTextFileResponse>;
-	onWriteTextFile?: (request: WriteTextFileRequest) => Promise<WriteTextFileResponse>;
 }
 
 export type SessionMeta = Record<string, unknown>;
 
 export interface AntigravityConnectionOptions extends AntigravityProcessOptions {
 	handlers?: AntigravityConnectionHandlers;
-	/** Advertise ACP fs so Antigravity's file tools call back into the provider. */
-	clientFs?: boolean;
 	initializeTimeoutMs?: number;
 	operationTimeoutMs?: number;
 	/** Deadline for session/new (default min(operationTimeoutMs, 40 seconds)). */
@@ -168,14 +160,6 @@ export class AntigravityAcpConnection {
 					}
 					await this.handlers.onUpdate?.(notification);
 				},
-				readTextFile: async (request) => {
-					if (!this.handlers.onReadTextFile) throw RequestError.methodNotFound("fs/read_text_file");
-					return this.handlers.onReadTextFile(request);
-				},
-				writeTextFile: async (request) => {
-					if (!this.handlers.onWriteTextFile) throw RequestError.methodNotFound("fs/write_text_file");
-					return this.handlers.onWriteTextFile(request);
-				},
 			}),
 			stream,
 		);
@@ -183,7 +167,7 @@ export class AntigravityAcpConnection {
 			this.connection.initialize({
 				protocolVersion: PROTOCOL_VERSION,
 				clientCapabilities: {
-					fs: { readTextFile: options.clientFs === true, writeTextFile: options.clientFs === true },
+					fs: { readTextFile: false, writeTextFile: false },
 					terminal: false,
 				},
 				clientInfo: {

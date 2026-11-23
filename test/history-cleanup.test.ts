@@ -91,9 +91,9 @@ describe("pruneAcpHistory", () => {
 
 	it("resolves the profile from GEMINI_HOME", () => {
 		vi.stubEnv("GEMINI_HOME", "/tmp/gemini-home");
-		expect(resolveAcpProfileDir()).toBe(path.join("/tmp/gemini-home", "antigravity-acp"));
+		expect(resolveAcpProfileDir()).toBe(path.join("/tmp/gemini-home", "antigravity-cli"));
 		vi.stubEnv("GEMINI_HOME", "~/custom");
-		expect(resolveAcpProfileDir()).toBe(path.join(os.homedir(), "custom", "antigravity-acp"));
+		expect(resolveAcpProfileDir()).toBe(path.join(os.homedir(), "custom", "antigravity-cli"));
 	});
 });
 

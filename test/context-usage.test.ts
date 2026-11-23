@@ -5,7 +5,7 @@ import {
 	buildPromptParts,
 	MAX_PROMPT_BYTES,
 	MAX_REPLAY_BATCHES,
-	PI_READ_EXAMINE_RULE,
+	NATIVE_READ_EXAMINE_RULE,
 } from "../src/stream/context.js";
 import { quotaFromPrompt } from "../src/status.js";
 import { usageFromPrompt, withContextUsage } from "../src/stream/usage.js";
@@ -199,16 +199,23 @@ describe("prompt context", () => {
 		const text = (buildPromptParts(context, true).prompt[0] as { resource: { text: string } }).resource.text;
 		const rules = /<rules>([\s\S]*)<\/rules>/u.exec(text)?.[1]?.trim().split("\n");
 		expect(rules).toEqual([
-			"- Use pi_bash for file operations",
+			"- Use run_command for file operations",
 			"- When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
 		]);
 	});
 
-	it("routes images and Pi skills through Pi read while keeping other text reads native", () => {
+	it("maps core file and shell instructions to native Antigravity tools and strips docs/tools", () => {
 		const rawInstructions =
 			"<tools>\n- read: Read file contents\n- bash: Execute commands\n</tools>\n\n" +
 			"<docs>\nPi documentation to strip\n</docs>\n\n" +
-			"<rules>\n- Use bash for file operations\n- Use read to examine files instead of cat or sed.\n</rules>\n\n" +
+			"<rules>\n" +
+			"- Use bash for file operations like ls, rg, find\n" +
+			"- Use read to examine files instead of cat or sed.\n" +
+			"- Use edit for targeted changes.\n" +
+			"- Each edits[].oldText must exactly and uniquely match the original file.\n" +
+			"- Use write only for new files or complete rewrites.\n" +
+			"- Use codemode to batch tool calls.\n" +
+			"</rules>\n\n" +
 			"<skills>\nUse the read tool to load a skill's file when the task matches its description.\n" +
 			"When a skill file references a relative path, resolve it against the skill directory.\n" +
 			"<available_skills><skill><name>libgen</name><location>/home/test/.pi/agent/skills/libgen/SKILL.md</location></skill></available_skills>\n</skills>";
@@ -216,21 +223,21 @@ describe("prompt context", () => {
 			systemPrompt: rawInstructions,
 			messages: [{ role: "user", content: "hello", timestamp: 1 }],
 		});
-		const result = buildPromptParts(context, true);
-		const text = (result.prompt[0] as { resource: { text: string } }).resource.text;
+		const text = (buildPromptParts(context, true).prompt[0] as { resource: { text: string } }).resource.text;
 		expect(text).not.toContain("<docs>");
 		expect(text).not.toContain("Pi documentation to strip");
 		expect(text).not.toContain("<tools>");
 		expect(text).not.toContain("- read: Read file contents");
-		expect(text).toContain("- Use pi_bash for file operations");
-		expect(text).toContain(PI_READ_EXAMINE_RULE);
-		expect(text).not.toContain("view_file");
-		expect(text).toContain("Use pi_read to load a skill's file when the task matches its description.");
+		expect(text).toContain("- Use run_command for file operations like ls, rg, find");
+		expect(text).toContain(NATIVE_READ_EXAMINE_RULE);
+		expect(text).toContain("- Use edit_file for targeted changes.");
+		expect(text).toContain("- Use write_file only for new files or complete rewrites.");
+		expect(text).toContain("- Use pi_codemode to batch tool calls.");
+		expect(text).not.toContain("edits[].oldText");
+		expect(text).toContain("Use read_file to load a skill's file when the task matches its description.");
 		expect(text).toContain("Do not use Antigravity's native skill loader for these files.");
 		expect(text).toContain("<location>/home/test/.pi/agent/skills/libgen/SKILL.md</location>");
 		expect(text).toContain("When a skill file references a relative path, resolve it against the skill directory.");
-		expect(text).not.toContain("Use the read tool to load a skill's file");
-		expect(text).not.toContain("Use only for images");
 	});
 });
 

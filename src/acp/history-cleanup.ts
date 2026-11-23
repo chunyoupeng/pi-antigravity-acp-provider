@@ -9,11 +9,11 @@ const CONVERSATION_SUFFIXES = [".db", ".db-wal", ".db-shm", ".meta"];
  * one `/antigravity-acp sessions` can attach, is never removed. */
 export const HISTORY_IDLE_MS = 7 * 24 * 60 * 60_000;
 
-/** The server's per-profile store; it honours GEMINI_HOME like the CLI. */
+/** The agy CLI per-profile store; it honours GEMINI_HOME. */
 export function resolveAcpProfileDir(): string {
-	const home = process.env.GEMINI_HOME || path.join(os.homedir(), ".gemini");
+	const home = process.env.GEMINI_HOME?.trim() || path.join(os.homedir(), ".gemini");
 	const directory = home === "~" || home.startsWith("~/") ? path.join(os.homedir(), home.slice(1)) : home;
-	return path.join(directory, "antigravity-acp");
+	return path.join(directory, "antigravity-cli");
 }
 
 /** Antigravity keeps every ACP conversation (`conversations/<id>.*` and

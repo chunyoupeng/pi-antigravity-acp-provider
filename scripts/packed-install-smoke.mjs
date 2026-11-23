@@ -24,8 +24,7 @@ try {
 	for (const required of ["extensions/index.ts", "src/acp/supervisor.mjs", "src/mcp/bridge.ts"]) {
 		if (!fs.existsSync(path.join(installed, required))) throw new Error(`Packed file is missing: ${required}`);
 	}
-	const unzipperPackage = path.join(temporary, "node_modules", "unzipper", "package.json");
-	if (!fs.existsSync(unzipperPackage)) throw new Error("Antigravity ACP installer dependency is missing");
+
 	const models = execFileSync(
 		"pi",
 		[

@@ -8,9 +8,8 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { AntigravityAcpConnection } from "../src/acp/connection.js";
 import { AcpSessionStore } from "../src/acp/session-store.js";
-import type { ToolOwner } from "../src/config.js";
-import { MCP_MAX_OUTPUT_BYTES, projectModels } from "../src/models.js";
-import { AntigravityRuntime, PI_OWNED_NATIVE_TOOLS, UNUSED_NATIVE_TOOLS } from "../src/runtime.js";
+import { projectModels } from "../src/models.js";
+import { AntigravityRuntime } from "../src/runtime.js";
 
 const fakeAgent = fileURLToPath(new URL("./fixtures/fake-agent.mjs", import.meta.url));
 const model: Model<"antigravity-acp"> = {
@@ -31,13 +30,11 @@ afterEach(() => {
 	for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
 });
 
-function runtimeFor(scenario: string, toolOwner: ToolOwner = "pi", store?: AcpSessionStore): AntigravityRuntime {
+function runtimeFor(scenario: string, store?: AcpSessionStore): AntigravityRuntime {
 	return new AntigravityRuntime(
 		(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent, scenario] }),
 		"yolo",
 		store,
-		undefined,
-		toolOwner,
 	);
 }
 
@@ -52,41 +49,12 @@ async function ask(runtime: AntigravityRuntime, text: string, sessionId?: string
 	return { message: writer.message, text: block?.type === "text" ? block.text : "" };
 }
 
-describe("Pi takeover of Antigravity capabilities", () => {
-	it("disables the built-ins Pi replaces and keeps client fs off", async () => {
+describe("Pi integration with Antigravity ACP", () => {
+	it("keeps client fs disabled so agy native file tools run directly", async () => {
 		const runtime = runtimeFor("default");
 		try {
 			const echoed = JSON.parse((await ask(runtime, "inspect meta")).text);
-			expect(echoed.meta.new).toEqual({ antigravity: { disabledTools: [...PI_OWNED_NATIVE_TOOLS, ...UNUSED_NATIVE_TOOLS], eagerMcpServers: ["pi-bridge"], mcpMaxOutputBytes: MCP_MAX_OUTPUT_BYTES } });
 			expect(echoed.clientCapabilities.fs).toEqual({ readTextFile: false, writeTextFile: false });
-		} finally {
-			await runtime.close();
-		}
-	});
-
-	it("keeps built-ins in native mode, clears any persisted filter, and serves fs", async () => {
-		const runtime = runtimeFor("default", "native");
-		try {
-			const echoed = JSON.parse((await ask(runtime, "inspect meta")).text);
-			expect(echoed.meta.new).toEqual({ antigravity: { disabledTools: [...UNUSED_NATIVE_TOOLS], eagerMcpServers: ["pi-bridge"], mcpMaxOutputBytes: MCP_MAX_OUTPUT_BYTES } });
-			expect(echoed.clientCapabilities.fs).toEqual({ readTextFile: true, writeTextFile: true });
-		} finally {
-			await runtime.close();
-		}
-	});
-
-	it("serves fs reads and writes inside the workspace and rejects paths outside it", async () => {
-		const workspace = fs.mkdtempSync(path.join(process.cwd(), ".fs-test-"));
-		directories.push(workspace);
-		fs.writeFileSync(path.join(workspace, "a.txt"), "one\ntwo\nthree\n");
-		const runtime = runtimeFor("default", "native");
-		try {
-			expect(JSON.parse((await ask(runtime, `fs read ${path.join(workspace, "a.txt")}`)).text)).toEqual({ content: "two" });
-			const target = path.join(workspace, "nested", "b.txt");
-			expect(JSON.parse((await ask(runtime, `fs write ${target}`)).text)).toEqual({});
-			expect(fs.readFileSync(target, "utf8")).toBe("written by agent\n");
-			const outside = JSON.parse((await ask(runtime, "fs read /etc/hosts")).text);
-			expect(outside.error).toMatch(/Invalid params/u);
 		} finally {
 			await runtime.close();
 		}
@@ -107,7 +75,7 @@ describe("Pi takeover of Antigravity capabilities", () => {
 		const home = fs.mkdtempSync(path.join(os.tmpdir(), "harness-checkpoint-"));
 		directories.push(home);
 		const acpSessionId = "0aba03aa-84de-4119-976a-b7ef85cc4727";
-		const logs = path.join(home, "antigravity-acp", "brain", acpSessionId, ".system_generated", "logs");
+		const logs = path.join(home, "antigravity-cli", "brain", acpSessionId, ".system_generated", "logs");
 		fs.mkdirSync(logs, { recursive: true });
 		const transcript = path.join(logs, "transcript_full.jsonl");
 		const planner = JSON.stringify({ step_index: 1, type: "PLANNER_RESPONSE", input_tokens: 1234, cache_read_tokens: 0, output_tokens: 0 });
@@ -162,7 +130,6 @@ describe("Pi takeover of Antigravity capabilities", () => {
 				"set_config_option:model=gemini-flash",
 				"set_config_option:thinking_level=low",
 			]);
-			// Changing only the thinking level on the same family skips re-setting the model selector.
 			const second = runtime.stream(
 				flash!,
 				normalizeContext({
@@ -193,7 +160,6 @@ describe("Pi takeover of Antigravity capabilities", () => {
 		try {
 			const { message } = await ask(runtime, "change model", "config-session");
 			expect(message.responseModel).toBe("gemini-other");
-			// The next turn of the same conversation re-applies Pi's selection.
 			const history: Message[] = [{ role: "user", content: "change model", timestamp: 1 }, message];
 			const echoed = JSON.parse((await ask(runtime, "inspect meta", "config-session", history)).text);
 			expect(echoed.selectionMethods).toEqual([
@@ -206,11 +172,11 @@ describe("Pi takeover of Antigravity capabilities", () => {
 		}
 	});
 
-	it("lists Antigravity sessions and resumes an attached one with the tool filter", async () => {
+	it("lists Antigravity sessions and resumes an attached one", async () => {
 		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "antigravity-attach-"));
 		directories.push(directory);
 		const store = new AcpSessionStore(path.join(directory, "sessions.json"));
-		const runtime = runtimeFor("default", "pi", store);
+		const runtime = runtimeFor("default", store);
 		try {
 			expect(await runtime.listSessions(process.cwd())).toEqual([
 				{ sessionId: "listed-session", cwd: process.cwd(), title: "Session listed-s" },
@@ -218,7 +184,6 @@ describe("Pi takeover of Antigravity capabilities", () => {
 			await runtime.attachSession("pi-session", "listed-session");
 			const echoed = JSON.parse((await ask(runtime, "inspect meta", "pi-session")).text);
 			expect(echoed.sessionId).toBe("listed-session");
-			expect(echoed.meta.resume).toEqual({ antigravity: { disabledTools: [...PI_OWNED_NATIVE_TOOLS, ...UNUSED_NATIVE_TOOLS], eagerMcpServers: ["pi-bridge"], mcpMaxOutputBytes: MCP_MAX_OUTPUT_BYTES } });
 		} finally {
 			await runtime.close();
 		}

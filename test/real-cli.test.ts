@@ -13,13 +13,13 @@ const enabled = process.env.PI_ANTIGRAVITY_ACP_REAL === "1";
 describe.skipIf(!enabled)("Google Antigravity ACP contract", () => {
 	it("resolves the Antigravity server and completes ACP initialize", async () => {
 		const entry = resolveAntigravityAcpEntry();
-		expect(entry).toMatch(/agy_acp_server\.par$/u);
+		expect(entry).toMatch(/agy(?:\.exe)?$/u);
 
 		const connection = new AntigravityAcpConnection({ cwd: process.cwd(), initializeTimeoutMs: 45_000 });
 		try {
 			const result = await connection.initialize();
 			expect(result.protocolVersion).toBe(1);
-			expect(result.agentInfo?.name).toBe("antigravity-acp");
+			expect(result.agentInfo?.name).toBe("Antigravity ACP Server");
 			expect(result.authMethods?.length).toBeGreaterThan(0);
 			expect(result.authMethods?.some((method) => method.id === "oauth-personal")).toBe(true);
 		} finally {
@@ -42,7 +42,7 @@ describe.skipIf(!enabled)("Google Antigravity ACP contract", () => {
 			expect(sessionModels(connection.getSessionState(session.sessionId))?.currentModelId).toBe(models.currentModelId);
 			const modes = sessionModes(session);
 			if (!modes) throw new Error("Official runtime did not advertise permission modes");
-			expect(modes.availableModes.map((mode) => mode.id)).toEqual(expect.arrayContaining(["default", "auto_edit", "yolo"]));
+			expect(modes.availableModes.map((mode) => mode.id)).toEqual(expect.arrayContaining(["default", "accept-edits", "auto"]));
 			await connection.setMode(session.sessionId, modes.currentModeId);
 			expect(sessionModes(connection.getSessionState(session.sessionId))?.currentModeId).toBe(modes.currentModeId);
 		} finally {

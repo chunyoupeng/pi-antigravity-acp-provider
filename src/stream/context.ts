@@ -128,12 +128,12 @@ export function buildPromptParts(
 	});
 }
 
-export const PI_READ_EXAMINE_RULE =
-	"- Use pi_read to examine files and images instead of cat or sed.";
-export const PI_READ_FALLBACK_RULE =
-	"- Use pi_read to examine files and images.";
+export const NATIVE_READ_EXAMINE_RULE =
+	"- Use read_file to examine files and images instead of cat or sed.";
+export const NATIVE_READ_FALLBACK_RULE =
+	"- Use read_file to examine files and images.";
 
-/** Rules that only restate what the bridged tool's MCP description or parameters already say. */
+/** Rules that only restate what tool descriptions already say or apply only to Pi's edit schema. */
 const SCHEMA_DUPLICATE_RULES = new Set([
 	"- Use edit for precise changes (edits[].oldText must match exactly)",
 	"- Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
@@ -143,53 +143,59 @@ const SCHEMA_DUPLICATE_RULES = new Set([
 	"- Set instruction to provide special research directives from the lead agent (e.g. focus on issues, compare benchmarks, restrict time range).",
 ]);
 
+const NATIVE_EDIT_RULE_PATTERN = /edits\[\]\.oldText/u;
+
 /**
- * Adapts Pi's system instructions for the Antigravity ACP environment.
- * Bridged Pi tools are prefixed with `pi_` to match Antigravity MCP bridge names.
+ * Adapts Pi's system instructions for `agy acp`.
+ * Core file/shell tools map to Antigravity's native `read_file`, `write_file`,
+ * `edit_file`, and `run_command`; other Pi tools remain prefixed with `pi_`.
  */
 export function adaptInstructionsForAntigravity(instructions: string): string {
 	if (!instructions) return instructions;
 	let adapted = instructions;
 
-	const hasReadTool = adapted.includes("- read:") || adapted.includes("pi_read:");
+	const hasReadTool = adapted.includes("- read:") || adapted.includes("read_file:");
 
-	// Strip Pi documentation and redundant tool list (tools are eagerly declared via MCP)
+	// Strip Pi documentation and redundant tool list (tools are declared natively / via MCP)
 	adapted = adapted.replace(/<docs>[\s\S]*?<\/docs>\s*/u, "");
 	adapted = adapted.replace(/<tools>[\s\S]*?<\/tools>\s*/u, "");
 
 	if (adapted.includes("<rules>")) {
 		adapted = adapted.replace(/<rules>([\s\S]*?)<\/rules>/u, (_, rulesContent: string) => {
-			let content = rulesContent.split("\n").filter((line) => !SCHEMA_DUPLICATE_RULES.has(line)).join("\n");
+			let content = rulesContent
+				.split("\n")
+				.filter((line) => !SCHEMA_DUPLICATE_RULES.has(line) && !NATIVE_EDIT_RULE_PATTERN.test(line))
+				.join("\n");
 			if (content.includes("- Use read to examine files instead of cat or sed.")) {
 				content = content.replace(
 					"- Use read to examine files instead of cat or sed.",
-					PI_READ_EXAMINE_RULE,
+					NATIVE_READ_EXAMINE_RULE,
 				);
-			} else if (!content.includes("Use pi_read to examine") && hasReadTool) {
-				content = `${content.trimEnd()}\n${PI_READ_FALLBACK_RULE}\n`;
+			} else if (!content.includes("Use read_file to examine") && hasReadTool) {
+				content = `${content.trimEnd()}\n${NATIVE_READ_FALLBACK_RULE}\n`;
 			}
-			content = content.replace(/\bUse bash\b/gu, "Use pi_bash");
-			content = content.replace(/\bUse edit\b/gu, "Use pi_edit");
-			content = content.replace(/\bUse write\b/gu, "Use pi_write");
+			content = content.replace(/\bUse bash\b/gu, "Use run_command");
+			content = content.replace(/\bUse edit\b/gu, "Use edit_file");
+			content = content.replace(/\bUse write\b/gu, "Use write_file");
 			content = content.replace(/\bUse codemode\b/gu, "Use pi_codemode");
 			content = content.replace(/\bUse generate_image\b/gu, "Use pi_generate_image");
-			content = content.replace(/\bUse read to inspect images\b/gu, "Use pi_read to inspect images");
+			content = content.replace(/\bUse read to inspect images\b/gu, "Use read_file to inspect images");
 			return `<rules>${content}</rules>`;
 		});
 	} else {
 		if (adapted.includes("- Use read to examine files instead of cat or sed.")) {
 			adapted = adapted.replace(
 				"- Use read to examine files instead of cat or sed.",
-				PI_READ_EXAMINE_RULE,
+				NATIVE_READ_EXAMINE_RULE,
 			);
 		}
-		adapted = adapted.replace(/\bUse bash\b/gu, "Use pi_bash");
-		adapted = adapted.replace(/\bUse edit\b/gu, "Use pi_edit");
-		adapted = adapted.replace(/\bUse write\b/gu, "Use pi_write");
+		adapted = adapted.replace(/\bUse bash\b/gu, "Use run_command");
+		adapted = adapted.replace(/\bUse edit\b/gu, "Use edit_file");
+		adapted = adapted.replace(/\bUse write\b/gu, "Use write_file");
 	}
 
 	adapted = adapted.replace(/<skills>([\s\S]*?)<\/skills>/u, (_, skillsContent: string) => {
-		const content = skillsContent.replace(/\bUse the read tool\b/u, "Use pi_read");
+		const content = skillsContent.replace(/\bUse the read tool\b/u, "Use read_file");
 		return `<skills>${content}\nDo not use Antigravity's native skill loader for these files.\n</skills>`;
 	});
 

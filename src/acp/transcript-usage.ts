@@ -13,7 +13,7 @@ const RETRY_DELAYS_MS = [50, 100, 200, 400];
  * compacts first. */
 export const HARNESS_BYTES_PER_TOKEN = 2.6;
 const RECENT_STEPS = 16;
-const TRUNCATION_NOTE = /<truncated (\d+) bytes>/u;
+const TRUNCATION_NOTE = /<truncated (\d+)(?:\s+of\s+\d+)?\s+bytes/u;
 
 interface StepTokens {
 	input: number;

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import path from "node:path";
 
 import { CCPA_BASE_URL_ENV, shouldStartCcpaRelay, startCcpaRelay } from "./ccpa-relay.mjs";
 
@@ -17,7 +18,7 @@ if (!entryOrCommand) {
 	process.exit(64);
 }
 const agentCommand = genericCommand ? entryOrCommand : process.execPath;
-const agentArgs = genericCommand ? forwardedArgs : [entryOrCommand, ...forwardedArgs];
+const agentArgs = genericCommand ? [...forwardedArgs] : [entryOrCommand, ...forwardedArgs];
 
 let ccpaRelay;
 const agentEnv = { ...process.env };
@@ -28,6 +29,13 @@ if (shouldStartCcpaRelay(agentEnv)) {
 	} catch {
 		// Fall back to direct upstream connections if a loopback listener cannot start.
 	}
+}
+
+const agentBase = path.basename(agentCommand).toLowerCase();
+const isAgyCliAcp = (agentBase === "agy" || agentBase === "agy.exe") && agentArgs[0] === "acp";
+const ccpaBaseUrl = agentEnv[CCPA_BASE_URL_ENV]?.trim();
+if (isAgyCliAcp && ccpaBaseUrl && !agentArgs.includes("--cloud_code_endpoint")) {
+	agentArgs.push("--cloud_code_endpoint", ccpaBaseUrl);
 }
 
 const parentPid = process.ppid;

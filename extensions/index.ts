@@ -11,23 +11,18 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-import { inspectAntigravityAuth } from "../src/acp/antigravity.js";
-import { describeCredentialStorage } from "../src/acp/credential-storage.js";
-import { resolveAntigravityAcpEntry } from "../src/acp/process.js";
 import {
-	checkAntigravityAcpUpdate,
-	inspectRuntimeSetup,
-	updateAntigravityAcpRuntime,
-} from "../src/acp/setup.js";
+	AGY_PATCH_MAX_TOKEN_LIMIT,
+	inspectAntigravityAuth,
+	isAgyPatchEnabled,
+	readCachedAgyPatchState,
+	resolveAntigravityAcpLaunch,
+} from "../src/acp/antigravity.js";
 import {
 	isPermissionMode,
-	isRuntimeUpdateMode,
-	isToolOwner,
 	loadConfig,
 	permissionModeLabel,
 	savePermissionMode,
-	saveRuntimeUpdateMode,
-	saveToolOwner,
 	type PermissionMode,
 } from "../src/config.js";
 import {
@@ -46,15 +41,9 @@ import {
 } from "../src/runtime.js";
 import { pruneAcpHistory } from "../src/acp/history-cleanup.js";
 import { AcpSessionStore } from "../src/acp/session-store.js";
-import {
-	formatRuntimeUpdateNotice,
-	setRuntimeUpdateNoticeListener,
-	takeRuntimeUpdateNotices,
-} from "../src/acp/update-notice.js";
 import { runSetupWizard } from "../src/wizard.js";
 import { fetchUsage, formatUsage } from "../src/usage.js";
 import { registerToolActivity } from "./tool-activity.js";
-import { createSafeBashToolDefinition, createSafeReadToolDefinition } from "./safe-read.js";
 
 // Pi may start several sessions in one process; prune once.
 let historyPruned = false;
@@ -62,11 +51,9 @@ let historyPruned = false;
 export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 	const config = loadConfig();
 	const runtime = new AntigravityRuntime(
-		undefined, config.permissions, undefined, registerToolActivity(pi), config.tools,
+		undefined, config.permissions, undefined, registerToolActivity(pi),
 	);
 	const sessionContexts = new Map<string, ExtensionContext>();
-	/** Most recently active Pi session; receives live runtime-update notices. */
-	let noticeContext: ExtensionContext | undefined;
 	runtime.setIdleCompactHandler((piSessionId) => {
 		const ctx = sessionContexts.get(piSessionId);
 		if (!ctx || !ctx.isIdle() || ctx.hasPendingMessages() || !ctx.model) return;
@@ -84,8 +71,6 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 	});
 	const { provider } = createAntigravityProvider(runtime);
 	pi.registerProvider(provider);
-	pi.registerTool(createSafeReadToolDefinition(process.cwd()));
-	pi.registerTool(createSafeBashToolDefinition(process.cwd()));
 
 	pi.registerTool({
 		name: PERMISSION_TOOL_NAME,
@@ -133,57 +118,10 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 				await runSetupWizard(ctx.ui, runtime);
 				return;
 			}
-			if (command === "update" || command === "update-runtime") {
-				const result = await updateAntigravityAcpRuntime((message) => ctx.ui.notify(message, "info"));
-				ctx.ui.notify(
-					result.changed
-						? `Installed verified Antigravity ACP ${result.version}. Restart Pi to move active sessions to it.`
-						: `Antigravity ACP ${result.version} is already the latest signed release.`,
-					"info",
-				);
-				return;
-			}
-			if (command === "updates" || command.startsWith("updates ")) {
-				const requested = command.slice("updates".length).trim();
-				if (!requested) {
-					ctx.ui.notify(`Antigravity runtime updates: ${loadConfig().runtimeUpdates}`, "info");
-					return;
-				}
-				if (!isRuntimeUpdateMode(requested)) {
-					ctx.ui.notify(
-						"Usage: /antigravity-acp updates [automatic|notify|manual]",
-						"warning",
-					);
-					return;
-				}
-				saveRuntimeUpdateMode(requested);
-				ctx.ui.notify(`Antigravity runtime updates: ${requested}`, "info");
-				return;
-			}
 			if (command === "logout" || command === "account" || command === "switch-account") {
 				const { server } = await runtime.logout();
 				ctx.ui.notify(
 					`${server ? "Antigravity signed out and cleared its stored credentials" : "Local Antigravity credentials were cleared"}; saved ACP sessions were forgotten. Run /logout for the old Pi marker, then /login to choose the next account.`,
-					"info",
-				);
-				return;
-			}
-			if (command === "tools" || command.startsWith("tools ")) {
-				const requested = command.slice("tools".length).trim();
-				if (!requested) {
-					ctx.ui.notify(`Antigravity tool owner: ${loadConfig().tools}`, "info");
-					return;
-				}
-				if (!isToolOwner(requested)) {
-					ctx.ui.notify("Usage: /antigravity-acp tools [pi|native]", "warning");
-					return;
-				}
-				runtime.setToolOwner(requested);
-				saveToolOwner(requested);
-				ctx.ui.notify(
-					requested === "pi"
-						? "Antigravity uses Pi's tools for files and the shell (from the next prompt)."
-						: "Antigravity uses its built-in tools; file reads and writes still go through Pi (from the next prompt).",
 					"info",
 				);
 				return;
@@ -272,34 +210,40 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 			const verbose = command === "doctor --verbose";
 			if (command !== "doctor" && command !== "status" && !verbose) {
 				ctx.ui.notify(
-					"Usage: /antigravity-acp [setup|doctor|status|usage|quota|update|updates|logout|account|qualify|permissions|tools|sessions|plan]",
+					"Usage: /antigravity-acp [setup|doctor|status|usage|quota|logout|account|qualify|permissions|sessions|plan]",
 					"warning",
 				);
 				return;
 			}
 			let entry: string;
 			try {
-				entry = resolveAntigravityAcpEntry();
+				const launch = resolveAntigravityAcpLaunch();
+				const patchState = readCachedAgyPatchState();
+				if (launch.patchStatus === "patched" && launch.officialCommand) {
+					const limitK = Math.round((patchState?.targetMaxTokenLimit ?? AGY_PATCH_MAX_TOKEN_LIMIT) / 1000);
+					entry = `${launch.command} (patched ${limitK}k; official: ${launch.officialCommand})`;
+				} else if (!isAgyPatchEnabled()) {
+					entry = `${launch.command} (patch disabled)`;
+				} else if (patchState?.status === "native") {
+					entry = `${launch.command} (native context window; no patch needed)`;
+				} else {
+					entry = launch.command;
+				}
 			} catch (error) {
 				entry = error instanceof Error ? error.message : String(error);
 			}
 			const snapshot = await runtime.snapshot(verbose);
 			const auth = inspectAntigravityAuth();
-			const setup = inspectRuntimeSetup();
-			const update = await checkAntigravityAcpUpdate().catch(() => undefined);
 			ctx.ui.notify(
 				[
-					`Antigravity ACP provider ${PACKAGE_VERSION}`,
-					`Runtime: installed=${setup.installedVersion ?? "external/unknown"} approved=${update?.approvedVersion ?? setup.approvedVersion} registry=${update?.latestVersion ?? "unavailable"} updates=${setup.updateMode}; ACP SDK ${ACP_SDK_VERSION}, protocol ${ACP_PROTOCOL_VERSION}`,
-					`Antigravity server: ${entry}`,
+					`Antigravity ACP provider ${PACKAGE_VERSION} (ACP SDK ${ACP_SDK_VERSION}, protocol ${ACP_PROTOCOL_VERSION})`,
+					`Antigravity CLI: ${entry}`,
 					`Authentication: ${auth.status}${auth.authType ? ` (${auth.authType})` : ""}${auth.credentialStore ? ` [${auth.credentialStore}]` : ""}`,
-					`Credential storage (preflight): ${describeCredentialStorage()}`,
 					`Requested permission mode: ${permissionModeLabel(snapshot.permissionMode)}`,
-					`Tool owner: ${snapshot.toolOwner}`,
 					`Active bindings: ${snapshot.bindings}`,
 					formatMetrics(snapshot.metrics),
 					...snapshot.processes.flatMap((item) => [
-						`• pid=${item.pid ?? "?"} generation=${item.generation} model=${item.modelId} confirmedMode=${item.confirmedPermissionMode} alive=${item.alive} restored=${item.restored} agent=${item.agentVersion ?? "?"} mcpHttp=${item.mcpHttp} piTools=${item.piOwnsTools} context=${item.contextTokens ?? "?"} permission=${item.waitingForPermission} tools=${item.waitingForTools} ignoredStdoutNoise=${item.ignoredStdoutNoiseLines}`,
+						`• pid=${item.pid ?? "?"} generation=${item.generation} model=${item.modelId} confirmedMode=${item.confirmedPermissionMode} alive=${item.alive} restored=${item.restored} agent=${item.agentVersion ?? "?"} mcpHttp=${item.mcpHttp} context=${item.contextTokens ?? "?"} permission=${item.waitingForPermission} tools=${item.waitingForTools} ignoredStdoutNoise=${item.ignoredStdoutNoiseLines}`,
 						`  omitted Pi tools: ${item.omittedTools.length ? item.omittedTools.map((tool) => `${tool.name} (${tool.reason})`).join("; ") : "none"}`,
 						...(verbose && item.stderrTail ? [`  stderr (redacted): ${item.stderrTail}`] : []),
 					]),
@@ -309,26 +253,9 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 		},
 	};
 	pi.registerCommand("antigravity-acp", commandDefinition);
-	pi.registerCommand("gemini-acp", {
-		...commandDefinition,
-		description: "Deprecated alias for /antigravity-acp",
-	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		sessionContexts.set(ctx.sessionManager.getSessionId(), ctx);
-		noticeContext = ctx;
-		// Background runtime updates are silent; tell the user what changed.
-		setRuntimeUpdateNoticeListener((notice) => {
-			if (!noticeContext) throw new Error("No Pi session to notify");
-			noticeContext.ui.notify(formatRuntimeUpdateNotice(notice), "warning");
-		});
-		try {
-			for (const notice of takeRuntimeUpdateNotices()) {
-				ctx.ui.notify(formatRuntimeUpdateNotice(notice), "warning");
-			}
-		} catch {
-			// Notices are advisory and must not interrupt Pi startup.
-		}
 		if (!historyPruned) {
 			historyPruned = true;
 			try {
@@ -346,39 +273,14 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 		} catch {
 			// Background prewarming is best-effort and must not interrupt Pi startup.
 		}
-		if (loadConfig().runtimeUpdates !== "notify") return;
-		try {
-			const update = await checkAntigravityAcpUpdate();
-			if (update.approvalPending) {
-				ctx.ui.notify(
-					`Antigravity ACP ${update.latestVersion} is published but is still awaiting a signed runtime manifest.`,
-					"warning",
-				);
-			} else if (update.updateAvailable) {
-				ctx.ui.notify(
-					update.managed
-						? `Antigravity ACP ${update.approvedVersion} is available. Run /antigravity-acp update.`
-						: `Antigravity ACP ${update.approvedVersion} is available, but the selected external runtime must be updated manually.`,
-					"info",
-				);
-			}
-		} catch {
-			// Update checks are advisory and must not interrupt Pi startup.
-		}
 	});
 
 	pi.on("agent_end", (_event, ctx) => {
 		sessionContexts.set(ctx.sessionManager.getSessionId(), ctx);
-		noticeContext = ctx;
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		sessionContexts.delete(ctx.sessionManager.getSessionId());
-		if (noticeContext === ctx) {
-			// A notice arriving with no live session is kept for the next start.
-			noticeContext = undefined;
-			setRuntimeUpdateNoticeListener(undefined);
-		}
 		await runtime.close();
 	});
 }

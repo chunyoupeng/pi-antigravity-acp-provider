@@ -30,7 +30,6 @@
     "extensions",
     "src",
     "docs",
-    "runtime-manifest.json",
     "README.md",
     "LICENSE"
   ],
@@ -53,8 +52,6 @@
     "check": "npm run typecheck && npm test",
     "pack:check": "npm pack --dry-run",
     "test:packed": "node scripts/packed-install-smoke.mjs",
-    "refresh:runtime-manifest": "node scripts/refresh-runtime-manifest.mjs",
-    "sign:runtime-manifest": "node scripts/sign-runtime-manifest.mjs",
     "prepublishOnly": "npm run check"
   },
   "peerDependencies": {
@@ -71,7 +68,6 @@
     "@modelcontextprotocol/sdk": "1.32.1",
     "diff": "8.0.4",
     "proper-lockfile": "4.1.2",
-    "unzipper": "0.12.5",
     "zod": "4.6.7"
   },
   "devDependencies": {
@@ -80,7 +76,6 @@
     "@earendil-works/pi-tui": "1.3.0",
     "@types/node": "24.19.2",
     "@types/proper-lockfile": "4.1.4",
-    "@types/unzipper": "0.10.11",
     "esbuild": "0.28.2",
     "typebox": "1.3.37",
     "typescript": "7.0.2",

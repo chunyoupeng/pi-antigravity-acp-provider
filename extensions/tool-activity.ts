@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import {
 	createBashToolDefinition,
 	createReadToolDefinition,
@@ -12,16 +14,21 @@ import { type Component, Image, Text, stripTerminalSequences, truncateToWidth, v
 import { structuredPatch } from "diff";
 
 import type { AcpToolActivity } from "../src/acp/events.js";
-import { matchNativeReadResult, readNativeReadResults, type NativeReadResult } from "../src/acp/native-read-results.js";
 
 export const TOOL_ACTIVITY_ENTRY = "antigravity-acp-tool-activity";
+export interface CompactDiff {
+	path: string;
+	lines: string[];
+}
 export interface ToolActivityEntry extends AcpToolActivity {
 	/** One display row per invocation; ACP IDs can be reused in later turns. */
 	rowId: string;
-	/** Receipt time of the first notification, not of a later bulk failure. */
+	/** Receipt time of the first notification. */
 	observedAt?: number;
-	/** Separate display evidence; toolCall and update remain raw ACP data. */
-	readResult?: NativeReadResult;
+	/** Pre-computed compact diff lines so full oldText/newText files are not persisted or re-diffed per frame. */
+	diffs?: CompactDiff[];
+	/** Line count inferred for native read_file calls that omit file text in ACP updates. */
+	readLines?: number;
 }
 
 interface ToolRow {
@@ -30,63 +37,10 @@ interface ToolRow {
 }
 
 /** Display-only session entries: never queued as model input or executable Pi calls. */
-export function registerToolActivity(
-	pi: ExtensionAPI,
-	loadReadResults: (sessionId: string) => Promise<NativeReadResult[]> = readNativeReadResults,
-): (activity: AcpToolActivity) => void {
+export function registerToolActivity(pi: ExtensionAPI): (activity: AcpToolActivity) => void {
 	const rows = new Map<string, ToolRow>();
 	const activeCalls = new Map<string, string>();
 	let cwd = process.cwd();
-	let generation = 0;
-	let active = false;
-	let disposed = false;
-	let running = false;
-	let dirty = false;
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	const stopTimer = () => {
-		clearTimeout(timer);
-		timer = undefined;
-	};
-	const pendingReads = () => [...rows.values()].filter((row) =>
-		row.latest.toolCall.kind === "read" && row.latest.toolCall.title === "Running view_file" && !row.latest.readResult);
-	const requestReconcile = () => {
-		if (disposed) return;
-		dirty = true;
-		if (!running) void reconcile();
-	};
-	const reconcile = async () => {
-		running = true;
-		dirty = false;
-		const currentGeneration = generation;
-		stopTimer();
-		try {
-			const pending = pendingReads();
-			for (const sessionId of new Set(pending.map((row) => row.latest.sessionId))) {
-				const results = await loadReadResults(sessionId);
-				if (disposed || currentGeneration !== generation) return;
-				const used = new Set([...rows.values()].filter((row) => row.latest.sessionId === sessionId)
-					.flatMap((row) => row.latest.readResult ? [row.latest.readResult.stepIndex] : []));
-				const available = results.filter((result) => !used.has(result.stepIndex));
-				const proposals = pendingReads().filter((row) => row.latest.sessionId === sessionId)
-					.map((row) => ({ row, result: matchNativeReadResult(available, row.latest.toolCall, row.latest.observedAt ?? NaN) }));
-				for (const { row, result } of proposals) {
-					// A result must match exactly one row as well as one invocation.
-					if (!result || proposals.filter((item) => item.result?.stepIndex === result.stepIndex).length !== 1) continue;
-					row.latest = { ...row.latest, readResult: result };
-					pi.appendEntry(TOOL_ACTIVITY_ENTRY, row.latest);
-				}
-			}
-		} catch {
-			// Recovery must never break tool execution or claim an unread file worked.
-		} finally {
-			running = false;
-			if (dirty && !disposed) requestReconcile();
-			else if (!disposed && currentGeneration === generation && active && pendingReads().length > 0) {
-				timer = setTimeout(requestReconcile, 300);
-				timer.unref();
-			}
-		}
-	};
 	// Only the presentation functions are used; execute() is never called.
 	const bashDefinition = createBashToolDefinition(cwd);
 	const readDefinition = createReadToolDefinition(cwd);
@@ -123,10 +77,6 @@ export function registerToolActivity(
 	};
 
 	const restore = (_event: unknown, ctx: ExtensionContext) => {
-		generation++;
-		active = false;
-		disposed = false;
-		stopTimer();
 		rows.clear();
 		activeCalls.clear();
 		cwd = ctx.cwd;
@@ -138,35 +88,18 @@ export function registerToolActivity(
 			const restored: ToolActivityEntry = {
 				...data,
 				observedAt: row?.latest.observedAt ?? data.observedAt ?? Date.parse(entry.timestamp),
-				...(row?.latest.readResult ? { readResult: row.latest.readResult } : {}),
 			};
 			if (row) row.latest = restored;
 			else rows.set(data.rowId, { latest: restored, owner: entry.id });
 			activeCalls.set(callKey(data), data.rowId);
 		}
-		requestReconcile();
 	};
 	pi.on("session_start", restore);
 	pi.on("session_tree", restore);
-	pi.on("agent_start", () => {
-		active = true;
-		requestReconcile();
-	});
-	pi.on("agent_settled", () => {
-		active = false;
-		stopTimer();
-		requestReconcile();
-	});
-	pi.on("session_shutdown", () => {
-		disposed = true;
-		generation++;
-		stopTimer();
-	});
 
 	pi.registerEntryRenderer<ToolActivityEntry>(TOOL_ACTIVITY_ENTRY, (entry, { expanded }, theme) => {
 		const data = entry.data;
 		if (!data) return undefined;
-		// An ungrouped entry still displays, but new entries always carry rowId.
 		const rowId = data.rowId ?? entry.id;
 		let row = rows.get(rowId);
 		if (!row) {
@@ -176,10 +109,18 @@ export function registerToolActivity(
 		row.owner ??= entry.id;
 		if (row.owner !== entry.id) return undefined;
 		const currentRow = row;
+		let cached: { latest: ToolActivityEntry; width: number; expanded: boolean; lines: string[] } | undefined;
 		return {
-			invalidate() {},
+			invalidate() {
+				cached = undefined;
+			},
 			render(width) {
-				return renderToolRow(currentRow.latest, { bash, read, edit }, cwd, expanded, theme, width);
+				if (cached && cached.latest === currentRow.latest && cached.width === width && cached.expanded === expanded) {
+					return cached.lines;
+				}
+				const lines = renderToolRow(currentRow.latest, { bash, read, edit }, cwd, expanded, theme, width);
+				cached = { latest: currentRow.latest, width, expanded, lines };
+				return lines;
 			},
 		} satisfies Component;
 	});
@@ -192,22 +133,130 @@ export function registerToolActivity(
 			activeCalls.set(key, rowId);
 		}
 		const row = rows.get(rowId);
-		const data: ToolActivityEntry = {
-			...activity, rowId,
-			observedAt: row?.latest.observedAt ?? Date.now(),
-			...(row?.latest.readResult ? { readResult: row.latest.readResult } : {}),
-		};
+		const data = compactActivityEntry(activity, rowId, row?.latest.observedAt ?? Date.now(), cwd);
 		if (row) row.latest = data;
 		else rows.set(rowId, { latest: data });
-		// Every update remains in the session and JSON/RPC stream. The TUI updates
-		// the first row in place and hides the later records for this invocation.
 		pi.appendEntry(TOOL_ACTIVITY_ENTRY, data);
-		requestReconcile();
 	};
 }
 
 /** One component per image block, so re-renders reuse the terminal image. */
 const images = new WeakMap<object, Image>();
+/** Lazy cache for legacy persisted entries that still contain raw oldText/newText diffs. */
+const legacyDiffCache = new WeakMap<object, CompactDiff[]>();
+const MAX_LOCAL_LINE_COUNT_BYTES = 512 * 1024;
+
+function computeDiffLines(filePath: string, oldText: string | null | undefined, newText: string): string[] {
+	const patch = structuredPatch(filePath, filePath, oldText ?? "", newText, undefined, undefined, { context: 3 });
+	return (patch?.hunks ?? []).flatMap((hunk) => {
+		let oldLine = hunk.oldStart;
+		let newLine = hunk.newStart;
+		return hunk.lines.map((line) => {
+			const prefix = line[0];
+			if (prefix === "+") return `+${newLine++} ${displayText(line.slice(1))}`;
+			if (prefix === "-") return `-${oldLine++} ${displayText(line.slice(1))}`;
+			if (prefix === " ") {
+				oldLine++;
+				return ` ${newLine++} ${displayText(line.slice(1))}`;
+			}
+			return displayText(line);
+		});
+	});
+}
+
+function stripDiffContent<T extends { content?: AcpToolActivity["toolCall"]["content"] }>(container: T): T {
+	if (!Array.isArray(container.content) || !container.content.some((item) => item.type === "diff")) {
+		return container;
+	}
+	const filtered = container.content.filter((item) => item.type !== "diff");
+	return {
+		...container,
+		content: filtered,
+	};
+}
+
+function inferReadLines(activity: AcpToolActivity, cwd: string): number | undefined {
+	const call = activity.toolCall;
+	if (call.kind !== "read" || call.status !== "completed") return undefined;
+	if (toolOutput(activity)) return undefined;
+	const input = record(call.rawInput);
+	const start = input.StartLine ?? input.start_line ?? input.offset;
+	const end = input.EndLine ?? input.end_line;
+	const limit = input.limit;
+	if (typeof start === "number" && typeof end === "number" && end >= start) {
+		return end - start + 1;
+	}
+	if (typeof limit === "number" && limit > 0) {
+		return limit;
+	}
+	const rawPath =
+		input.path ?? input.Path ?? input.file_path ?? input.filePath ?? input.AbsolutePath ?? input.absolute_path ??
+		call.locations?.[0]?.path;
+	if (typeof rawPath !== "string" || !rawPath.trim()) return undefined;
+	try {
+		const resolved = path.isAbsolute(rawPath) ? rawPath : path.resolve(cwd, rawPath);
+		const stat = fs.statSync(resolved);
+		if (!stat.isFile() || stat.size > MAX_LOCAL_LINE_COUNT_BYTES) return undefined;
+		const buf = fs.readFileSync(resolved);
+		// Skip likely binary files (NUL byte in first 8 KiB).
+		const sampleEnd = Math.min(buf.length, 8192);
+		for (let i = 0; i < sampleEnd; i++) {
+			if (buf[i] === 0) return undefined;
+		}
+		if (buf.length === 0) return 0;
+		let lines = 1;
+		for (let i = 0; i < buf.length; i++) {
+			if (buf[i] === 0x0a) lines += 1;
+		}
+		if (buf[buf.length - 1] === 0x0a) lines -= 1;
+		return lines;
+	} catch {
+		return undefined;
+	}
+}
+
+function compactActivityEntry(
+	activity: AcpToolActivity,
+	rowId: string,
+	observedAt: number,
+	cwd: string,
+): ToolActivityEntry {
+	const rawDiffs = (activity.toolCall.content ?? []).filter(
+		(item): item is Extract<NonNullable<AcpToolActivity["toolCall"]["content"]>[number], { type: "diff" }> =>
+			item.type === "diff",
+	);
+	const diffs = rawDiffs.length > 0
+		? rawDiffs.map((item) => ({ path: item.path, lines: computeDiffLines(item.path, item.oldText, item.newText) }))
+		: undefined;
+	const readLines = inferReadLines(activity, cwd);
+	const toolCall = diffs ? stripDiffContent(activity.toolCall) : activity.toolCall;
+	const update = diffs && "content" in activity.update ? stripDiffContent(activity.update) : activity.update;
+	return {
+		...activity,
+		update,
+		toolCall,
+		rowId,
+		observedAt,
+		...(diffs ? { diffs } : {}),
+		...(readLines !== undefined ? { readLines } : {}),
+	};
+}
+
+function entryDiffs(activity: ToolActivityEntry): CompactDiff[] {
+	if (activity.diffs) return activity.diffs;
+	const call = activity.toolCall;
+	const rawDiffs = (call.content ?? []).filter(
+		(item): item is Extract<NonNullable<AcpToolActivity["toolCall"]["content"]>[number], { type: "diff" }> =>
+			item.type === "diff",
+	);
+	if (rawDiffs.length === 0) return [];
+	let cached = legacyDiffCache.get(call);
+	if (!cached) {
+		cached = rawDiffs.map((item) => ({ path: item.path, lines: computeDiffLines(item.path, item.oldText, item.newText) }));
+		legacyDiffCache.set(call, cached);
+	}
+	return cached;
+}
 
 function callKey(activity: AcpToolActivity): string {
 	return JSON.stringify([activity.sessionId, activity.toolCall.toolCallId]);
@@ -221,62 +270,54 @@ function renderToolRow(
 	theme: Theme,
 	width: number,
 ): string[] {
-	const call = activity.readResult ? {
-		...activity.toolCall, status: activity.readResult.status, rawOutput: activity.readResult.output, content: [],
-	} : activity.toolCall;
+	const call = activity.toolCall;
 	const input = record(call.rawInput);
-	const path = input.path ?? input.file_path ?? input.filePath ?? input.AbsolutePath ?? input.absolute_path ?? call.locations?.[0]?.path ??
-		call.content?.find((item) => item.type === "diff")?.path;
-	// Some ACP builds report this generic failure after view_file already
-	// returned content to the model. Keep the raw record; do not infer success.
-	const unconfirmedRead = !activity.readResult && call.kind === "read" && call.title === "Running view_file" &&
-		call.status === "failed" && call.rawOutput === "Tool execution failed" &&
-		(call.content?.length ?? 0) === 0;
+	const diffs = entryDiffs(activity);
+	const filePath = input.path ?? input.Path ?? input.file_path ?? input.filePath ?? input.AbsolutePath ?? input.absolute_path ?? call.locations?.[0]?.path ??
+		diffs[0]?.path;
 	const isPartial = call.status !== "completed" && call.status !== "failed";
-	const isError = call.status === "failed" && !unconfirmedRead;
+	const isError = call.status === "failed";
 	let args: Record<string, unknown> = input;
 	let renderer: ToolRenderers | undefined;
 	if (call.kind === "execute") {
 		renderer = renderers.bash;
-		args = { command: displayText(String(input.command ?? input.command_line ?? call.title ?? call.toolCallId)) };
-	} else if (call.kind === "read" && typeof path === "string") {
+		args = { command: displayText(String(input.command ?? input.CommandLine ?? input.command_line ?? call.title ?? call.toolCallId)) };
+	} else if (call.kind === "read" && typeof filePath === "string") {
 		renderer = renderers.read;
 		const start = input.StartLine ?? input.start_line;
 		const end = input.EndLine ?? input.end_line;
 		args = {
-			...input, path: displayText(path),
+			...input, path: displayText(filePath),
 			...(typeof start === "number" ? { offset: start } : {}),
 			...(typeof start === "number" && typeof end === "number" ? { limit: end - start + 1 } : {}),
 		};
-	} else if (call.kind === "edit" && typeof path === "string") {
+	} else if (call.kind === "edit" && typeof filePath === "string") {
 		renderer = renderers.edit;
-		// Never ask the edit renderer to preview against the local filesystem.
-		args = { path: displayText(path) };
+		args = { path: displayText(filePath) };
 	}
 	const context = {
 		args, toolCallId: call.toolCallId, cwd, expanded, isPartial, isError,
 		executionStarted: false, argsComplete: true, showImages: false, durationMs: undefined,
-		// The activity gutter supplies the indentation.
 		outputPad: 0, state: {}, lastComponent: undefined, invalidate() {},
 	};
 	const header = renderer?.renderCall?.(args, theme, context) ??
 		new Text(theme.fg("toolTitle", theme.bold(displayText(call.title ?? call.toolCallId))), 0, 0);
-	const statusColor = unconfirmedRead ? "warning" : isError ? "error" : isPartial ? "border" : "success";
+	const statusColor = isError ? "error" : isPartial ? "border" : "success";
 	const lines = gutter(header, 2, theme.fg(statusColor, "⏺"), width);
-	const output = unconfirmedRead ? "ACP status is ambiguous; read result unconfirmed." : toolOutput({ ...activity, toolCall: call });
+	const output = toolOutput(activity);
 	if (output) {
-		// Bash's result renderer supplies Pi's width-aware output preview and
-		// expansion hint. It also suits tools without a Pi-specific result shape.
 		const resultRenderer = call.kind === "read" ? renderers.read : renderers.bash;
-		const component = unconfirmedRead ? new Text(theme.fg("warning", output), 0, 0) :
-			resultRenderer.renderResult?.(
-				{ content: [{ type: "text", text: output }], details: undefined },
-				{ expanded, isPartial }, theme, context,
-			);
+		const component = resultRenderer.renderResult?.(
+			{ content: [{ type: "text", text: output }], details: undefined },
+			{ expanded, isPartial }, theme, context,
+		);
 		if (component) lines.push(...gutter(component, 5, `  ${theme.fg("dim", "⎿")}`, width));
+	} else if (call.kind === "read" && call.status === "completed" && activity.readLines !== undefined) {
+		const count = activity.readLines;
+		const summary = new Text(theme.fg("muted", `Read ${count} ${count === 1 ? "line" : "lines"}`), 0, 0);
+		lines.push(...gutter(summary, 5, `  ${theme.fg("dim", "⎿")}`, width));
 	}
 	for (const item of call.content ?? []) {
-		// Generated images arrive inline in the tool content.
 		if (item.type !== "content" || item.content.type !== "image") continue;
 		let image = images.get(item.content);
 		if (!image) {
@@ -285,31 +326,13 @@ function renderToolRow(
 		}
 		lines.push(...gutter(image, 5, `  ${theme.fg("dim", "⎿")}`, width));
 	}
-	for (const item of call.content ?? []) {
-		if (item.type !== "diff") continue;
-		const patch = structuredPatch(item.path, item.path, item.oldText ?? "", item.newText, undefined, undefined, { context: 3 });
-		const diff = (patch?.hunks ?? []).flatMap((hunk) => {
-			let oldLine = hunk.oldStart;
-			let newLine = hunk.newStart;
-			return hunk.lines.map((line) => {
-				const prefix = line[0];
-				if (prefix === "+") return `+${newLine++} ${displayText(line.slice(1))}`;
-				if (prefix === "-") return `-${oldLine++} ${displayText(line.slice(1))}`;
-				if (prefix === " ") {
-					oldLine++;
-					return ` ${newLine++} ${displayText(line.slice(1))}`;
-				}
-				return displayText(line);
-			});
-		});
-		const preview = expanded ? diff : diff.slice(0, 6);
-		let text = `${theme.fg("accent", displayText(item.path))}\n${renderDiff(preview.join("\n"))}`;
-		if (preview.length < diff.length) text += `\n${theme.fg("muted", `… +${diff.length - preview.length} lines (expand to view)`)}`;
+	for (const item of diffs) {
+		const diffBody = renderDiff(item.lines.join("\n"), { filePath: item.path });
+		const showPathHeader = diffs.length > 1 || item.path !== filePath;
+		const text = showPathHeader
+			? `${theme.fg("accent", displayText(item.path))}\n${diffBody}`
+			: diffBody;
 		lines.push(...gutter(new Text(text, 0, 0), 5, `  ${theme.fg("dim", "⎿")}`, width));
-	}
-	if (expanded) {
-		const details = new Text(theme.fg("muted", `ACP details\n${JSON.stringify(activity, null, 2)}`), 0, 0);
-		lines.push(...gutter(details, 5, `  ${theme.fg("dim", "⎿")}`, width));
 	}
 	return lines;
 }
@@ -328,6 +351,13 @@ function gutter(component: Component, indent: number, marker: string, width: num
 	));
 }
 
+function cleanExecuteOutput(text: string): string {
+	let cleaned = text.replace(/^(?:(?:Created|Completed) At:[^\n]*\n)+/u, "");
+	cleaned = cleaned.replace(/^Command exited with code 0\.\n+(?:Command output:\n)?/u, "");
+	if (cleaned.trim() === "No output from the command.") return "(no output)";
+	return cleaned;
+}
+
 function toolOutput(activity: AcpToolActivity): string {
 	const texts: string[] = [];
 	for (const item of activity.toolCall.content ?? []) {
@@ -337,14 +367,25 @@ function toolOutput(activity: AcpToolActivity): string {
 			else if (item.content.type !== "image") texts.push(`[${item.content.type}]`);
 		} else if (item.type === "terminal") texts.push(`[terminal: ${item.terminalId}]`);
 	}
-	if (texts.length === 0 && activity.toolCall.rawOutput !== undefined) {
+	if (texts.length === 0 && activity.toolCall.rawOutput !== undefined && activity.toolCall.rawOutput !== null) {
 		const raw = activity.toolCall.rawOutput;
-		const output = record(raw);
-		texts.push(typeof raw === "string" ? raw :
-			typeof output.stdout === "string" ? output.stdout + (typeof output.stderr === "string" ? output.stderr : "") :
-			JSON.stringify(raw, null, 2));
+		if (typeof raw === "string") {
+			if (raw.length > 0) texts.push(raw);
+		} else if (typeof raw === "object" && !Array.isArray(raw)) {
+			const output = record(raw);
+			if (typeof output.stdout === "string") {
+				texts.push(output.stdout + (typeof output.stderr === "string" ? output.stderr : ""));
+			} else if (typeof output.output === "string") {
+				texts.push(output.output);
+			} else if (Object.keys(output).length > 0) {
+				texts.push(JSON.stringify(raw, null, 2));
+			}
+		} else {
+			texts.push(JSON.stringify(raw, null, 2));
+		}
 	}
-	return displayText(texts.join("\n"));
+	const joined = displayText(texts.join("\n"));
+	return activity.toolCall.kind === "execute" ? cleanExecuteOutput(joined) : joined;
 }
 
 function record(value: unknown): Record<string, unknown> {

@@ -4,8 +4,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { registerToolActivity, TOOL_ACTIVITY_ENTRY, type ToolActivityEntry } from "../extensions/tool-activity.js";
 import type { AcpToolActivity } from "../src/acp/events.js";
-import { decodeNativeReadResult, type NativeReadResult } from "../src/acp/native-read-results.js";
-import { nativeReadStep } from "./fixtures/native-read-step.js";
 
 afterEach(() => {
 	vi.restoreAllMocks();
@@ -20,14 +18,14 @@ const activity: AcpToolActivity = {
 	toolCall: { toolCallId: "call", title: "ls -la", kind: "execute", status: "in_progress", rawInput: { command: "ls -la" } },
 };
 
-function harness(loadReadResults?: (sessionId: string) => Promise<NativeReadResult[]>) {
+function harness() {
 	const appendEntry = vi.fn();
 	const registerEntryRenderer = vi.fn();
 	const on = vi.fn();
 	const sendMessage = vi.fn();
 	const registerTool = vi.fn();
 	const pi = { appendEntry, registerEntryRenderer, on, sendMessage, registerTool } as unknown as ExtensionAPI;
-	const receive = registerToolActivity(pi, loadReadResults);
+	const receive = registerToolActivity(pi);
 	const render = registerEntryRenderer.mock.calls[0]?.[1] as EntryRenderer<ToolActivityEntry>;
 	const entry = (index: number) => ({ type: "custom" as const, id: `entry-${index}`, parentId: null, timestamp: "2026-01-01T00:00:00.000Z", customType: TOOL_ACTIVITY_ENTRY, data: appendEntry.mock.calls[index]?.[1] as ToolActivityEntry });
 	return { receive, render, entry, appendEntry, registerEntryRenderer, on, sendMessage, registerTool };
@@ -39,32 +37,6 @@ function completed(): AcpToolActivity {
 		update: { sessionUpdate: "tool_call_update", toolCallId: "call", status: "completed", rawOutput: "first\nsecond\nthird\nfourth\nfifth\nsixth" },
 		toolCall: { ...activity.toolCall, status: "completed", rawOutput: "first\nsecond\nthird\nfourth\nfifth\nsixth" },
 	};
-}
-
-function nativeRead(id = "read"): AcpToolActivity {
-	const toolCall: AcpToolActivity["toolCall"] = {
-		toolCallId: id, kind: "read", title: "Running view_file", status: "in_progress",
-		rawInput: { AbsolutePath: "/workspace/file.ts", StartLine: 1, EndLine: 10 },
-	};
-	return {
-		...activity, toolCall,
-		update: { sessionUpdate: "tool_call", toolCallId: id, title: "Running view_file", kind: "read", status: "in_progress", rawInput: toolCall.rawInput },
-	};
-}
-
-function nativeFailure(): AcpToolActivity {
-	const original = nativeRead();
-	return {
-		...original,
-		toolCall: { ...original.toolCall, status: "failed", rawOutput: "Tool execution failed" },
-		update: { sessionUpdate: "tool_call_update", toolCallId: "read", status: "failed", rawOutput: "Tool execution failed" },
-	};
-}
-
-function evidence(options: Parameters<typeof nativeReadStep>[0] = {}): NativeReadResult {
-	return decodeNativeReadResult(nativeReadStep({
-		id: "read", startedAt: Date.now() - 5, completedAt: Date.now() + 100, ...options,
-	}), options.id === "other" ? 454 : 453)!;
 }
 
 describe("tool activity entries", () => {
@@ -90,8 +62,10 @@ describe("tool activity entries", () => {
 		expect(compact).not.toContain("rawInput");
 		const expanded = stripTerminalSequences(h.render(h.entry(0), { expanded: true }, theme)!.render(80).join("\n"));
 		expect(expanded).toContain("first");
-		expect(expanded).toContain("rawInput");
-		expect(expanded).toContain("rawOutput");
+		expect(expanded).toContain("sixth");
+		expect(expanded).not.toContain("ACP details");
+		expect(expanded).not.toContain("rawInput");
+		expect(expanded).not.toContain("rawOutput");
 	});
 
 	it("updates the first row in place while retaining every raw update", () => {
@@ -143,230 +117,6 @@ describe("tool activity entries", () => {
 		expect(expanded).toContain("const value = 1;");
 	});
 
-	it("shows an ambiguous view_file failure as unconfirmed without changing the raw record", () => {
-		const h = harness();
-		const call: AcpToolActivity["toolCall"] = {
-			toolCallId: "read", title: "Running view_file", kind: "read", status: "failed",
-			rawInput: { AbsolutePath: "/workspace/file.ts" },
-			locations: [{ path: "/workspace/file.ts" }],
-			rawOutput: "Tool execution failed",
-		};
-		const failed: AcpToolActivity = {
-			...activity,
-			update: { sessionUpdate: "tool_call_update", toolCallId: "read", status: "failed", rawOutput: call.rawOutput },
-			toolCall: call,
-		};
-		h.receive(failed);
-		const colors = vi.spyOn(theme, "fg");
-		const row = h.render(h.entry(0), { expanded: false }, theme)!;
-		const text = stripTerminalSequences(row.render(80).join("\n"));
-		expect(text).toContain("read result unconfirmed");
-		expect(text).not.toContain("Tool execution failed");
-		expect(colors).toHaveBeenCalledWith("warning", "⏺");
-		expect(colors).not.toHaveBeenCalledWith("success", "⏺");
-		expect(colors).not.toHaveBeenCalledWith("error", "⏺");
-		expect(h.entry(0).data).toMatchObject(failed);
-		expect(call.status).toBe("failed");
-		expect(h.sendMessage).not.toHaveBeenCalled();
-		const expanded = stripTerminalSequences(h.render(h.entry(0), { expanded: true }, theme)!.render(80).join("\n"));
-		expect(expanded).toContain("Tool execution failed");
-		expect(expanded).toContain('"status": "failed"');
-		for (const width of [24, 12, 4, 1]) {
-			for (const line of row.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
-		}
-
-		// A later authoritative completion replaces the warning on the same row.
-		colors.mockClear();
-		h.receive({
-			...failed,
-			update: { sessionUpdate: "tool_call_update", toolCallId: "read", status: "completed", rawOutput: "const value = 1;" },
-			toolCall: { ...call, status: "completed", rawOutput: "const value = 1;" },
-		});
-		expect(h.entry(1).data.rowId).toBe(h.entry(0).data.rowId);
-		expect(stripTerminalSequences(row.render(80).join("\n"))).not.toContain("unconfirmed");
-		expect(colors).toHaveBeenCalledWith("success", "⏺");
-
-		// Restoring an older session uses the same presentation-only treatment.
-		const restored = harness();
-		const restore = restored.on.mock.calls.find(([event]) => event === "session_start")?.[1];
-		restore({}, { cwd: process.cwd(), sessionManager: { getBranch: () => [h.entry(0)] } });
-		expect(stripTerminalSequences(restored.render(h.entry(0), { expanded: false }, theme)!.render(80).join("\n"))).toContain("read result unconfirmed");
-	});
-
-	it.each([
-		{ title: "Running view_file", rawOutput: "ENOENT: file not found" },
-		{ title: "Read file", rawOutput: "Tool execution failed" },
-		{ title: "Running view_file", rawOutput: "Tool execution failed", content: [{ type: "content" as const, content: { type: "text" as const, text: "Permission denied" } }] },
-	])("keeps concrete read errors and other tools marked as failed: %s", (fields) => {
-		const h = harness();
-		h.receive({ ...activity, toolCall: {
-			toolCallId: "read", kind: "read", status: "failed",
-			locations: [{ path: "/workspace/file.ts" }], ...fields,
-		} });
-		const colors = vi.spyOn(theme, "fg");
-		const text = stripTerminalSequences(h.render(h.entry(0), { expanded: false }, theme)!.render(80).join("\n"));
-		expect(text).not.toContain("unconfirmed");
-		expect(colors).toHaveBeenCalledWith("error", "⏺");
-		const expanded = stripTerminalSequences(h.render(h.entry(0), { expanded: true }, theme)!.render(80).join("\n"));
-		expect(expanded).toContain(fields.content ? "Permission denied" : fields.rawOutput);
-	});
-
-	it("recovers content on the original row and keeps later bulk failures raw", async () => {
-		const result = evidence();
-		const h = harness(async () => [result]);
-		const original = nativeRead();
-		h.receive(original);
-		const row = h.render(h.entry(0), { expanded: true }, theme)!;
-		await vi.waitFor(() => expect(h.appendEntry).toHaveBeenCalledTimes(2));
-		expect(h.entry(1).data).toMatchObject({ ...original, readResult: result, rowId: h.entry(0).data.rowId });
-		expect(h.render(h.entry(1), { expanded: false }, theme)).toBeUndefined();
-		const colors = vi.spyOn(theme, "fg");
-		expect(stripTerminalSequences(row.render(100).join("\n"))).toContain("const value = 1;");
-		expect(colors).toHaveBeenCalledWith("success", "⏺");
-		h.receive(nativeFailure());
-		colors.mockClear();
-		const text = stripTerminalSequences(row.render(100).join("\n"));
-		expect(text).not.toContain("unconfirmed");
-		expect(colors).toHaveBeenCalledWith("success", "⏺");
-		expect(colors).not.toHaveBeenCalledWith("error", "⏺");
-		expect(h.entry(2).data.toolCall.status).toBe("failed");
-		expect(h.entry(2).data.toolCall.rawOutput).toBe("Tool execution failed");
-		expect(text).toContain("Tool execution failed"); // Expanded raw ACP details.
-		expect(h.sendMessage).not.toHaveBeenCalled();
-		expect(h.registerTool).not.toHaveBeenCalled();
-		expect(original.toolCall.status).toBe("in_progress");
-	});
-
-	it.each(["[Errno 2] No such file or directory", "Tool execution failed"])("shows a recorded error as failed, even if the step was DONE: %s", async (error) => {
-		const h = harness(async () => [evidence({ error })]);
-		h.receive(nativeRead());
-		await vi.waitFor(() => expect(h.appendEntry).toHaveBeenCalledTimes(2));
-		const colors = vi.spyOn(theme, "fg");
-		const text = stripTerminalSequences(h.render(h.entry(0), { expanded: true }, theme)!.render(100).join("\n"));
-		expect(text).toContain(error);
-		expect(text).not.toContain("unconfirmed");
-		expect(colors).toHaveBeenCalledWith("error", "⏺");
-	});
-
-	it("restores confirmed evidence, including after an unrelated later error", async () => {
-		const source = harness(async () => [evidence()]);
-		source.receive(nativeRead());
-		await vi.waitFor(() => expect(source.appendEntry).toHaveBeenCalledTimes(2));
-		source.receive(nativeFailure());
-		const load = vi.fn(async () => []);
-		const h = harness(load);
-		const restore = h.on.mock.calls.find(([event]) => event === "session_start")![1];
-		restore({}, { cwd: process.cwd(), sessionManager: { getBranch: () => [source.entry(0), source.entry(1), source.entry(2)] } });
-		const text = stripTerminalSequences(h.render(source.entry(0), { expanded: true }, theme)!.render(100).join("\n"));
-		expect(text).toContain("const value = 1;");
-		expect(text).not.toContain("unconfirmed");
-		expect(h.render(source.entry(2), { expanded: false }, theme)).toBeUndefined();
-		expect(load).not.toHaveBeenCalled();
-	});
-
-	it("backfills an older saved row using its first timestamp, not the later error timestamp", async () => {
-		vi.useFakeTimers();
-		vi.setSystemTime("2026-01-01T00:00:00Z");
-		const source = harness(async () => []);
-		source.receive(nativeRead());
-		source.receive(nativeFailure());
-		const entries = [source.entry(0), source.entry(1)].map((entry, index) => {
-			const { observedAt: _observedAt, ...data } = entry.data;
-			return { ...entry, data, timestamp: index === 0 ? entry.timestamp : "2026-01-01T00:10:00Z" };
-		});
-		const h = harness(async () => [evidence()]);
-		const restore = h.on.mock.calls.find(([event]) => event === "session_start")![1];
-		restore({}, { cwd: process.cwd(), sessionManager: { getBranch: () => entries } });
-		await vi.advanceTimersByTimeAsync(0);
-		expect(h.appendEntry).toHaveBeenCalledTimes(1);
-		expect(h.entry(0).data.readResult?.status).toBe("completed");
-		expect(h.entry(0).data.rowId).toBe(entries[0]!.data.rowId);
-	});
-
-	it("separates identical concurrent reads by ID and never consumes one result twice", async () => {
-		const first = evidence();
-		const second = evidence({ id: "other" });
-		const h = harness(async () => [first, second]);
-		h.receive(nativeRead());
-		h.receive(nativeRead("other"));
-		await vi.waitFor(() => expect(h.appendEntry).toHaveBeenCalledTimes(4));
-		expect(h.entry(2).data.readResult?.toolCallId).toBe("read");
-		expect(h.entry(3).data.readResult?.toolCallId).toBe("other");
-		h.receive(nativeRead()); // Reused ACP ID, but there is no new response yet.
-		await Promise.resolve();
-		expect(h.entry(4).data.readResult).toBeUndefined();
-		expect(h.entry(4).data.rowId).not.toBe(h.entry(0).data.rowId);
-		expect(h.appendEntry).toHaveBeenCalledTimes(5);
-	});
-
-	it("leaves two indistinguishable invocations unconfirmed rather than guessing", async () => {
-		const h = harness(async () => [evidence()]);
-		h.receive(nativeRead());
-		h.receive(nativeRead());
-		await Promise.resolve();
-		await Promise.resolve();
-		expect(h.appendEntry).toHaveBeenCalledTimes(2);
-		expect(h.entry(0).data.readResult).toBeUndefined();
-		expect(h.entry(1).data.readResult).toBeUndefined();
-	});
-
-	it("retries delayed persisted responses while active, then stops after shutdown", async () => {
-		vi.useFakeTimers();
-		const result = evidence();
-		const load = vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValue([result]);
-		const h = harness(load);
-		h.on.mock.calls.find(([event]) => event === "agent_start")![1]();
-		h.receive(nativeRead());
-		await vi.advanceTimersByTimeAsync(300);
-		expect(h.appendEntry).toHaveBeenCalledTimes(1);
-		await vi.advanceTimersByTimeAsync(300);
-		expect(h.appendEntry).toHaveBeenCalledTimes(2);
-		h.receive(nativeRead("missing"));
-		await vi.advanceTimersByTimeAsync(0);
-		h.on.mock.calls.find(([event]) => event === "session_shutdown")![1]();
-		const calls = load.mock.calls.length;
-		await vi.advanceTimersByTimeAsync(2000);
-		expect(load).toHaveBeenCalledTimes(calls);
-	});
-
-	it("stops periodic reads at agent_settled without imposing a tool timeout", async () => {
-		vi.useFakeTimers();
-		const load = vi.fn(async () => []);
-		const h = harness(load);
-		h.on.mock.calls.find(([event]) => event === "agent_start")![1]();
-		h.receive(nativeRead());
-		await vi.advanceTimersByTimeAsync(600);
-		expect(load.mock.calls.length).toBeGreaterThan(1);
-		h.on.mock.calls.find(([event]) => event === "agent_settled")![1]();
-		await vi.advanceTimersByTimeAsync(0);
-		const calls = load.mock.calls.length;
-		await vi.advanceTimersByTimeAsync(2000);
-		expect(load).toHaveBeenCalledTimes(calls);
-		expect(h.entry(0).data.toolCall.status).toBe("in_progress");
-	});
-
-	it.each(["session_tree", "session_shutdown"])("discards an in-flight lookup after %s", async (event) => {
-		let resolve!: (value: NativeReadResult[]) => void;
-		const h = harness(() => new Promise((done) => { resolve = done; }));
-		h.receive(nativeRead());
-		const handler = h.on.mock.calls.find(([name]) => name === event)![1];
-		handler({}, { cwd: process.cwd(), sessionManager: { getBranch: () => [] } });
-		resolve([evidence()]);
-		await Promise.resolve();
-		await Promise.resolve();
-		expect(h.appendEntry).toHaveBeenCalledTimes(1);
-	});
-
-	it("preserves the warning and raw record when recovery is unavailable", async () => {
-		const h = harness(async () => { throw new Error("Unavailable private store"); });
-		h.receive(nativeFailure());
-		await Promise.resolve();
-		const text = stripTerminalSequences(h.render(h.entry(0), { expanded: false }, theme)!.render(100).join("\n"));
-		expect(text).toContain("unconfirmed");
-		expect(h.entry(0).data.toolCall.status).toBe("failed");
-		expect(h.appendEntry).toHaveBeenCalledTimes(1);
-	});
-
 	it("computes an actual change diff instead of marking the whole file replaced", () => {
 		const h = harness();
 		const before = Array.from({ length: 30 }, (_, i) => `unchanged ${i}`);
@@ -399,5 +149,126 @@ describe("tool activity entries", () => {
 		for (const width of [24, 12, 4, 1]) {
 			for (const line of row.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 		}
+	});
+
+	it("renders agy CLI native Path and CommandLine rawInput fields", () => {
+		const h = harness();
+		h.receive({
+			...activity,
+			toolCall: {
+				toolCallId: "read-1",
+				title: "Read file",
+				kind: "read",
+				status: "completed",
+				rawInput: { Path: "src/index.ts", StartLine: 10, EndLine: 25 },
+				rawOutput: "line 10",
+			},
+		});
+		h.receive({
+			...activity,
+			toolCall: {
+				toolCallId: "bash-1",
+				title: "Run command",
+				kind: "execute",
+				status: "completed",
+				rawInput: { CommandLine: "echo native-ok" },
+				rawOutput: "native-ok",
+			},
+		});
+		const readText = stripTerminalSequences(h.render(h.entry(0), { expanded: false }, theme)!.render(80).join("\n"));
+		expect(readText).toContain("src/index.ts");
+		expect(readText).toContain("10");
+		const bashText = stripTerminalSequences(h.render(h.entry(1), { expanded: false }, theme)!.render(80).join("\n"));
+		expect(bashText).toContain("echo native-ok");
+		expect(bashText).toContain("native-ok");
+	});
+
+	it("compacts full-file diffs before persisting, strips empty {} edit rawOutput, and cleans agy command timestamps", () => {
+		const h = harness();
+		const bigBefore = Array.from({ length: 400 }, (_, i) => `const line_${i} = ${i};`).join("\n");
+		const bigAfter = bigBefore.replace("const line_200 = 200;", "const line_200 = 999;");
+		h.receive({
+			...activity,
+			update: {
+				sessionUpdate: "tool_call_update",
+				toolCallId: "edit-big",
+				kind: "edit",
+				status: "completed",
+				rawOutput: {},
+				content: [{ type: "diff", path: "src/big.ts", oldText: bigBefore, newText: bigAfter }],
+			},
+			toolCall: {
+				toolCallId: "edit-big",
+				kind: "edit",
+				status: "completed",
+				rawOutput: {},
+				content: [{ type: "diff", path: "src/big.ts", oldText: bigBefore, newText: bigAfter }],
+			},
+		});
+		const persisted = h.entry(0).data;
+		const serialized = JSON.stringify(persisted);
+		expect(serialized.length).toBeLessThan(2_000);
+		expect(serialized).not.toContain("const line_10 = 10;");
+		expect(persisted.diffs?.[0]?.path).toBe("src/big.ts");
+		const editText = stripTerminalSequences(h.render(h.entry(0), { expanded: false }, theme)!.render(100).join("\n"));
+		expect(editText).toContain("-201 const line_200 = 200;");
+		expect(editText).toContain("+201 const line_200 = 999;");
+		expect(editText).not.toContain("expand to view");
+		expect(editText).not.toContain("{}");
+		expect(editText).not.toContain("ACP details");
+
+		// Even multi-hunk / >6-line diffs stay fully visible when collapsed (matching Pi's native edit UX).
+		const multiAfter = bigBefore
+			.replace("const line_10 = 10;", "const line_10 = 1001;")
+			.replace("const line_200 = 200;", "const line_200 = 2002;");
+		h.receive({
+			...activity,
+			toolCall: {
+				toolCallId: "edit-multi",
+				kind: "edit",
+				status: "completed",
+				rawOutput: {},
+				content: [{ type: "diff", path: "src/big.ts", oldText: bigBefore, newText: multiAfter }],
+			},
+		});
+		const multiText = stripTerminalSequences(h.render(h.entry(1), { expanded: false }, theme)!.render(100).join("\n"));
+		expect(multiText).toContain("+11 const line_10 = 1001;");
+		expect(multiText).toContain("+201 const line_200 = 2002;");
+		expect(multiText).not.toContain("expand to view");
+
+		h.receive({
+			...activity,
+			toolCall: {
+				toolCallId: "bash-meta",
+				kind: "execute",
+				status: "completed",
+				rawInput: { CommandLine: "rm foo.ts" },
+				content: [{
+					type: "content",
+					content: {
+						type: "text",
+						text: "Created At: 2026-11-23T13:18:14+08:00\nCompleted At: 2026-11-23T13:18:18+08:00\nCommand exited with code 0.\n\nNo output from the command.",
+					},
+				}],
+			},
+		});
+		const bashText = stripTerminalSequences(h.render(h.entry(2), { expanded: true }, theme)!.render(100).join("\n"));
+		expect(bashText).toContain("rm foo.ts");
+		expect(bashText).toContain("(no output)");
+		expect(bashText).not.toContain("Created At:");
+		expect(bashText).not.toContain("ACP details");
+
+		h.receive({
+			...activity,
+			toolCall: {
+				toolCallId: "read-empty",
+				kind: "read",
+				status: "completed",
+				rawInput: { Path: "src/missing.ts", StartLine: 10, EndLine: 29 },
+			},
+		});
+		const readText = stripTerminalSequences(h.render(h.entry(3), { expanded: false }, theme)!.render(100).join("\n"));
+		expect(readText).toContain("src/missing.ts");
+		expect(readText).toContain("Read 20 lines");
 	});
 });

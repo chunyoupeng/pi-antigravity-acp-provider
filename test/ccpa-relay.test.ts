@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
+import http2 from "node:http2";
 import https from "node:https";
 import net from "node:net";
 import os from "node:os";
@@ -20,7 +21,7 @@ import {
 import { AntigravityProcess } from "../src/acp/process.js";
 
 const relays: CcpaRelayHandle[] = [];
-const servers: Array<http.Server | https.Server | net.Server> = [];
+const servers: Array<http.Server | https.Server | http2.Http2SecureServer | net.Server> = [];
 const tempDirs: string[] = [];
 
 afterEach(async () => {
@@ -39,7 +40,7 @@ afterEach(async () => {
 	}
 });
 
-async function listenServer<T extends http.Server | https.Server | net.Server>(server: T): Promise<{ server: T; port: number }> {
+async function listenServer<T extends http.Server | https.Server | http2.Http2SecureServer | net.Server>(server: T): Promise<{ server: T; port: number }> {
 	servers.push(server);
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);
@@ -723,5 +724,64 @@ describe("CCPA Keep-Alive and Retry Relay", () => {
 			call: 1,
 		});
 		expect(upstreamCalls).toBe(1);
+	});
+
+	it("multiplexes HTTPS streaming and non-streaming requests over one persistent HTTP/2 connection", async () => {
+		const { keyPath, certPath } = createSelfSignedCert();
+		let h2Sessions = 0;
+		let requestCount = 0;
+		const h2Upstream = http2.createSecureServer(
+			{ key: fs.readFileSync(keyPath), cert: fs.readFileSync(certPath) },
+			(req, res) => {
+				requestCount += 1;
+				const chunks: Buffer[] = [];
+				req.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+				req.on("end", () => {
+					if (req.url?.includes("streamGenerateContent")) {
+						res.writeHead(200, { "content-type": "text/event-stream" });
+						res.end(`data: {"response":{"step":${requestCount},"httpVersion":"${req.httpVersion}"}}\n\n`);
+						return;
+					}
+					res.writeHead(200, { "content-type": "application/json" });
+					res.end(JSON.stringify({ step: requestCount, httpVersion: req.httpVersion }));
+				});
+			},
+		);
+		h2Upstream.on("session", () => {
+			h2Sessions += 1;
+		});
+		const { port } = await listenServer(h2Upstream);
+
+		const relay = await startCcpaRelay({
+			upstreamUrl: `https://127.0.0.1:${port}`,
+			env: { SSL_CERT_FILE: certPath, NO_PROXY: "127.0.0.1" },
+			baseDelayMs: 5,
+			onLog: () => undefined,
+		});
+		relays.push(relay);
+
+		// Send 2 non-streaming + 3 SSE streaming requests — all must share 1 HTTP/2 session.
+		for (let step = 1; step <= 2; step += 1) {
+			const res = await fetch(`${relay.baseUrl}/v1internal:generateContent`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ step }),
+			});
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual({ step, httpVersion: "2.0" });
+		}
+		for (let step = 3; step <= 5; step += 1) {
+			const res = await fetch(`${relay.baseUrl}/v1internal:streamGenerateContent?alt=sse`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ step }),
+			});
+			expect(res.status).toBe(200);
+			const text = await res.text();
+			expect(text).toContain(`"step":${step}`);
+			expect(text).toContain(`"httpVersion":"2.0"`);
+		}
+		expect(requestCount).toBe(5);
+		expect(h2Sessions).toBe(1);
 	});
 });

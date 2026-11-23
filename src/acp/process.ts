@@ -8,7 +8,6 @@ import { resolveConfigRoot } from "../config.js";
 import { resolveAntigravityAcpLaunch } from "./antigravity.js";
 import { redact } from "./errors.js";
 import { applyAcpProxyEnvironment } from "./proxy.js";
-import { applyCredentialStorageEnvironment, type CredentialStorageOptions } from "./credential-storage.js";
 const STDERR_LIMIT = 16 * 1024;
 const HEARTBEAT_LINES = /^Antigravity CCPA relay: inference streaming .*\n/gmu;
 // Rotated once to `.1` when a new server starts past this size.
@@ -23,9 +22,7 @@ export interface AntigravityProcessOptions {
 	command?: string;
 	args?: string[];
 	env?: NodeJS.ProcessEnv;
-	/** Overrides the credential-storage resolution seams (keychain probe and
-	 * token path) in tests; production callers leave this unset. */
-	credentialStorage?: Omit<CredentialStorageOptions, "env">;
+	dangerouslySkipPermissions?: boolean;
 	/** Appends the child's redacted stderr here. Defaults to
 	 * `resolveServerLogPath()` for the real server and to no log otherwise. */
 	logPath?: string;
@@ -155,7 +152,10 @@ export class AntigravityProcess {
 			const nodeBinary = resolveNodeBinary(options.env?.NODE, options.env ?? process.env);
 			const launch = options.entryPath
 				? { command: nodeBinary, args: [options.entryPath, ...(options.args ?? [])] }
-				: resolveAntigravityAcpLaunch();
+				: resolveAntigravityAcpLaunch({
+						...(options.dangerouslySkipPermissions !== undefined ? { dangerouslySkipPermissions: options.dangerouslySkipPermissions } : {}),
+						...(options.env !== undefined ? { env: options.env } : {}),
+					});
 			if (!options.entryPath) logPath ??= resolveServerLogPath();
 			command = nodeBinary;
 			args = [resolveSupervisorEntry(), "--command", launch.command, ...launch.args];
@@ -165,10 +165,7 @@ export class AntigravityProcess {
 			resolveExit = resolve;
 		});
 
-		const env = applyCredentialStorageEnvironment(
-			applyDefaultTlsEnvironment(applyAcpProxyEnvironment(options.env ?? process.env)),
-			options.credentialStorage ?? {},
-		);
+		const env = applyDefaultTlsEnvironment(applyAcpProxyEnvironment(options.env ?? process.env));
 		const child = spawn(command, args, {
 			cwd: path.resolve(options.cwd),
 			env,

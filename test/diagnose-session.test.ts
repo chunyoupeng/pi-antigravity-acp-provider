@@ -43,7 +43,7 @@ describe("diagnose-session script", () => {
 			{ t: "2026-10-19T14:41:42Z", event: "prompt", pi: PI, acp: ACP, fresh: true, from: 0, to: 41, bytes: 99_397 },
 			{ t: "2026-10-19T14:41:42Z", event: "bind", pi: "someone-else", acp: "b", how: "new", messageCount: 0, model: "m" },
 		]));
-		const transcript = path.join(root, "gemini", "antigravity-acp", "brain", ACP, ".system_generated", "logs");
+		const transcript = path.join(root, "gemini", "antigravity-cli", "brain", ACP, ".system_generated", "logs");
 		fs.mkdirSync(transcript, { recursive: true });
 		const history = "<USER_REQUEST>\nEmbedded resource (urn:pi:antigravity-acp:context/1):\n...</USER_REQUEST>";
 		fs.writeFileSync(path.join(transcript, "transcript_full.jsonl"), jsonl([
@@ -89,7 +89,7 @@ describe("diagnose-session script", () => {
 			{ t: "2026-10-19T14:37:28Z", event: "prompt", pi: PI, acp: ACP, fresh: true, from: 0, to: 30, batch: 2, batches: 2, bytes: 90_000 },
 			{ t: "2026-10-19T14:37:41Z", event: "end", pi: PI, acp: ACP, stop: "end_turn", tokens: 85_000 },
 		]));
-		const transcript = path.join(root, "gemini", "antigravity-acp", "brain", ACP, ".system_generated", "logs");
+		const transcript = path.join(root, "gemini", "antigravity-cli", "brain", ACP, ".system_generated", "logs");
 		fs.mkdirSync(transcript, { recursive: true });
 		fs.writeFileSync(path.join(transcript, "transcript_full.jsonl"), jsonl([
 			{ step_index: 0, type: "USER_INPUT", created_at: "2026-10-19T14:37:25Z", content: "Embedded resource (urn:pi:antigravity-acp:context/1):\n..." },

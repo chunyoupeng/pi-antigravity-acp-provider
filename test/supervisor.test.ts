@@ -221,88 +221,7 @@ describe("applyDefaultTlsEnvironment", () => {
 		expect(reported.sslCertFile).toBe("/custom/integration-ca.crt");
 	});
 
-	it("pins the spawned child to the secure-file credential backend by default on macOS", async () => {
-		// Integration check for the real spawn path: the server's own keychain
-		// probe is bounded to 3 s and can time out under load, which silently
-		// drops a valid login and opens interactive consent.
-		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "antigravity-credential-"));
-		const tokenPath = path.join(directory, "acp_token.json");
-		await fs.writeFile(tokenPath, '{"refresh_token":"fixture"}');
-		const baseEnv: NodeJS.ProcessEnv = { ...process.env };
-		delete baseEnv.AGY_ACP_FORCE_FILE_STORAGE;
-		const child = new AntigravityProcess({
-			cwd: process.cwd(),
-			entryPath: envDumpFixture,
-			args: [],
-			env: baseEnv,
-			credentialStorage: { platform: "darwin", tokenPath, keychainSecret: () => undefined },
-		});
-		const exit = await Promise.race([
-			child.exited,
-			delay(2_000).then(() => {
-				throw new Error("env-dump agent did not exit");
-			}),
-		]);
-		expect(exit.code).toBe(0);
-		const reported = JSON.parse(exit.stderrTail) as { forceFileStorage: string | null };
-		expect(reported.forceFileStorage).toBe("1");
-	});
 
-	it("passes an explicit user choice through unchanged", async () => {
-		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "antigravity-credential-"));
-		const tokenPath = path.join(directory, "acp_token.json");
-		const baseEnv: NodeJS.ProcessEnv = { ...process.env, AGY_ACP_FORCE_FILE_STORAGE: "0" };
-		const child = new AntigravityProcess({
-			cwd: process.cwd(),
-			entryPath: envDumpFixture,
-			args: [],
-			env: baseEnv,
-			credentialStorage: { platform: "darwin", tokenPath, keychainSecret: () => '{"refresh_token":"fixture"}' },
-		});
-		const exit = await Promise.race([
-			child.exited,
-			delay(2_000).then(() => {
-				throw new Error("env-dump agent did not exit");
-			}),
-		]);
-		expect(exit.code).toBe(0);
-		const reported = JSON.parse(exit.stderrTail) as { forceFileStorage: string | null };
-		expect(reported.forceFileStorage).toBe("0");
-		await expect(fs.access(tokenPath)).rejects.toThrow();
-	});
-
-	it("migrates a keychain login into the child's own GEMINI_HOME before spawning", async () => {
-		// The child can run with a store the launching process never sees; the
-		// migration must follow the environment the child actually receives.
-		const childHome = await fs.mkdtemp(path.join(os.tmpdir(), "antigravity-child-home-"));
-		const parentHome = await fs.mkdtemp(path.join(os.tmpdir(), "antigravity-parent-home-"));
-		vi.stubEnv("GEMINI_HOME", parentHome);
-		const baseEnv: NodeJS.ProcessEnv = { ...process.env, GEMINI_HOME: childHome };
-		delete baseEnv.AGY_ACP_FORCE_FILE_STORAGE;
-		delete baseEnv.GEMINI_API_KEY;
-		const child = new AntigravityProcess({
-			cwd: process.cwd(),
-			entryPath: envDumpFixture,
-			args: [],
-			env: baseEnv,
-			credentialStorage: {
-				platform: "darwin",
-				keychainSecret: (_service, account) => (account === "antigravity-acp" ? '{"refresh_token":"fixture"}' : undefined),
-			},
-		});
-		const exit = await Promise.race([
-			child.exited,
-			delay(2_000).then(() => {
-				throw new Error("env-dump agent did not exit");
-			}),
-		]);
-		expect(exit.code).toBe(0);
-		const reported = JSON.parse(exit.stderrTail) as { forceFileStorage: string | null };
-		expect(reported.forceFileStorage).toBe("1");
-		const migrated = await fs.readFile(path.join(childHome, "antigravity-acp", "acp_token.json"), "utf8");
-		expect(migrated).toBe('{"refresh_token":"fixture"}');
-		await expect(fs.access(path.join(parentHome, "antigravity-acp", "acp_token.json"))).rejects.toThrow();
-	});
 
 	it("injects a detected fallback bundle when SSL_CERT_FILE is unset", async () => {
 		// Simulate an environment with no SSL_CERT_FILE (NixOS/minimal Linux) by
@@ -383,7 +302,6 @@ describe("applyDefaultTlsEnvironment", () => {
 					cwd: process.cwd(),
 					entryPath: envDumpFixture,
 					env,
-					credentialStorage: { platform: "linux" },
 				});
 				try {
 					const exit = await Promise.race([

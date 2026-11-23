@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
+import http2 from "node:http2";
 import https from "node:https";
 import net from "node:net";
 import os from "node:os";
@@ -15,6 +16,7 @@ export function formatInferenceHeartbeat(open, bytes) {
 	return `Antigravity CCPA relay: inference streaming (${open} open, ${bytes} bytes received)`;
 }
 export const CCPA_RELAY_ENABLED_ENV = "PI_ANTIGRAVITY_CCPA_RELAY";
+export const CCPA_HTTP2_ENABLED_ENV = "PI_ANTIGRAVITY_CCPA_HTTP2";
 export const CCPA_UPSTREAM_URL_ENV = "PI_ANTIGRAVITY_CCPA_UPSTREAM_URL";
 export const CCPA_MAX_RETRIES_ENV = "PI_ANTIGRAVITY_CCPA_MAX_RETRIES";
 export const CCPA_RETRY_BASE_MS_ENV = "PI_ANTIGRAVITY_CCPA_RETRY_BASE_MS";
@@ -51,6 +53,8 @@ const MAX_PROXY_HEADER_BYTES = 16 * 1024;
 const MAX_ERROR_BODY_BYTES = 64 * 1024;
 const MAX_CACHEABLE_BODY_BYTES = 512 * 1024;
 const SYSTEM_PROXY_CACHE_TTL_MS = 10_000;
+const H2_PING_INTERVAL_MS = 30_000;
+const H2_PING_TIMEOUT_MS = 10_000;
 
 let cachedSystemProxy = { timestamp: 0, url: undefined };
 
@@ -73,6 +77,15 @@ function guardLateSocketErrors(socket) {
 export function shouldStartCcpaRelay(env = process.env) {
 	if (env[CCPA_BASE_URL_ENV]?.trim()) return false;
 	const flag = env[CCPA_RELAY_ENABLED_ENV]?.trim().toLowerCase();
+	if (flag === "0" || flag === "false" || flag === "no" || flag === "off") return false;
+	return true;
+}
+
+function isHttp2Enabled(upstreamUrl, env = process.env, options = {}) {
+	if (upstreamUrl.protocol !== "https:") return false;
+	if (options.agent) return false;
+	if (options.http2 === false) return false;
+	const flag = env[CCPA_HTTP2_ENABLED_ENV]?.trim().toLowerCase();
 	if (flag === "0" || flag === "false" || flag === "no" || flag === "off") return false;
 	return true;
 }
@@ -264,7 +277,7 @@ export class ProxiedHttpsKeepAliveAgent extends https.Agent {
 			const tlsSocket = tls.connect({
 				...options,
 				socket: proxySocket,
-				servername: targetHost,
+				...(net.isIP(targetHost) ? {} : { servername: targetHost }),
 				...(this.options.ca ? { ca: this.options.ca } : {}),
 			});
 			// The tunnel's listeners were removed above; keep a late error on the raw socket
@@ -516,6 +529,35 @@ function sanitizeRequestHeaders(headers, upstreamHost, bodyLength) {
 	return out;
 }
 
+function sanitizeHttp2RequestHeaders(headers, method, targetPath, authority) {
+	const out = {
+		":method": method,
+		":path": targetPath,
+		":scheme": "https",
+		":authority": authority,
+	};
+	for (const [key, value] of Object.entries(headers)) {
+		if (value === undefined) continue;
+		const lower = key.toLowerCase();
+		if (lower.startsWith(":") || lower === "host" || lower === "http2-settings" || HOP_BY_HOP_HEADERS.has(lower)) {
+			continue;
+		}
+		out[lower] = value;
+	}
+	return out;
+}
+
+function sanitizeHttp2ResponseHeaders(headers) {
+	const out = {};
+	for (const [key, value] of Object.entries(headers)) {
+		if (value === undefined) continue;
+		const lower = key.toLowerCase();
+		if (lower.startsWith(":") || HOP_BY_HOP_HEADERS.has(lower)) continue;
+		out[lower] = value;
+	}
+	return out;
+}
+
 function sanitizeResponseHeaders(headers) {
 	const out = {};
 	for (const [key, value] of Object.entries(headers)) {
@@ -649,7 +691,147 @@ export async function startCcpaRelay(options = {}) {
 
 	const agentPool = new Map();
 	const memoryCache = new Map();
+	const h2Enabled = isHttp2Enabled(upstreamUrl, env, options);
+	const h2Sessions = new Map();
+	const h2Connecting = new Map();
+	const h2Unsupported = new Set();
+	const pendingHttp1Sockets = new Map();
 	let preferDirectFallback = false;
+
+	const takePendingHttp1Socket = (baseKey) => {
+		const socket = pendingHttp1Sockets.get(baseKey);
+		if (!socket) return undefined;
+		pendingHttp1Sockets.delete(baseKey);
+		if (socket.destroyed || !socket.readable || !socket.writable) return undefined;
+		return socket;
+	};
+
+	const stashPendingHttp1Socket = (baseKey, socket) => {
+		const previous = pendingHttp1Sockets.get(baseKey);
+		if (previous && previous !== socket && !previous.destroyed) previous.destroy();
+		pendingHttp1Sockets.set(baseKey, socket);
+		const remove = () => {
+			if (pendingHttp1Sockets.get(baseKey) === socket) pendingHttp1Sockets.delete(baseKey);
+		};
+		socket.once("close", remove);
+		socket.once("error", remove);
+	};
+
+	const resolveUpstreamProxy = (forceDirect = false, forceRefreshProxy = false) =>
+		forceDirect || preferDirectFallback
+			? undefined
+			: resolveProxyUrl(upstreamUrl, env, {
+					readSystemProxy: options.readSystemProxy,
+					forceRefreshSystemProxy: forceRefreshProxy,
+				});
+
+	const evictH2Session = (key, entry) => {
+		if (entry.evicted) return;
+		entry.evicted = true;
+		if (entry.pingTimer) {
+			clearInterval(entry.pingTimer);
+			entry.pingTimer = undefined;
+		}
+		if (entry.pingTimeout) {
+			clearTimeout(entry.pingTimeout);
+			entry.pingTimeout = undefined;
+		}
+		if (h2Sessions.get(key) === entry) {
+			h2Sessions.delete(key);
+		}
+	};
+
+	const acquireH2Session = async (forceDirect = false, forceRefreshProxy = false) => {
+		const proxyUrl = resolveUpstreamProxy(forceDirect, forceRefreshProxy);
+		const key = proxyUrl ? proxyUrl.href : "https-direct";
+		if (h2Unsupported.has(key)) return { kind: "unsupported" };
+		const existing = h2Sessions.get(key);
+		if (existing && !existing.session.closed && !existing.session.destroyed) {
+			return { kind: "session", key, entry: existing, reused: existing.requestCount > 0 };
+		}
+		let pending = h2Connecting.get(key);
+		if (!pending) {
+			pending = connectTlsForHttp2(upstreamUrl, proxyUrl, baseAgentOptions, connectTimeoutMs)
+				.then((result) => {
+					if (!result.h2) {
+						h2Unsupported.add(key);
+						if (result.socket) stashPendingHttp1Socket(key, result.socket);
+						return { kind: "unsupported" };
+					}
+					const session = http2.connect(upstreamUrl.origin, {
+						createConnection: () => result.socket,
+					});
+					session.unref?.();
+					const entry = {
+						session,
+						requestCount: 0,
+						evicted: false,
+						pingTimer: undefined,
+						pingTimeout: undefined,
+					};
+					const cleanup = () => evictH2Session(key, entry);
+					session.once("close", cleanup);
+					session.once("goaway", cleanup);
+					session.on("error", () => {
+						cleanup();
+						if (!session.destroyed) session.destroy();
+					});
+					entry.pingTimer = setInterval(() => {
+						if (entry.evicted || session.closed || session.destroyed) {
+							cleanup();
+							return;
+						}
+						if (entry.pingTimeout) return;
+						entry.pingTimeout = setTimeout(() => {
+							entry.pingTimeout = undefined;
+							cleanup();
+							if (!session.destroyed) session.destroy();
+						}, H2_PING_TIMEOUT_MS);
+						entry.pingTimeout.unref?.();
+						try {
+							session.ping((err) => {
+								if (entry.pingTimeout) {
+									clearTimeout(entry.pingTimeout);
+									entry.pingTimeout = undefined;
+								}
+								if (err) {
+									cleanup();
+									if (!session.destroyed) session.destroy();
+								}
+							});
+						} catch {
+							if (entry.pingTimeout) {
+								clearTimeout(entry.pingTimeout);
+								entry.pingTimeout = undefined;
+							}
+							cleanup();
+							if (!session.destroyed) session.destroy();
+						}
+					}, H2_PING_INTERVAL_MS);
+					entry.pingTimer.unref?.();
+					h2Sessions.set(key, entry);
+					return { kind: "session", key, entry, reused: false };
+				})
+				.catch((error) => ({ kind: "network_error", error, reusedSocket: false }))
+				.finally(() => {
+					if (h2Connecting.get(key) === pending) h2Connecting.delete(key);
+				});
+			h2Connecting.set(key, pending);
+		}
+		const resolved = await pending;
+		if (resolved.kind === "session") {
+			if (resolved.entry.session.closed || resolved.entry.session.destroyed) {
+				evictH2Session(key, resolved.entry);
+				return {
+					kind: "network_error",
+					error: new Error("HTTP/2 session closed before stream could open"),
+					reusedSocket: false,
+				};
+			}
+			return { ...resolved, reused: resolved.entry.requestCount > 0 };
+		}
+		return resolved;
+	};
 
 	const getCachedResponse = (cacheKey) => {
 		if (cacheTtlMs <= 0) return undefined;
@@ -731,19 +913,26 @@ export async function startCcpaRelay(options = {}) {
 			}
 			return httpAgent;
 		}
-		const proxyUrl =
-			forceDirect || preferDirectFallback
-				? undefined
-				: resolveProxyUrl(upstreamUrl, env, {
-						readSystemProxy: options.readSystemProxy,
-						forceRefreshSystemProxy: forceRefreshProxy,
-					});
-		const key = `${proxyUrl ? proxyUrl.href : "https-direct"}:${keepAlive ? "ka" : "fresh"}`;
+		const proxyUrl = resolveUpstreamProxy(forceDirect, forceRefreshProxy);
+		const baseKey = proxyUrl ? proxyUrl.href : "https-direct";
+		const key = `${baseKey}:${keepAlive ? "ka" : "fresh"}`;
 		let agent = agentPool.get(key);
 		if (!agent) {
 			agent = proxyUrl
 				? new ProxiedHttpsKeepAliveAgent(proxyUrl, agentOpts)
 				: new https.Agent(agentOpts);
+			const baseCreateConnection = agent.createConnection.bind(agent);
+			agent.createConnection = (connOpts, cb) => {
+				const adopted = takePendingHttp1Socket(baseKey);
+				if (adopted) {
+					if (typeof cb === "function") {
+						cb(null, adopted);
+						return undefined;
+					}
+					return adopted;
+				}
+				return baseCreateConnection(connOpts, cb);
+			};
 			agentPool.set(key, agent);
 		}
 		return agent;
@@ -838,44 +1027,93 @@ export async function startCcpaRelay(options = {}) {
 		for (let attempt = 1; attempt <= maxRetries + 1; ) {
 			if (clientClosed) return;
 
-			// Avoid reusing pooled HTTP/1.1 sockets for SSE inference streams: proxies/GFE
-			// frequently half-close post-SSE connections silently, causing 300s hangs.
-			const activeAgent = getAgent(forceDirectThisRequest, forceRefreshProxy, !isStream);
+			const currentForceRefreshProxy = forceRefreshProxy;
 			forceRefreshProxy = false;
 
-			const outcome = await attemptUpstreamRequest({
-				requestFn,
-				upstreamUrl,
-				targetPath,
-				method,
-				headers,
-				body,
-				agent: activeAgent,
-				isStream,
-				firstByteTimeoutMs,
-				streamIdleTimeoutMs,
-				connectTimeoutMs,
-				clientRes,
-				isClientClosed: () => clientClosed,
-				onStreamCommitted: isStream ? trackStream : undefined,
-				onStreamStall: isStream
-					? (idleMs) =>
-						log(
-							`Antigravity CCPA relay: failed network error (Upstream stream timed out after ${idleMs}ms without data) on ${method} ${targetPath}`,
-						)
-					: undefined,
-				onSuccessBody: cacheKey
-					? (statusCode, resHeaders, resBody) => {
-							if (statusCode === 200 && !resHeaders["content-encoding"]) {
-								putCachedResponse(cacheKey, resHeaders["content-type"], resBody);
+			let outcome;
+			if (h2Enabled) {
+				const h2 = await acquireH2Session(forceDirectThisRequest, currentForceRefreshProxy);
+				if (h2.kind === "session") {
+					outcome = await attemptUpstreamHttp2Request({
+						sessionEntry: h2.entry,
+						reused: h2.reused,
+						onSessionError: () => {
+							evictH2Session(h2.key, h2.entry);
+							if (!h2.entry.session.destroyed) h2.entry.session.destroy();
+						},
+						upstreamUrl,
+						targetPath,
+						method,
+						headers,
+						body,
+						isStream,
+						firstByteTimeoutMs,
+						streamIdleTimeoutMs,
+						clientRes,
+						isClientClosed: () => clientClosed,
+						onStreamCommitted: isStream ? trackStream : undefined,
+						onStreamStall: isStream
+							? (idleMs) =>
+								log(
+									`Antigravity CCPA relay: failed network error (Upstream stream timed out after ${idleMs}ms without data) on ${method} ${targetPath}`,
+								)
+							: undefined,
+						onSuccessBody: cacheKey
+							? (statusCode, resHeaders, resBody) => {
+									if (statusCode === 200 && !resHeaders["content-encoding"]) {
+										putCachedResponse(cacheKey, resHeaders["content-type"], resBody);
+									}
+								}
+							: undefined,
+						onCancelRegister: (fn, add) => {
+							if (add) closeListeners.add(fn);
+							else closeListeners.delete(fn);
+						},
+					});
+				} else if (h2.kind === "network_error") {
+					outcome = h2;
+				}
+			}
+
+			if (!outcome) {
+				// Avoid reusing pooled HTTP/1.1 sockets for SSE inference streams: proxies/GFE
+				// frequently half-close post-SSE connections silently, causing 300s hangs.
+				const activeAgent = getAgent(forceDirectThisRequest, currentForceRefreshProxy, !isStream);
+
+				outcome = await attemptUpstreamRequest({
+					requestFn,
+					upstreamUrl,
+					targetPath,
+					method,
+					headers,
+					body,
+					agent: activeAgent,
+					isStream,
+					firstByteTimeoutMs,
+					streamIdleTimeoutMs,
+					connectTimeoutMs,
+					clientRes,
+					isClientClosed: () => clientClosed,
+					onStreamCommitted: isStream ? trackStream : undefined,
+					onStreamStall: isStream
+						? (idleMs) =>
+							log(
+								`Antigravity CCPA relay: failed network error (Upstream stream timed out after ${idleMs}ms without data) on ${method} ${targetPath}`,
+							)
+						: undefined,
+					onSuccessBody: cacheKey
+						? (statusCode, resHeaders, resBody) => {
+								if (statusCode === 200 && !resHeaders["content-encoding"]) {
+									putCachedResponse(cacheKey, resHeaders["content-type"], resBody);
+								}
 							}
-						}
-					: undefined,
-				onCancelRegister: (fn, add) => {
-					if (add) closeListeners.add(fn);
-					else closeListeners.delete(fn);
-				},
-			});
+						: undefined,
+					onCancelRegister: (fn, add) => {
+						if (add) closeListeners.add(fn);
+						else closeListeners.delete(fn);
+					},
+				});
+			}
 
 			if (outcome.kind === "completed" || clientClosed) {
 				return;
@@ -987,6 +1225,16 @@ export async function startCcpaRelay(options = {}) {
 			closed = true;
 			clearInterval(heartbeat);
 			options.agent?.destroy();
+			for (const [key, entry] of [...h2Sessions.entries()]) {
+				evictH2Session(key, entry);
+				if (!entry.session.destroyed) entry.session.destroy();
+			}
+			h2Sessions.clear();
+			h2Connecting.clear();
+			for (const socket of pendingHttp1Sockets.values()) {
+				if (!socket.destroyed) socket.destroy();
+			}
+			pendingHttp1Sockets.clear();
 			for (const pooledAgent of agentPool.values()) {
 				pooledAgent.destroy();
 			}
@@ -1286,5 +1534,406 @@ function attemptUpstreamRequest({
 		}
 
 		upReq.end(body);
+	});
+}
+
+function connectTlsForHttp2(upstreamUrl, proxyUrl, tlsOptions, connectTimeoutMs) {
+	return new Promise((resolve, reject) => {
+		const targetHost = upstreamUrl.hostname.replace(/^\[|\]$/g, "");
+		const targetPort = Number(upstreamUrl.port) || 443;
+		const socketOpts = {
+			host: targetHost,
+			port: targetPort,
+			...(net.isIP(targetHost) ? {} : { servername: targetHost }),
+			ALPNProtocols: ["h2", "http/1.1"],
+			...(tlsOptions?.ca ? { ca: tlsOptions.ca } : {}),
+			...(tlsOptions?.rejectUnauthorized !== undefined
+				? { rejectUnauthorized: tlsOptions.rejectUnauthorized }
+				: {}),
+		};
+
+		let settled = false;
+		let activeSocket;
+		let timer;
+		const cleanup = () => {
+			if (timer) {
+				clearTimeout(timer);
+				timer = undefined;
+			}
+		};
+		const fail = (err) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			activeSocket?.destroy();
+			reject(err);
+		};
+
+		if (connectTimeoutMs > 0) {
+			timer = setTimeout(() => {
+				timer = undefined;
+				fail(
+					Object.assign(new Error(`Upstream connect/TLS handshake timed out after ${connectTimeoutMs}ms`), {
+						code: "ETIMEDOUT",
+					}),
+				);
+			}, connectTimeoutMs);
+			timer.unref?.();
+		}
+
+		const attachTlsSocket = (socket) => {
+			activeSocket = socket;
+			guardLateSocketErrors(socket);
+			socket.setKeepAlive?.(true, 30_000);
+			const onError = (err) => fail(err);
+			const onClose = () => fail(new Error(`TLS connection to ${targetHost}:${targetPort} closed during handshake`));
+			const onSecureConnect = () => {
+				if (settled) {
+					socket.destroy();
+					return;
+				}
+				settled = true;
+				cleanup();
+				socket.removeListener("error", onError);
+				socket.removeListener("close", onClose);
+				if (socket.alpnProtocol === "h2") {
+					resolve({ h2: true, socket });
+				} else {
+					resolve({ h2: false, socket });
+				}
+			};
+			socket.once("error", onError);
+			socket.once("close", onClose);
+			if (socket.authorized || (!socket.connecting && !socket.secureConnecting)) {
+				onSecureConnect();
+			} else {
+				socket.once("secureConnect", onSecureConnect);
+			}
+		};
+
+		if (proxyUrl) {
+			const tunnelAgent = new ProxiedHttpsKeepAliveAgent(proxyUrl, {
+				...(tlsOptions?.ca ? { ca: tlsOptions.ca } : {}),
+			});
+			tunnelAgent.createConnection(socketOpts, (err, socket) => {
+				if (err || !socket) {
+					fail(err ?? new Error("Proxy tunnel returned no socket"));
+					return;
+				}
+				attachTlsSocket(socket);
+			});
+		} else {
+			attachTlsSocket(tls.connect(socketOpts));
+		}
+	});
+}
+
+function attemptUpstreamHttp2Request({
+	sessionEntry,
+	reused,
+	onSessionError,
+	upstreamUrl,
+	targetPath,
+	method,
+	headers,
+	body,
+	isStream,
+	firstByteTimeoutMs,
+	streamIdleTimeoutMs,
+	clientRes,
+	isClientClosed,
+	onSuccessBody,
+	onStreamCommitted,
+	onStreamStall,
+	onCancelRegister,
+}) {
+	return new Promise((resolve) => {
+		let settled = false;
+		let stream;
+		let firstByteTimer;
+		let streamIdleTimer;
+		const clearFirstByteTimer = () => {
+			if (!firstByteTimer) return;
+			clearTimeout(firstByteTimer);
+			firstByteTimer = undefined;
+		};
+		const clearStreamIdleTimer = () => {
+			if (!streamIdleTimer) return;
+			clearTimeout(streamIdleTimer);
+			streamIdleTimer = undefined;
+		};
+		const startStream = () => {
+			if (settled || stream || !onStreamCommitted) return;
+			stream = onStreamCommitted();
+		};
+		const finish = (result) => {
+			if (settled) return;
+			settled = true;
+			clearFirstByteTimer();
+			clearStreamIdleTimer();
+			stream?.end();
+			onCancelRegister(abortUpstream, false);
+			resolve(result);
+		};
+
+		let upStream;
+		try {
+			sessionEntry.requestCount += 1;
+			const h2Headers = sanitizeHttp2RequestHeaders(headers, method, targetPath, upstreamUrl.host);
+			upStream = sessionEntry.session.request(h2Headers);
+		} catch (err) {
+			onSessionError?.();
+			finish({ kind: "network_error", error: err, reusedSocket: reused });
+			return;
+		}
+
+		const abortUpstream = () => {
+			try {
+				upStream.close(http2.constants.NGHTTP2_CANCEL);
+			} catch {
+				upStream.destroy();
+			}
+			finish({ kind: "completed" });
+		};
+		onCancelRegister(abortUpstream, true);
+
+		startStream();
+
+		let statusCode = 502;
+		let responseHeaders = {};
+		let committed = false;
+		let gotResponse = false;
+
+		const readStreamErrorBody = () =>
+			new Promise((resolveBody) => {
+				const chunks = [];
+				let total = 0;
+				upStream.on("data", (chunk) => {
+					const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+					if (total < MAX_ERROR_BODY_BYTES) {
+						const slice = buf.subarray(0, MAX_ERROR_BODY_BYTES - total);
+						chunks.push(slice);
+						total += slice.length;
+					}
+				});
+				upStream.once("end", () => resolveBody(Buffer.concat(chunks)));
+				upStream.once("error", () => resolveBody(Buffer.concat(chunks)));
+				upStream.once("close", () => resolveBody(Buffer.concat(chunks)));
+			});
+
+		upStream.once("response", async (rawHeaders) => {
+			gotResponse = true;
+			statusCode = Number(rawHeaders[":status"]) || 502;
+			responseHeaders = sanitizeHttp2ResponseHeaders(rawHeaders);
+			if (statusCode !== 200) {
+				stream?.end();
+			}
+			if (RETRYABLE_STATUS_CODES.has(statusCode)) {
+				clearFirstByteTimer();
+				const errBody = await readStreamErrorBody();
+				finish({
+					kind: "http_error",
+					statusCode,
+					headers: responseHeaders,
+					body: errBody,
+				});
+				return;
+			}
+
+			const onFirstData = (firstChunk) => {
+				clearFirstByteTimer();
+				cleanupPreCommit();
+				const buf = Buffer.isBuffer(firstChunk) ? firstChunk : Buffer.from(firstChunk);
+				if (isStream && statusCode === 200) {
+					const sseErrorCode = isRetryableSseErrorChunk(buf);
+					if (sseErrorCode !== undefined) {
+						try {
+							upStream.close(http2.constants.NGHTTP2_CANCEL);
+						} catch {
+							upStream.destroy();
+						}
+						finish({
+							kind: "http_error",
+							statusCode: sseErrorCode,
+							headers: { "content-type": "application/json" },
+							body: buf,
+						});
+						return;
+					}
+				}
+				committed = true;
+				if (isClientClosed()) {
+					try {
+						upStream.close(http2.constants.NGHTTP2_CANCEL);
+					} catch {
+						upStream.destroy();
+					}
+					finish({ kind: "completed" });
+					return;
+				}
+				clientRes.writeHead(statusCode, responseHeaders);
+				clientRes.write(buf);
+				const armStreamIdleTimer = () => {
+					if (!isStream || !(streamIdleTimeoutMs > 0) || settled) return;
+					clearStreamIdleTimer();
+					streamIdleTimer = setTimeout(() => {
+						streamIdleTimer = undefined;
+						if (settled) return;
+						onStreamStall?.(streamIdleTimeoutMs);
+						upStream.unpipe(clientRes);
+						try {
+							upStream.close(http2.constants.NGHTTP2_CANCEL);
+						} catch {
+							upStream.destroy();
+						}
+						clientRes.destroy();
+						finish({ kind: "completed" });
+					}, streamIdleTimeoutMs);
+					streamIdleTimer.unref?.();
+				};
+				if (statusCode === 200 && onStreamCommitted) {
+					startStream();
+					stream.received(buf.length);
+				}
+				if (isStream && statusCode === 200) {
+					armStreamIdleTimer();
+					upStream.on("data", (chunk) => {
+						stream?.received(chunk.length);
+						armStreamIdleTimer();
+					});
+				} else if (statusCode === 200 && onStreamCommitted) {
+					upStream.on("data", (chunk) => stream.received(chunk.length));
+				}
+				const shouldCapture = typeof onSuccessBody === "function" && statusCode === 200;
+				const capturedChunks = shouldCapture ? [buf] : undefined;
+				let capturedBytes = shouldCapture ? buf.length : 0;
+				let captureOverflow = shouldCapture && capturedBytes > MAX_CACHEABLE_BODY_BYTES;
+				if (shouldCapture) {
+					upStream.on("data", (chunk) => {
+						if (captureOverflow) return;
+						const c = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+						capturedBytes += c.length;
+						if (capturedBytes > MAX_CACHEABLE_BODY_BYTES) {
+							captureOverflow = true;
+							capturedChunks.length = 0;
+							return;
+						}
+						capturedChunks.push(c);
+					});
+				}
+				let endedCleanly = false;
+				upStream.pipe(clientRes);
+				upStream.once("end", () => {
+					endedCleanly = true;
+					if (shouldCapture && !captureOverflow && capturedChunks) {
+						try {
+							onSuccessBody(statusCode, responseHeaders, Buffer.concat(capturedChunks));
+						} catch {
+							// Ignore cache callback errors.
+						}
+					}
+					finish({ kind: "completed" });
+				});
+				upStream.once("close", () => {
+					if (!endedCleanly && !clientRes.writableEnded) {
+						clientRes.destroy();
+					}
+					finish({ kind: "completed" });
+				});
+				upStream.once("error", () => {
+					clientRes.destroy();
+					finish({ kind: "completed" });
+				});
+			};
+
+			const onEmptyEnd = () => {
+				clearFirstByteTimer();
+				cleanupPreCommit();
+				committed = true;
+				if (!isClientClosed() && !clientRes.headersSent) {
+					clientRes.writeHead(statusCode, responseHeaders);
+					clientRes.end();
+				}
+				finish({ kind: "completed" });
+			};
+
+			const onPreCommitError = (err) => {
+				cleanupPreCommit();
+				if (!committed) {
+					if (sessionEntry.session.closed || sessionEntry.session.destroyed) onSessionError?.();
+					finish({ kind: "network_error", error: err, reusedSocket: reused });
+				}
+			};
+
+			const onPreCommitClose = () => {
+				cleanupPreCommit();
+				if (!committed && !settled) {
+					if (sessionEntry.session.closed || sessionEntry.session.destroyed) onSessionError?.();
+					finish({
+						kind: "network_error",
+						error: new Error("Upstream closed stream before sending any response data"),
+						reusedSocket: reused,
+					});
+				}
+			};
+
+			const cleanupPreCommit = () => {
+				upStream.removeListener("data", onFirstData);
+				upStream.removeListener("end", onEmptyEnd);
+				upStream.removeListener("error", onPreCommitError);
+				upStream.removeListener("close", onPreCommitClose);
+			};
+
+			upStream.once("data", onFirstData);
+			upStream.once("end", onEmptyEnd);
+			upStream.once("error", onPreCommitError);
+			upStream.once("close", onPreCommitClose);
+		});
+
+		upStream.once("error", (err) => {
+			if (!gotResponse) {
+				if (
+					sessionEntry.session.closed ||
+					sessionEntry.session.destroyed ||
+					err?.code === "ERR_HTTP2_GOAWAY_SESSION" ||
+					err?.code === "ERR_HTTP2_SESSION_ERROR" ||
+					err?.code === "ERR_HTTP2_INVALID_SESSION"
+				) {
+					onSessionError?.();
+				}
+				finish({ kind: "network_error", error: err, reusedSocket: reused });
+			}
+		});
+
+		upStream.once("close", () => {
+			if (!gotResponse && !settled) {
+				onSessionError?.();
+				finish({
+					kind: "network_error",
+					error: new Error("Upstream HTTP/2 stream closed before response headers"),
+					reusedSocket: reused,
+				});
+			}
+		});
+
+		if (firstByteTimeoutMs > 0) {
+			firstByteTimer = setTimeout(() => {
+				firstByteTimer = undefined;
+				if (settled) return;
+				const timeoutErr = Object.assign(
+					new Error(`Upstream timed out before first byte after ${firstByteTimeoutMs}ms`),
+					{ code: "ETIMEDOUT" },
+				);
+				try {
+					upStream.close(http2.constants.NGHTTP2_CANCEL);
+				} catch {
+					upStream.destroy();
+				}
+				finish({ kind: "network_error", error: timeoutErr, reusedSocket: reused });
+			}, firstByteTimeoutMs);
+			firstByteTimer.unref?.();
+		}
+
+		upStream.end(body);
 	});
 }

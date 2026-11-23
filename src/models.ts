@@ -10,20 +10,12 @@ export const API_ID = "antigravity-acp";
 /** Cap inline base64 image payloads at 512 KiB and 1536px (2x2 Gemini 768px tiles). */
 export const MAX_IMAGE_BYTES = 512 * 1024;
 export const MAX_IMAGE_DIMENSION = 1536;
-/** Antigravity's harness replaces history with its own summary once its count
- * passes about 247-250k (of a nominal 256k; measured 2026-10-17, server 1.4.0),
- * although the model accepts 1M. Pi is given that count (see
- * transcript-usage.ts) and checks it once per step, while one step can add a
- * 46 KiB tool result (about 18k), so Pi compacts first, visibly, with room for
- * that step. */
+/** Unpatched `agy acp` checkpoints around 256k; the provider patches a private
+ * copy of `agy` up to 544k (leaving the official binary untouched), so Pi can
+ * compact cleanly around 512k before the harness summarizes on its own. */
 export const CONTEXT_WINDOW = 512_000;
-/** `_meta.antigravity.mcpMaxOutputBytes`: each MCP result item up to this size
- * (images by decoded bytes) reaches the model inline; a larger one is only a
- * file path. Above every image Pi sends (verified 2026-10-15, server 1.4.0). */
-export const MCP_MAX_OUTPUT_BYTES = 1024 * 1024;
-/** The harness cuts any text result over 48 KiB to its head regardless of
- * mcpMaxOutputBytes (verified 2026-10-15, server 1.4.0), so Pi tool text is
- * capped below that with its continuation note intact. */
+/** Cap bridged Pi tool text inline at 46 KiB and save larger output to a
+ * temporary file with a read_file continuation note. */
 export const MAX_TEXT_RESULT_BYTES = 46 * 1024;
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;

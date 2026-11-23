@@ -1,106 +1,51 @@
-import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
-	clearAntigravityCredentials,
 	inspectAntigravityAuth,
-	resolveAntigravityAcpDirectory,
+	resolveAgyCliAppDataDir,
 } from "../src/acp/antigravity.js";
 
-const roots: string[] = [];
 const apiKey = process.env.GEMINI_API_KEY;
 beforeEach(() => {
 	delete process.env.GEMINI_API_KEY;
 });
 afterEach(() => {
 	if (apiKey !== undefined) process.env.GEMINI_API_KEY = apiKey;
-	for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-function root(): string {
-	const value = fs.mkdtempSync(path.join(os.tmpdir(), "antigravity-auth-"));
-	roots.push(value);
-	return value;
-}
-
 describe("Antigravity auth health", () => {
-	it("does not mistake settings alone for completed authentication", () => {
-		const directory = root();
-		fs.writeFileSync(path.join(directory, "settings.json"), '{"auth":{"type":"oauth-personal"}}');
-		expect(inspectAntigravityAuth(directory, {}, () => false).status).toBe("configured-not-authenticated");
-	});
-
 	it("recognizes an OAuth token held in the macOS Keychain", () => {
-		const directory = root();
-		fs.writeFileSync(path.join(directory, "settings.json"), '{"auth":{"type":"oauth-personal"}}');
-		const queried: Array<string | undefined> = [];
-		const health = inspectAntigravityAuth(directory, {}, (authType) => {
-			queried.push(authType);
-			return true;
+		const health = inspectAntigravityAuth({}, () => true);
+		expect(health).toEqual({
+			status: "oauth-refreshable",
+			authType: "oauth-personal",
+			credentialStore: "keychain",
 		});
-		expect(queried).toEqual(["oauth-personal"]);
-		expect(health).toMatchObject({ status: "oauth-refreshable", credentialStore: "keychain", tokenFile: false });
 	});
 
-	it("recognizes a structurally refreshable token and clears it", () => {
-		const directory = root();
-		fs.writeFileSync(path.join(directory, "settings.json"), '{"auth":{"type":"oauth-personal"}}');
-		fs.writeFileSync(path.join(directory, "acp_token.json"), '{"refresh_token":"secret"}');
-		expect(inspectAntigravityAuth(directory, {}, () => false).status).toBe("oauth-refreshable");
-		clearAntigravityCredentials(directory);
-		expect(inspectAntigravityAuth(directory, {}, () => false).status).toBe("missing");
-	});
-
-	it("reports corrupt token files", () => {
-		const directory = root();
-		fs.writeFileSync(path.join(directory, "acp_token.json"), "not-json");
-		expect(inspectAntigravityAuth(directory, {}, () => false).status).toBe("corrupt");
-	});
-
-	it("follows an explicit GEMINI_HOME to the relocated token", () => {
-		const home = root();
-		const acp = path.join(home, "antigravity-acp");
-		fs.mkdirSync(acp, { recursive: true });
-		fs.writeFileSync(path.join(acp, "acp_token.json"), '{"refresh_token":"secret"}');
-		const previous = process.env.GEMINI_HOME;
-		process.env.GEMINI_HOME = home;
-		try {
-			expect(resolveAntigravityAcpDirectory()).toBe(acp);
-			expect(inspectAntigravityAuth().status).toBe("oauth-refreshable");
-		} finally {
-			if (previous === undefined) delete process.env.GEMINI_HOME;
-			else process.env.GEMINI_HOME = previous;
-		}
-	});
-
-	it("ignores an empty GEMINI_HOME and keeps the default home", () => {
-		const previous = process.env.GEMINI_HOME;
-		process.env.GEMINI_HOME = "  ";
-		try {
-			expect(resolveAntigravityAcpDirectory()).toBe(
-				path.join(os.homedir(), ".gemini", "antigravity-acp"),
-			);
-		} finally {
-			if (previous === undefined) delete process.env.GEMINI_HOME;
-			else process.env.GEMINI_HOME = previous;
-		}
-	});
-
-	it("resolves the store from the environment it is given", () => {
-		expect(resolveAntigravityAcpDirectory({ HOME: "/child/home" })).toBe(
-			path.join("/child/home", ".gemini", "antigravity-acp"),
-		);
-		expect(resolveAntigravityAcpDirectory({ HOME: "/child/home", GEMINI_HOME: "/child/workspace" })).toBe(
-			path.join("/child/workspace", "antigravity-acp"),
-		);
+	it("reports missing when neither API key nor keychain entry exists", () => {
+		expect(inspectAntigravityAuth({}, () => false)).toEqual({ status: "missing" });
 	});
 
 	it("reads the API key from the inspected environment only", () => {
-		const directory = root();
-		fs.writeFileSync(path.join(directory, "acp_token.json"), '{"refresh_token":"secret"}');
-		expect(inspectAntigravityAuth(directory, { GEMINI_API_KEY: "child-key" }).status).toBe("api-key-env");
-		expect(inspectAntigravityAuth(directory, {}).status).toBe("oauth-refreshable");
+		expect(inspectAntigravityAuth({ GEMINI_API_KEY: "child-key" }, () => false)).toEqual({
+			status: "api-key-env",
+			authType: "gemini-api-key",
+		});
+		expect(inspectAntigravityAuth({}, () => false).status).toBe("missing");
+	});
+
+	it("resolves the agy CLI app data dir from HOME and GEMINI_HOME", () => {
+		expect(resolveAgyCliAppDataDir({ HOME: "/child/home" })).toBe(
+			path.join("/child/home", ".gemini", "antigravity-cli"),
+		);
+		expect(resolveAgyCliAppDataDir({ HOME: "/child/home", GEMINI_HOME: "/child/workspace" })).toBe(
+			path.join("/child/workspace", "antigravity-cli"),
+		);
+		expect(resolveAgyCliAppDataDir({ HOME: os.homedir(), GEMINI_HOME: "  " })).toBe(
+			path.join(os.homedir(), ".gemini", "antigravity-cli"),
+		);
 	});
 });

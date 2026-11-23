@@ -177,6 +177,55 @@ describe("ACP session compatibility", () => {
 		expect(sessionModels(state)?.availableModels.map((m) => m.modelId)).toContain("gemini-4-hydrogen-xhigh");
 	});
 
+	it("retains exact per-family inventory when non-thinking models share the selector (agy CLI)", () => {
+		const state = decodeSessionState({
+			models: {
+				currentModelId: "gemini-4-neon-high",
+				availableModels: [
+					{ modelId: "gemini-4-neon-low", name: "Gemini 4 Neon (Low)" },
+					{ modelId: "gemini-4-neon-medium", name: "Gemini 4 Neon (Medium)" },
+					{ modelId: "gemini-4-neon-high", name: "Gemini 4 Neon (High)" },
+					{ modelId: "gemini-4-neon-xhigh", name: "Gemini 4 Neon (XHigh)" },
+					{ modelId: "gemini-4-carbon-low", name: "Gemini 4 Carbon (Low)" },
+					{ modelId: "gemini-4-carbon-medium", name: "Gemini 4 Carbon (Medium)" },
+					{ modelId: "gemini-4-carbon-high", name: "Gemini 4 Carbon (High)" },
+					{ modelId: "gemini-pro-orchestrator-neon", name: "Orchestrator (Neon)" },
+				],
+			},
+			configOptions: [
+				{
+					id: "model",
+					name: "Model",
+					category: "model",
+					type: "select",
+					currentValue: "gemini-4-neon",
+					options: [
+						{ value: "gemini-4-neon", name: "Gemini 4 Neon" },
+						{ value: "gemini-4-carbon", name: "Gemini 4 Carbon" },
+						{ value: "gemini-pro-orchestrator-neon", name: "Orchestrator (Neon)" },
+					],
+				},
+				{
+					id: "thought_level",
+					name: "Thinking Level",
+					category: "thought_level",
+					type: "select",
+					currentValue: "high",
+					options: [
+						{ value: "low", name: "Low" },
+						{ value: "medium", name: "Medium" },
+						{ value: "high", name: "High" },
+						{ value: "xhigh", name: "Extra" },
+					],
+				},
+			],
+		});
+		const ids = sessionModels(state)?.availableModels.map((m) => m.modelId);
+		expect(ids).not.toContain("gemini-4-carbon-xhigh");
+		expect(ids).toContain("gemini-pro-orchestrator-neon");
+		expect(ids).not.toContain("gemini-pro-orchestrator-neon-high");
+	});
+
 	it("retains legacy labels only for a complete compatible inventory", () => {
 		const state = splitState();
 		const legacy = sessionModels(state)!.availableModels.map((model) => ({ ...model, name: `Legacy ${model.name}` })).reverse();

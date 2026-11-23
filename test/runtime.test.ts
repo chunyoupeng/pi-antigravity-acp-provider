@@ -561,7 +561,7 @@ describe("AntigravityRuntime", () => {
 		const lines = Array.from({ length: 1000 }, (_, index) => `${index + 1}: ${"y".repeat(80)}`);
 		const text = await relayToolResult([{ type: "text", text: lines.join("\n") }]);
 		expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(MAX_TEXT_RESULT_BYTES);
-		const note = /\n\n\[Showing lines 1-(\d+) of 1000 \(46 KiB limit\)\. Full output: (.+)\. Read the rest with pi_read \(offset=(\d+)\)\.\]$/u.exec(text);
+		const note = /\n\n\[Showing lines 1-(\d+) of 1000 \(46 KiB limit\)\. Full output: (.+)\. Read the rest with read_file \(StartLine=(\d+)\)\.\]$/u.exec(text);
 		if (!note) throw new Error(`Missing note in: ${text.slice(-300)}`);
 		expect(text.slice(0, note.index)).toBe(lines.slice(0, Number(note[1])).join("\n"));
 		expect(Number(note[3])).toBe(Number(note[1]) + 1);
@@ -678,7 +678,6 @@ describe("AntigravityRuntime", () => {
 			"yolo",
 			undefined,
 			undefined,
-			"pi",
 			200,
 		);
 		try {

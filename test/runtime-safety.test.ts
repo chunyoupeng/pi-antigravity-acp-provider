@@ -40,7 +40,7 @@ function setup(
 		const connection = new AntigravityAcpConnection({ ...options, command: process.execPath,
 			args: [fakeAgent, ...(scenario ? [scenario] : [])], env: { ...process.env, FAKE_AGENT_LOG_FILE: log } });
 		connections.push(connection); return connection;
-	}, mode, store, undefined, "pi", undefined, decisions, idleTimeoutMs);
+	}, mode, store, undefined, undefined, decisions, idleTimeoutMs);
 	runtimes.push(runtime);
 	const entries = () => fs.readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as { method: string; prompt?: unknown; mode?: string });
 	return { root, runtime, connections, entries };
@@ -590,7 +590,7 @@ describe("session/new stall recovery", () => {
 			const connection = new AntigravityAcpConnection({ ...options, command: process.execPath, sessionNewTimeoutMs: 150,
 				args: [fakeAgent, scenario], env: { ...process.env, FAKE_AGENT_LOG_FILE: log } });
 			connections.push(connection); return connection;
-		}, "yolo", undefined, undefined, "pi");
+		}, "yolo");
 		runtimes.push(runtime);
 		const sessionNews = () => fs.readFileSync(log, "utf8").split("\n").filter((line) => line.includes('"session/new"')).length;
 		return { runtime, connections, sessionNews };

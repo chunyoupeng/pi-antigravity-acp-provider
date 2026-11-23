@@ -1,7 +1,6 @@
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 
-import { inspectAntigravityAuth } from "./acp/antigravity.js";
-import { ensureAntigravityAcpReady, inspectRuntimeSetup } from "./acp/setup.js";
+import { inspectAntigravityAuth, resolveAntigravityAcpLaunch } from "./acp/antigravity.js";
 import { MANAGED_AUTH_MARKER } from "./constants.js";
 import { savePermissionMode, type PermissionMode } from "./config.js";
 import type { AntigravityRuntime } from "./runtime.js";
@@ -10,9 +9,8 @@ export async function runSetupWizard(
 	ui: ExtensionUIContext,
 	runtime: AntigravityRuntime,
 ): Promise<void> {
-	ui.notify("Checking Antigravity ACP runtime…", "info");
-	await ensureAntigravityAcpReady((message) => ui.notify(message, "info"));
-	const setup = inspectRuntimeSetup();
+	ui.notify("Checking Antigravity CLI (agy)…", "info");
+	const launch = resolveAntigravityAcpLaunch();
 	let localAuth = inspectAntigravityAuth();
 	if (localAuth.status !== "oauth-refreshable" && localAuth.status !== "api-key-env") {
 		const loginNow = await ui.confirm(
@@ -21,7 +19,7 @@ export async function runSetupWizard(
 		);
 		if (!loginNow) {
 			ui.notify(
-				`Runtime ${setup.installedVersion ?? setup.approvedVersion} ready at ${setup.launch?.command ?? "unknown path"}. Run /login and choose Google Antigravity (ACP) when ready.`,
+				`Antigravity CLI ready at ${launch.command}. Run /login and choose Google Antigravity (ACP) when ready.`,
 				"warning",
 			);
 			return;
@@ -73,7 +71,7 @@ export async function runSetupWizard(
 	ui.notify(
 		[
 			"Antigravity ACP setup complete.",
-			`Runtime: ${setup.installedVersion ?? setup.approvedVersion} (${setup.platform})`,
+			`CLI: ${launch.command}`,
 			`Authentication: valid ${localAuth.authType ?? localAuth.status}`,
 			`Models discovered: ${models.length}`,
 			`Permission mode: ${runtimeStatus.permissionMode.replace("_", "-")}.`,

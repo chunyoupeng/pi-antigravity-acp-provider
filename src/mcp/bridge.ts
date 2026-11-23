@@ -18,6 +18,8 @@ import { projectToolSchema } from "./schema.js";
 const BODY_LIMIT = 1024 * 1024;
 const MAX_TOOLS = 64;
 export const BRIDGE_NAME = "pi-bridge";
+/** Pi core tools superseded when Antigravity's native file and shell tools are active. */
+export const NATIVE_REPLACED_PI_TOOLS: ReadonlySet<string> = new Set(["read", "write", "edit", "bash"]);
 
 interface BridgeTool {
 	mcpName: string;
@@ -191,7 +193,7 @@ function projectTools(
 	const output: BridgeTool[] = [];
 	const names = new Set<string>();
 	for (const tool of tools) {
-		if (tool.name === PERMISSION_TOOL_NAME) continue;
+		if (tool.name === PERMISSION_TOOL_NAME || NATIVE_REPLACED_PI_TOOLS.has(tool.name)) continue;
 		if (output.length >= MAX_TOOLS) {
 			omissions.push({ name: tool.name, reason: `Tool limit ${MAX_TOOLS} reached` });
 			continue;

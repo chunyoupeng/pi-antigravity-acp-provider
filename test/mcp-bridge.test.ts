@@ -4,7 +4,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
 
-import { PiMcpBridge } from "../src/mcp/bridge.js";
+import { PiMcpBridge, piToolFingerprint } from "../src/mcp/bridge.js";
 
 const tools: Tool[] = [
 	{
@@ -63,5 +63,31 @@ describe("PiMcpBridge", () => {
 		expect(bridge.reports("Running pi_other", undefined)).toBe(false);
 		expect(bridge.reports("Run search_web?", undefined)).toBe(false);
 		expect(bridge.reports("Running run_command", undefined)).toBe(false);
+	});
+
+	it("excludes core file and shell tools when native tools handle them", async () => {
+		const mixed: Tool[] = [
+			{ name: "read", description: "Read", parameters: Type.Object({ path: Type.String() }) },
+			{ name: "write", description: "Write", parameters: Type.Object({ path: Type.String() }) },
+			{ name: "edit", description: "Edit", parameters: Type.Object({ path: Type.String() }) },
+			{ name: "bash", description: "Bash", parameters: Type.Object({ command: Type.String() }) },
+			{ name: "codemode", description: "Codemode", parameters: Type.Object({ code: Type.String() }) },
+			{ name: "memory", description: "Memory", parameters: Type.Object({ action: Type.String() }) },
+		];
+		const bridge = new PiMcpBridge({ tools: mixed, onCall: vi.fn() });
+		expect(bridge.fingerprint).toBe(piToolFingerprint(mixed));
+		const descriptor = await bridge.start();
+		if (!descriptor || !("url" in descriptor)) throw new Error("bridge did not start");
+		const headers = Object.fromEntries(descriptor.headers.map((header) => [header.name, header.value]));
+		const client = new Client({ name: "bridge-test", version: "1" }, { capabilities: {} });
+		const transport = new StreamableHTTPClientTransport(new URL(descriptor.url), { requestInit: { headers } });
+		try {
+			await client.connect(transport as Parameters<typeof client.connect>[0]);
+			const catalog = await client.listTools();
+			expect(catalog.tools.map((tool) => tool.name)).toEqual(["pi_codemode", "pi_memory"]);
+		} finally {
+			await client.close();
+			await bridge.close();
+		}
 	});
 });

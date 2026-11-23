@@ -99,6 +99,17 @@ describe("contextTokensInUse", () => {
 		await expect(contextTokensInUse(sessionId, 1010, profile, [])).resolves.toBe(Math.ceil((192_000 + 25 + 68_000) / 2.6));
 	});
 
+	it("counts middle-truncated bytes reported by agy CLI transcripts", async () => {
+		const note = "<truncated 36263 of 46151 bytes from the middle of the output>";
+		const profile = profileWith([
+			JSON.stringify({ step_index: 2, type: "GENERIC", content: `${"x".repeat(10_000)}\n${note}\n` }),
+			planner(3, 1000, 0, 10),
+		]);
+		await expect(contextTokensInUse(sessionId, 1010, profile, [])).resolves.toBe(
+			Math.ceil((10_000 + 2 + note.length + 36_263) / 2.6),
+		);
+	});
+
 	it("keeps counting through the harness's checkpoint so Pi compacts", async () => {
 		const profile = profileWith([
 			JSON.stringify({ step_index: 2, type: "MCP_TOOL", content: "x".repeat(260_000) }),
