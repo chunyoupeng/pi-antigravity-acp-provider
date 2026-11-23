@@ -15,9 +15,9 @@ import { API_ID, CONTEXT_WINDOW, FALLBACK_MODELS, MAX_IMAGE_BYTES, MAX_IMAGE_DIM
 import { AntigravityRuntime, MANAGED_AUTH_MARKER } from "./runtime.js";
 
 export const DEFAULT_MODEL_CATALOG_TTL_MS = 6 * 3_600_000;
-/** Bumped when model projection changes (e.g. xhigh tier mapping) so stale
- * cached catalogs from older builds are re-discovered automatically. */
-export const MODEL_CATALOG_SCHEMA_TAG = "antigravity-acp-v2";
+/** Bumped when model projection changes (e.g. non-Gemini reasoning families) so
+ * stale cached catalogs from older builds are re-discovered automatically. */
+export const MODEL_CATALOG_SCHEMA_TAG = "antigravity-acp-v3";
 
 function resolveModelCatalogTtlMs(): number {
 	const raw = process.env.PI_ANTIGRAVITY_MODEL_CATALOG_TTL_MS?.trim();

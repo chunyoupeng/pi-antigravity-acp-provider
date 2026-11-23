@@ -8,6 +8,7 @@ import {
 	type SimpleStreamOptions,
 	type StopReason,
 	type ToolCall,
+	type Usage,
 } from "@earendil-works/pi-ai";
 
 import { AntigravityAcpError, errorMessage } from "../acp/errors.js";
@@ -20,9 +21,15 @@ export class PiEventWriter {
 	private open: { kind: "text" | "thinking"; index: number } | undefined;
 	private started = false;
 	private terminal = false;
+	private completedOutputTokens = 0;
+	private inFlightOutputChars = 0;
 
 	get finished(): boolean {
 		return this.terminal;
+	}
+
+	get cumulativeOutputTokens(): number {
+		return this.completedOutputTokens;
 	}
 
 	constructor(private readonly model: Model<Api>, private readonly options: SimpleStreamOptions = {}) {
@@ -39,13 +46,37 @@ export class PiEventWriter {
 		};
 	}
 
+	resetOutputTracking(): void {
+		this.completedOutputTokens = 0;
+		this.inFlightOutputChars = 0;
+	}
+
+	/** Records a completed internal ACP step's usage on this assistant turn and
+	 * notifies Pi so live token counters advance across multi-step native tool
+	 * turns instead of freezing or dropping back to the last step's output. */
+	recordStepUsage(stepUsage: Usage): void {
+		if (this.terminal) return;
+		if (stepUsage.output > 0) {
+			this.completedOutputTokens += stepUsage.output;
+			this.inFlightOutputChars = 0;
+		}
+		const output =
+			this.completedOutputTokens > 0
+				? this.completedOutputTokens + Math.ceil(this.inFlightOutputChars / 4)
+				: stepUsage.output;
+		this.message.usage = { ...stepUsage, output };
+		if (output > 0) this.notifyUsageUpdate();
+	}
+
 	text(delta: string): void {
 		if (!delta || this.terminal) return;
 		const index = this.ensureOpen("text");
 		const block = this.message.content[index];
 		if (!block || block.type !== "text") throw new Error("Pi text block invariant failed");
 		block.text += delta;
-		this.stream.push({ type: "text_delta", contentIndex: index, delta, partial: this.message });
+		this.inFlightOutputChars += delta.length;
+		this.syncLiveOutputUsage();
+		this.stream.push({ type: "text_delta", contentIndex: index, delta, partial: this.snapshot() });
 	}
 
 	thinking(delta: string): void {
@@ -54,7 +85,9 @@ export class PiEventWriter {
 		const block = this.message.content[index];
 		if (!block || block.type !== "thinking") throw new Error("Pi thinking block invariant failed");
 		block.thinking += delta;
-		this.stream.push({ type: "thinking_delta", contentIndex: index, delta, partial: this.message });
+		this.inFlightOutputChars += delta.length;
+		this.syncLiveOutputUsage();
+		this.stream.push({ type: "thinking_delta", contentIndex: index, delta, partial: this.snapshot() });
 	}
 
 	async providerEvent(data: unknown): Promise<void> {
@@ -71,14 +104,17 @@ export class PiEventWriter {
 		const toolCall: ToolCall = { type: "toolCall", id, name, arguments: args };
 		this.message.content.push(toolCall);
 		const contentIndex = this.message.content.length - 1;
-		this.stream.push({ type: "toolcall_start", contentIndex, partial: this.message });
+		const serializedArgs = JSON.stringify(args);
+		this.inFlightOutputChars += name.length + serializedArgs.length;
+		this.syncLiveOutputUsage();
+		this.stream.push({ type: "toolcall_start", contentIndex, partial: this.snapshot() });
 		this.stream.push({
 			type: "toolcall_delta",
 			contentIndex,
-			delta: JSON.stringify(args),
-			partial: this.message,
+			delta: serializedArgs,
+			partial: this.snapshot(),
 		});
-		this.stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: this.message });
+		this.stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: this.snapshot() });
 	}
 
 	done(reason: Extract<StopReason, "stop" | "length" | "toolUse">): void {
@@ -106,10 +142,52 @@ export class PiEventWriter {
 		this.stream.end();
 	}
 
+	private snapshot(): AssistantMessage {
+		return { ...this.message, usage: { ...this.message.usage } };
+	}
+
+	private syncLiveOutputUsage(): void {
+		if (this.completedOutputTokens > 0) {
+			this.message.usage = {
+				...this.message.usage,
+				output: this.completedOutputTokens + Math.ceil(this.inFlightOutputChars / 4),
+			};
+		}
+	}
+
+	private notifyUsageUpdate(): void {
+		if (!this.started) {
+			this.ensureStarted();
+			return;
+		}
+		if (this.open) {
+			this.stream.push({
+				type: this.open.kind === "thinking" ? "thinking_delta" : "text_delta",
+				contentIndex: this.open.index,
+				delta: "",
+				partial: this.snapshot(),
+			});
+			return;
+		}
+		for (let index = this.message.content.length - 1; index >= 0; index--) {
+			const block = this.message.content[index];
+			if (block?.type === "thinking" || block?.type === "text") {
+				this.stream.push({
+					type: block.type === "thinking" ? "thinking_delta" : "text_delta",
+					contentIndex: index,
+					delta: "",
+					partial: this.snapshot(),
+				});
+				return;
+			}
+		}
+		this.stream.push({ type: "text_delta", contentIndex: 0, delta: "", partial: this.snapshot() });
+	}
+
 	private ensureStarted(): void {
 		if (this.started) return;
 		this.started = true;
-		this.stream.push({ type: "start", partial: this.message });
+		this.stream.push({ type: "start", partial: this.snapshot() });
 	}
 
 	private ensureOpen(kind: "text" | "thinking"): number {

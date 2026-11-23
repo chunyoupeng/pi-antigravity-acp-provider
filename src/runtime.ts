@@ -148,6 +148,8 @@ interface Binding {
 	restored: boolean;
 	contextTokens: number | undefined;
 	lastStepUsage: TranscriptContextUsage | undefined;
+	/** Output tokens already accounted for by earlier Pi writers within the same ACP prompt. */
+	turnOutputOffset: number;
 	/** Harness checkpoints already in the transcript when this binding first saw it. */
 	harnessCheckpoints: number | undefined;
 	/** The harness replaced this session's history with its own summary. */
@@ -632,6 +634,7 @@ export class AntigravityRuntime {
 				await this.dropBinding(key, binding, diverged ? "history diverged" : "permission left unanswered", diverged);
 				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 			} else {
+				binding.turnOutputOffset += binding.writer?.message.usage.output ?? 0;
 				attachWriter(binding, writer);
 				this.noteContinuationInstructions(binding, context);
 				binding.pendingContextCount = context.messages.length;
@@ -665,6 +668,7 @@ export class AntigravityRuntime {
 				await this.dropBinding(key, binding, diverged ? "history diverged" : "tool results missing", diverged);
 				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 			} else {
+				binding.turnOutputOffset += binding.writer?.message.usage.output ?? 0;
 				attachWriter(binding, writer);
 				this.noteContinuationInstructions(binding, context);
 				binding.pendingContextCount = context.messages.length;
@@ -711,6 +715,7 @@ export class AntigravityRuntime {
 					throw error;
 				}
 			}
+			binding.turnOutputOffset = 0;
 			attachWriter(binding, writer);
 
 			const fresh = binding.messageCount === 0;
@@ -806,6 +811,8 @@ export class AntigravityRuntime {
 							throw error;
 						}
 					}
+					binding.turnOutputOffset = 0;
+					activeWriter.resetOutputTracking();
 					attachWriter(binding, activeWriter);
 					parts = adaptPromptToCapabilities(
 						buildPromptParts(retryContext, true, 0),
@@ -849,6 +856,7 @@ export class AntigravityRuntime {
 				if (response.stopReason !== "end_turn" || binding.abortRequested || binding.lateResults.length === 0) break;
 				this.metrics.record(response, usageFromPrompt(response));
 				this.decide(binding, "prompt", { lateResults: binding.lateResults.length });
+				binding.turnOutputOffset = 0;
 				response = await binding.connection.prompt(
 					{
 						sessionId: binding.session.sessionId,
@@ -861,10 +869,15 @@ export class AntigravityRuntime {
 			const activeWriter = binding.writer ?? writer;
 			if (binding.abortRequested) throw abortError();
 			const reported = usageFromPrompt(response);
+			const remainingReportedOutput = Math.max(0, reported.output - binding.turnOutputOffset);
+			const turnOutput = Math.max(activeWriter.cumulativeOutputTokens, remainingReportedOutput);
+			const finalBreakdown = binding.lastStepUsage
+				? { ...binding.lastStepUsage, output: turnOutput }
+				: { input: 0, cacheRead: 0, output: turnOutput };
 			activeWriter.message.usage = withContextUsage(
 				reported,
 				binding.contextTokens,
-				binding.lastStepUsage ?? { input: 0, cacheRead: 0, output: 0 },
+				finalBreakdown,
 			);
 			this.metrics.record(response, reported);
 			activeWriter.message.rawStopReason = response.stopReason;
@@ -1196,6 +1209,7 @@ export class AntigravityRuntime {
 				restored,
 				contextTokens: undefined,
 				lastStepUsage: undefined,
+				turnOutputOffset: 0,
 				harnessCheckpoints: undefined,
 				harnessCheckpointed: false,
 				pendingErrorChunk: undefined,
@@ -1424,7 +1438,9 @@ export class AntigravityRuntime {
 					binding.contextTokens = stepUsage.contextTokens;
 					binding.lastStepUsage = stepUsage;
 					this.metrics.recordContext(stepUsage.contextTokens, activity.size);
-					writer.message.usage = contextUsage(stepUsage.contextTokens, stepUsage);
+					if (!replayingContext) {
+						writer.recordStepUsage(contextUsage(stepUsage.contextTokens, stepUsage));
+					}
 				} else if (activity.type === "config") {
 					// The server changed the selection itself, e.g. it replaced a model
 					// that is no longer offered. The connection already recorded the new

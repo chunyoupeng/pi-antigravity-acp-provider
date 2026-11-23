@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { FALLBACK_MODELS, MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, projectModels, resolveAcpModelId, splitEffortSuffix } from "../src/models.js";
+import { FALLBACK_MODELS, MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, projectModels, resolveAcpModelId, resolveAcpThinking, splitEffortSuffix } from "../src/models.js";
 import { createAntigravityProvider, MODEL_CATALOG_SCHEMA_TAG } from "../src/provider.js";
 
 describe("projectModels", () => {
@@ -99,6 +99,51 @@ describe("projectModels", () => {
 		const models = projectModels([{ modelId: "gemini-unknown", name: "Gemini Unknown" }]);
 		expect(models[0]?.reasoning).toBe(false);
 		expect(models[0]?.thinkingLevelMap).toBeUndefined();
+	});
+
+	it("collapses non-Gemini effort families such as Claude Opus and preserves single-tier models", () => {
+		const models = projectModels([
+			{ modelId: "claude-opus-5-5-low", name: "Claude Opus 5.5 (Low)" },
+			{ modelId: "claude-opus-5-5-medium", name: "Claude Opus 5.5 (Medium)" },
+			{ modelId: "claude-opus-5-5-high", name: "Claude Opus 5.5 (High)" },
+			{ modelId: "claude-sonnet-5-5-low", name: "Claude Sonnet 5.5 (Low)" },
+			{ modelId: "claude-sonnet-5-5-medium", name: "Claude Sonnet 5.5 (Medium)" },
+			{ modelId: "claude-sonnet-5-5-high", name: "Claude Sonnet 5.5 (High)" },
+			{ modelId: "gpt-oss-120b-medium", name: "GPT-OSS 120B (Medium)" },
+			{ modelId: "gemini-pro-orchestrator-neon", name: "Orchestrator (Neon)" },
+		]);
+
+		expect(models.map((model) => model.id)).toEqual([
+			"claude-opus-5-5",
+			"claude-sonnet-5-5",
+			"gpt-oss-120b-medium",
+			"gemini-pro-orchestrator-neon",
+		]);
+		const opus = models[0]!;
+		expect(opus.name).toBe("Claude Opus 5.5");
+		expect(opus.reasoning).toBe(true);
+		expect(opus.thinkingLevelMap).toEqual({
+			off: null,
+			minimal: null,
+			low: "claude-opus-5-5-low",
+			medium: "claude-opus-5-5-medium",
+			high: "claude-opus-5-5-high",
+			xhigh: null,
+			max: null,
+		});
+		expect(resolveAcpModelId(opus, "high")).toBe("claude-opus-5-5-high");
+		expect(resolveAcpModelId(opus, "xhigh")).toBe("claude-opus-5-5-high");
+		expect(resolveAcpThinking(opus, "claude-opus-5-5-high")).toEqual({ model: "claude-opus-5-5", level: "high" });
+
+		const gptOss = models[2]!;
+		expect(gptOss.reasoning).toBe(true);
+		expect(gptOss.thinkingLevelMap?.medium).toBe("gpt-oss-120b-medium");
+		expect(gptOss.thinkingLevelMap?.high).toBeNull();
+		expect(resolveAcpModelId(gptOss, "high")).toBe("gpt-oss-120b-medium");
+
+		const orchestrator = models[3]!;
+		expect(orchestrator.reasoning).toBe(false);
+		expect(orchestrator.thinkingLevelMap).toBeUndefined();
 	});
 
 	it("registers separate Google-account and API-key login methods", async () => {

@@ -81,7 +81,7 @@ export function projectModels(models: readonly AcpModelInfo[]): Model<typeof API
 	for (const candidate of safe) {
 		const id = candidate.modelId.trim();
 		const parsed = effortFromName(candidate.name) ?? effortFromId(id);
-		if (!id.startsWith("gemini-") || !parsed) continue;
+		if (!parsed) continue;
 		const key = parsed.baseName.toLowerCase();
 		const group = groups.get(key) ?? { name: parsed.baseName, variants: {}, members: [] };
 		group.variants[parsed.effort] = id;
@@ -109,10 +109,11 @@ export function projectModels(models: readonly AcpModelInfo[]): Model<typeof API
 		}
 		emittedIds.add(id);
 		// A single advertised effort is still a reasoning model (for example
-		// Argon Medium during a rollout). Preserve its exact public/ACP ID and
-		// expose only that tier, rather than claiming thinking is unsupported or
-		// guessing additional variants which may not exist for this account.
-		projected.push(id.startsWith("gemini-") && parsed
+		// Argon Medium during a rollout or GPT-OSS 120B (Medium)). Preserve its
+		// exact public/ACP ID and expose only that tier, rather than claiming
+		// thinking is unsupported or guessing additional variants which may not
+		// exist for this account.
+		projected.push(parsed
 			? reasoningModel(id, candidate.name.trim() || id, { [parsed.effort]: id })
 			: fixedModel(id, candidate.name.trim() || id));
 	}

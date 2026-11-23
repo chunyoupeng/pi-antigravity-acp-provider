@@ -2,6 +2,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 
 import { PiEventWriter } from "../src/stream/pi-events.js";
+import { contextUsage } from "../src/stream/usage.js";
 
 const model: Model<Api> = {
 	id: "test",
@@ -87,5 +88,42 @@ describe("PiEventWriter", () => {
 		for await (const event of writer.stream) events.push(event);
 		expect(events).toHaveLength(1);
 		expect(events[0]).toMatchObject({ type: "error", reason: "error" });
+	});
+
+	it("accumulates output tokens across multi-step usage updates and notifies Pi live", async () => {
+		const writer = new PiEventWriter(model);
+		const seenOutputs: number[] = [];
+		const drain = (async () => {
+			for await (const event of writer.stream) {
+				if (event.type === "start" || event.type === "thinking_delta" || event.type === "text_delta") {
+					seenOutputs.push(event.partial.usage.output);
+				}
+			}
+		})();
+
+		// Step 1: silent native tool step completes with 380 output tokens before any text/thinking.
+		writer.recordStepUsage(contextUsage(10_380, { input: 10_000, cacheRead: 0, output: 380 }));
+		// Step 2: streams 40 chars of thinking (+10 estimated tokens) before its usage_update arrives.
+		writer.thinking("a".repeat(40));
+		// Step 2 completes with 210 output tokens (smaller than step 1, must sum to 590, not drop to 210).
+		writer.recordStepUsage(contextUsage(12_210, { input: 2_000, cacheRead: 10_000, output: 210 }));
+		// Step 3: streams 80 chars of answer (+20 estimated tokens), then completes with 500 output tokens.
+		writer.text("b".repeat(80));
+		writer.recordStepUsage(contextUsage(15_500, { input: 3_000, cacheRead: 12_000, output: 500 }));
+		writer.done("stop");
+		await drain;
+
+		expect(seenOutputs).toEqual([380, 390, 590, 610, 1090]);
+		expect(writer.cumulativeOutputTokens).toBe(1090);
+		expect(writer.message.usage).toMatchObject({
+			input: 3_000,
+			cacheRead: 12_000,
+			output: 1090,
+			totalTokens: 15_500,
+		});
+		expect(writer.message.content).toEqual([
+			{ type: "thinking", thinking: "a".repeat(40) },
+			{ type: "text", text: "b".repeat(80) },
+		]);
 	});
 });

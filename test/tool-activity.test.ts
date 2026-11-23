@@ -2,7 +2,7 @@ import { initTheme, type EntryRenderer, type ExtensionAPI, type Theme } from "@e
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { registerToolActivity, TOOL_ACTIVITY_ENTRY, type ToolActivityEntry } from "../extensions/tool-activity.js";
+import { registerToolActivity, TOOL_ACTIVITY_ENTRY, TOOL_DIVIDER_ENTRY, type RegisterToolActivityOptions, type ToolActivityEntry } from "../extensions/tool-activity.js";
 import type { AcpToolActivity } from "../src/acp/events.js";
 
 afterEach(() => {
@@ -18,17 +18,30 @@ const activity: AcpToolActivity = {
 	toolCall: { toolCallId: "call", title: "ls -la", kind: "execute", status: "in_progress", rawInput: { command: "ls -la" } },
 };
 
-function harness() {
+function harness(options?: RegisterToolActivityOptions) {
 	const appendEntry = vi.fn();
 	const registerEntryRenderer = vi.fn();
 	const on = vi.fn();
 	const sendMessage = vi.fn();
 	const registerTool = vi.fn();
 	const pi = { appendEntry, registerEntryRenderer, on, sendMessage, registerTool } as unknown as ExtensionAPI;
-	const receive = registerToolActivity(pi);
-	const render = registerEntryRenderer.mock.calls[0]?.[1] as EntryRenderer<ToolActivityEntry>;
-	const entry = (index: number) => ({ type: "custom" as const, id: `entry-${index}`, parentId: null, timestamp: "2026-01-01T00:00:00.000Z", customType: TOOL_ACTIVITY_ENTRY, data: appendEntry.mock.calls[index]?.[1] as ToolActivityEntry });
-	return { receive, render, entry, appendEntry, registerEntryRenderer, on, sendMessage, registerTool };
+	const receive = registerToolActivity(pi, { collapseToolOutput: () => true, outputPad: () => 1, ...options });
+	const render = registerEntryRenderer.mock.calls.find(([type]) => type === TOOL_ACTIVITY_ENTRY)?.[1] as EntryRenderer<ToolActivityEntry>;
+	const renderDivider = registerEntryRenderer.mock.calls.find(([type]) => type === TOOL_DIVIDER_ENTRY)?.[1] as EntryRenderer<Record<string, never>>;
+	const emit = (eventName: string, event: unknown, ctx?: unknown) => {
+		for (const [name, handler] of on.mock.calls) {
+			if (name === eventName) handler(event, ctx);
+		}
+	};
+	const entry = (index: number) => ({
+		type: "custom" as const,
+		id: `entry-${index}`,
+		parentId: null,
+		timestamp: "2026-01-01T00:00:00.000Z",
+		customType: appendEntry.mock.calls[index]?.[0] as string,
+		data: appendEntry.mock.calls[index]?.[1] as ToolActivityEntry,
+	});
+	return { receive, render, renderDivider, emit, entry, appendEntry, registerEntryRenderer, on, sendMessage, registerTool };
 }
 
 function completed(): AcpToolActivity {
@@ -91,16 +104,18 @@ describe("tool activity entries", () => {
 		expect(h.entry(3).data.rowId).not.toBe(h.entry(0).data.rowId);
 	});
 
-	it("restores one row at the latest status from persisted entries", () => {
+	it("restores one row at the latest status from persisted entries and collapses finished execute previews", () => {
 		const source = harness();
 		source.receive(activity);
 		source.receive(completed());
 		const restored = harness();
-		const restore = restored.on.mock.calls.find(([event]) => event === "session_start")?.[1];
-		restore({}, { cwd: process.cwd(), sessionManager: { getBranch: () => [source.entry(0), source.entry(1)] } });
+		restored.emit("session_start", {}, { cwd: process.cwd(), sessionManager: { getBranch: () => [source.entry(0), source.entry(1)] } });
 		expect(restored.render(source.entry(1), { expanded: false }, theme)).toBeUndefined();
-		const row = restored.render(source.entry(0), { expanded: false }, theme)!;
-		expect(stripTerminalSequences(row.render(80).join("\n"))).toContain("sixth");
+		const collapsed = stripTerminalSequences(restored.render(source.entry(0), { expanded: false }, theme)!.render(80).join("\n"));
+		expect(collapsed).toContain("ls -la");
+		expect(collapsed).not.toContain("sixth");
+		const expanded = stripTerminalSequences(restored.render(source.entry(0), { expanded: true }, theme)!.render(80).join("\n"));
+		expect(expanded).toContain("sixth");
 	});
 
 	it("uses the native read renderer and shows resource text", () => {
@@ -270,5 +285,100 @@ describe("tool activity entries", () => {
 		const readText = stripTerminalSequences(h.render(h.entry(3), { expanded: false }, theme)!.render(100).join("\n"));
 		expect(readText).toContain("src/missing.ts");
 		expect(readText).toContain("Read 20 lines");
+	});
+
+	it("auto-collapses execute output on agent_end while keeping read and edit previews visible", () => {
+		const h = harness();
+		h.receive(completed());
+		h.receive({
+			...activity,
+			update: { sessionUpdate: "tool_call", toolCallId: "read-1", title: "Read file", kind: "read", status: "completed" },
+			toolCall: { toolCallId: "read-1", title: "Read file", kind: "read", status: "completed", rawInput: { Path: "src/a.ts", StartLine: 1, EndLine: 5 } },
+		});
+		h.receive({
+			...activity,
+			update: { sessionUpdate: "tool_call", toolCallId: "edit-1", title: "Edit file", kind: "edit", status: "completed" },
+			toolCall: {
+				toolCallId: "edit-1",
+				title: "Edit file",
+				kind: "edit",
+				status: "completed",
+				content: [{ type: "diff", path: "src/a.ts", oldText: "old", newText: "new" }],
+			},
+		});
+
+		const execRow = h.render(h.entry(0), { expanded: false }, theme)!;
+		const readRow = h.render(h.entry(1), { expanded: false }, theme)!;
+		const editRow = h.render(h.entry(2), { expanded: false }, theme)!;
+
+		// Before agent_end, execute preview is visible.
+		expect(stripTerminalSequences(execRow.render(80).join("\n"))).toContain("sixth");
+
+		// After agent_end, execute collapses to header only; read and edit stay visible.
+		h.emit("agent_end", { type: "agent_end", messages: [] });
+		const collapsedExec = stripTerminalSequences(execRow.render(80).join("\n"));
+		expect(collapsedExec).toContain("ls -la");
+		expect(collapsedExec).not.toContain("sixth");
+		expect(collapsedExec).not.toContain("⎿");
+		expect(stripTerminalSequences(readRow.render(80).join("\n"))).toContain("Read 5 lines");
+		expect(stripTerminalSequences(editRow.render(80).join("\n"))).toContain("+1 new");
+
+		// Expanding (Ctrl+O) still reveals the collapsed execute output.
+		const expandedExec = stripTerminalSequences(h.render(h.entry(0), { expanded: true }, theme)!.render(80).join("\n"));
+		expect(expandedExec).toContain("sixth");
+	});
+
+	it("respects collapseToolOutput=false setting on agent_end", () => {
+		const h = harness({ collapseToolOutput: () => false });
+		h.receive(completed());
+		const execRow = h.render(h.entry(0), { expanded: false }, theme)!;
+		h.emit("agent_end", { type: "agent_end", messages: [] });
+		expect(stripTerminalSequences(execRow.render(80).join("\n"))).toContain("sixth");
+	});
+
+	it("appends a divider before final assistant text after native ACP tools without duplicating Pi's divider", () => {
+		const h = harness();
+		// Turn 1: native ACP tool followed by final assistant text -> divider appended.
+		h.emit("message_start", { type: "message_start", message: { role: "user", content: "hi" } });
+		h.receive(completed());
+		h.emit("message_end", {
+			type: "message_end",
+			message: { role: "assistant", content: [{ type: "text", text: "Done." }] },
+		});
+		expect(h.appendEntry).toHaveBeenCalledWith(TOOL_DIVIDER_ENTRY, {});
+		const dividerComponent = h.renderDivider(
+			{ type: "custom", id: "div-1", parentId: null, timestamp: "2026-01-01T00:00:00.000Z", customType: TOOL_DIVIDER_ENTRY, data: {} },
+			{ expanded: false },
+			theme,
+		)!;
+		expect(dividerComponent.render(90)).toEqual([` ${"─".repeat(80)}`]);
+		expect(dividerComponent.render(20)).toEqual([` ${"─".repeat(18)}`]);
+		for (const width of [20, 4, 1]) {
+			for (const line of dividerComponent.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+		}
+
+		// Turn 2: no tools -> no divider.
+		h.appendEntry.mockClear();
+		h.emit("message_start", { type: "message_start", message: { role: "user", content: "plain" } });
+		h.emit("message_end", {
+			type: "message_end",
+			message: { role: "assistant", content: [{ type: "text", text: "Hello." }] },
+		});
+		expect(h.appendEntry).not.toHaveBeenCalledWith(TOOL_DIVIDER_ENTRY, expect.anything());
+
+		// Turn 3: native ACP tool + Pi MCP toolCall -> Pi will add the divider, so extension must not duplicate it.
+		h.appendEntry.mockClear();
+		h.emit("message_start", { type: "message_start", message: { role: "user", content: "mixed" } });
+		h.receive(completed());
+		h.emit("message_end", {
+			type: "message_end",
+			message: { role: "assistant", content: [{ type: "toolCall", id: "t1", name: "memory", arguments: {} }] },
+		});
+		h.receive(completed());
+		h.emit("message_end", {
+			type: "message_end",
+			message: { role: "assistant", content: [{ type: "text", text: "Final answer." }] },
+		});
+		expect(h.appendEntry).not.toHaveBeenCalledWith(TOOL_DIVIDER_ENTRY, expect.anything());
 	});
 });

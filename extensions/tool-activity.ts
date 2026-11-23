@@ -4,6 +4,7 @@ import {
 	createBashToolDefinition,
 	createReadToolDefinition,
 	createEditToolDefinition,
+	SettingsManager,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type Theme,
@@ -16,6 +17,8 @@ import { structuredPatch } from "diff";
 import type { AcpToolActivity } from "../src/acp/events.js";
 
 export const TOOL_ACTIVITY_ENTRY = "antigravity-acp-tool-activity";
+export const TOOL_DIVIDER_ENTRY = "antigravity-acp-tool-divider";
+const NON_COLLAPSIBLE_KINDS = new Set<string>(["read", "edit"]);
 export interface CompactDiff {
 	path: string;
 	lines: string[];
@@ -34,13 +37,52 @@ export interface ToolActivityEntry extends AcpToolActivity {
 interface ToolRow {
 	latest: ToolActivityEntry;
 	owner?: string;
+	previewCollapsed: boolean;
+}
+
+export interface RegisterToolActivityOptions {
+	collapseToolOutput?: () => boolean;
+	outputPad?: () => number;
+}
+
+function isCollapsibleKind(kind: AcpToolActivity["toolCall"]["kind"]): boolean {
+	return !kind || !NON_COLLAPSIBLE_KINDS.has(kind);
+}
+
+interface CollapseSettingsReader {
+	getCollapseToolOutput?: () => boolean;
+}
+
+function readCollapseToolOutput(cwd: string): boolean {
+	try {
+		const settings = SettingsManager.create(cwd) as CollapseSettingsReader;
+		return settings.getCollapseToolOutput?.() ?? true;
+	} catch {
+		return true;
+	}
+}
+
+function readOutputPad(cwd: string): number {
+	try {
+		return SettingsManager.create(cwd).getOutputPad();
+	} catch {
+		return 1;
+	}
 }
 
 /** Display-only session entries: never queued as model input or executable Pi calls. */
-export function registerToolActivity(pi: ExtensionAPI): (activity: AcpToolActivity) => void {
+export function registerToolActivity(
+	pi: ExtensionAPI,
+	options?: RegisterToolActivityOptions,
+): (activity: AcpToolActivity) => void {
 	const rows = new Map<string, ToolRow>();
 	const activeCalls = new Map<string, string>();
+	const turnRows = new Set<ToolRow>();
 	let cwd = process.cwd();
+	let outputPad = options?.outputPad ? options.outputPad() : readOutputPad(cwd);
+	let pendingAcpTool = false;
+	let piWillAddDivider = false;
+	const shouldCollapse = () => (options?.collapseToolOutput ? options.collapseToolOutput() : readCollapseToolOutput(cwd));
 	// Only the presentation functions are used; execute() is never called.
 	const bashDefinition = createBashToolDefinition(cwd);
 	const readDefinition = createReadToolDefinition(cwd);
@@ -79,7 +121,12 @@ export function registerToolActivity(pi: ExtensionAPI): (activity: AcpToolActivi
 	const restore = (_event: unknown, ctx: ExtensionContext) => {
 		rows.clear();
 		activeCalls.clear();
+		turnRows.clear();
+		pendingAcpTool = false;
+		piWillAddDivider = false;
 		cwd = ctx.cwd;
+		outputPad = options?.outputPad ? options.outputPad() : readOutputPad(cwd);
+		const collapse = shouldCollapse();
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type !== "custom" || entry.customType !== TOOL_ACTIVITY_ENTRY) continue;
 			const data = entry.data as ToolActivityEntry | undefined;
@@ -89,13 +136,52 @@ export function registerToolActivity(pi: ExtensionAPI): (activity: AcpToolActivi
 				...data,
 				observedAt: row?.latest.observedAt ?? data.observedAt ?? Date.parse(entry.timestamp),
 			};
-			if (row) row.latest = restored;
-			else rows.set(data.rowId, { latest: restored, owner: entry.id });
+			const finished = restored.toolCall.status === "completed" || restored.toolCall.status === "failed";
+			const previewCollapsed = collapse && finished && isCollapsibleKind(restored.toolCall.kind);
+			if (row) {
+				row.latest = restored;
+				row.previewCollapsed = previewCollapsed;
+			} else {
+				rows.set(data.rowId, { latest: restored, owner: entry.id, previewCollapsed });
+			}
 			activeCalls.set(callKey(data), data.rowId);
 		}
 	};
 	pi.on("session_start", restore);
 	pi.on("session_tree", restore);
+	pi.on("message_start", (event) => {
+		if (event.message.role === "user") {
+			pendingAcpTool = false;
+			piWillAddDivider = false;
+		}
+	});
+	pi.on("message_end", (event) => {
+		if (event.message.role !== "assistant") return;
+		const content = Array.isArray(event.message.content) ? event.message.content : [];
+		const hasToolCall = content.some((block) => block.type === "toolCall");
+		const hasText = content.some((block) => block.type === "text" && block.text.trim().length > 0);
+		if (pendingAcpTool && !piWillAddDivider && !hasToolCall && hasText) {
+			pi.appendEntry(TOOL_DIVIDER_ENTRY, {});
+			pendingAcpTool = false;
+		}
+		if (hasToolCall) {
+			piWillAddDivider = true;
+			pendingAcpTool = false;
+		} else if (hasText) {
+			piWillAddDivider = false;
+			pendingAcpTool = false;
+		}
+	});
+	pi.on("agent_end", () => {
+		if (shouldCollapse()) {
+			for (const row of turnRows) {
+				if (isCollapsibleKind(row.latest.toolCall.kind)) {
+					row.previewCollapsed = true;
+				}
+			}
+		}
+		turnRows.clear();
+	});
 
 	pi.registerEntryRenderer<ToolActivityEntry>(TOOL_ACTIVITY_ENTRY, (entry, { expanded }, theme) => {
 		const data = entry.data;
@@ -103,39 +189,72 @@ export function registerToolActivity(pi: ExtensionAPI): (activity: AcpToolActivi
 		const rowId = data.rowId ?? entry.id;
 		let row = rows.get(rowId);
 		if (!row) {
-			row = { latest: data, owner: entry.id };
+			row = { latest: data, owner: entry.id, previewCollapsed: false };
 			rows.set(rowId, row);
 		}
 		row.owner ??= entry.id;
 		if (row.owner !== entry.id) return undefined;
 		const currentRow = row;
-		let cached: { latest: ToolActivityEntry; width: number; expanded: boolean; lines: string[] } | undefined;
+		let cached:
+			| { latest: ToolActivityEntry; width: number; expanded: boolean; previewCollapsed: boolean; lines: string[] }
+			| undefined;
 		return {
 			invalidate() {
 				cached = undefined;
 			},
 			render(width) {
-				if (cached && cached.latest === currentRow.latest && cached.width === width && cached.expanded === expanded) {
+				if (
+					cached &&
+					cached.latest === currentRow.latest &&
+					cached.width === width &&
+					cached.expanded === expanded &&
+					cached.previewCollapsed === currentRow.previewCollapsed
+				) {
 					return cached.lines;
 				}
-				const lines = renderToolRow(currentRow.latest, { bash, read, edit }, cwd, expanded, theme, width);
-				cached = { latest: currentRow.latest, width, expanded, lines };
+				const lines = renderToolRow(
+					currentRow.latest,
+					{ bash, read, edit },
+					cwd,
+					expanded,
+					currentRow.previewCollapsed,
+					theme,
+					width,
+				);
+				cached = { latest: currentRow.latest, width, expanded, previewCollapsed: currentRow.previewCollapsed, lines };
 				return lines;
 			},
 		} satisfies Component;
 	});
 
+	pi.registerEntryRenderer(TOOL_DIVIDER_ENTRY, (_entry, _options, theme) => ({
+		invalidate() {},
+		render(width) {
+			if (width <= 0) return [];
+			const pad = Math.min(outputPad, Math.max(0, Math.floor((width - 1) / 2)));
+			const contentWidth = Math.max(1, width - pad * 2);
+			return [" ".repeat(pad) + theme.fg("mdHr", "─".repeat(Math.min(contentWidth, 80)))];
+		},
+	}));
+
 	return (activity) => {
+		pendingAcpTool = true;
 		const key = callKey(activity);
 		let rowId = activeCalls.get(key);
 		if (!rowId || activity.update.sessionUpdate === "tool_call") {
 			rowId = crypto.randomUUID();
 			activeCalls.set(key, rowId);
 		}
-		const row = rows.get(rowId);
+		let row = rows.get(rowId);
 		const data = compactActivityEntry(activity, rowId, row?.latest.observedAt ?? Date.now(), cwd);
-		if (row) row.latest = data;
-		else rows.set(rowId, { latest: data });
+		if (row) {
+			row.latest = data;
+			row.previewCollapsed = false;
+		} else {
+			row = { latest: data, previewCollapsed: false };
+			rows.set(rowId, row);
+		}
+		turnRows.add(row);
 		pi.appendEntry(TOOL_ACTIVITY_ENTRY, data);
 	};
 }
@@ -267,6 +386,7 @@ function renderToolRow(
 	renderers: { bash: ToolRenderers; read: ToolRenderers; edit: ToolRenderers },
 	cwd: string,
 	expanded: boolean,
+	previewCollapsed: boolean,
 	theme: Theme,
 	width: number,
 ): string[] {
@@ -304,6 +424,7 @@ function renderToolRow(
 		new Text(theme.fg("toolTitle", theme.bold(displayText(call.title ?? call.toolCallId))), 0, 0);
 	const statusColor = isError ? "error" : isPartial ? "border" : "success";
 	const lines = gutter(header, 2, theme.fg(statusColor, "⏺"), width);
+	if (previewCollapsed && !expanded) return lines;
 	const output = toolOutput(activity);
 	if (output) {
 		const resultRenderer = call.kind === "read" ? renderers.read : renderers.bash;

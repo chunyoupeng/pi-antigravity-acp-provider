@@ -71,6 +71,59 @@ describe("Pi integration with Antigravity ACP", () => {
 		}
 	});
 
+	it("accumulates output tokens across native-tool steps while keeping context window at latest step", async () => {
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "multi-step-usage-"));
+		directories.push(home);
+		const acpSessionId = "1aba03aa-84de-4119-976a-b7ef85cc4727";
+		const logs = path.join(home, "antigravity-cli", "brain", acpSessionId, ".system_generated", "logs");
+		fs.mkdirSync(logs, { recursive: true });
+		const transcript = path.join(logs, "transcript_full.jsonl");
+		fs.writeFileSync(
+			transcript,
+			[
+				JSON.stringify({ step_index: 1, type: "PLANNER_RESPONSE", input_tokens: 10_000, cache_read_tokens: 0, output_tokens: 380 }),
+				JSON.stringify({ step_index: 3, type: "PLANNER_RESPONSE", input_tokens: 2_000, cache_read_tokens: 10_000, output_tokens: 210 }),
+				JSON.stringify({ step_index: 5, type: "PLANNER_RESPONSE", input_tokens: 3_000, cache_read_tokens: 12_000, output_tokens: 500 }),
+			].join("\n") + "\n",
+		);
+		const saved = { home: process.env.GEMINI_HOME, id: process.env.FAKE_SESSION_ID };
+		process.env.GEMINI_HOME = home;
+		process.env.FAKE_SESSION_ID = acpSessionId;
+		const runtime = new AntigravityRuntime(
+			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent, "default"] }),
+			"yolo",
+			undefined,
+			() => undefined,
+		);
+		try {
+			const writer = runtime.stream(
+				model,
+				normalizeContext({ messages: [{ role: "user", content: "multi-step usage", timestamp: 1 }] }),
+				{ apiKey: "test-key" },
+			);
+			const liveOutputs: number[] = [];
+			for await (const event of writer.stream) {
+				if (event.type === "thinking_delta" || event.type === "text_delta") {
+					liveOutputs.push(event.partial.usage.output);
+				}
+			}
+			// Step 1 (380), Step 2 (380 + 210 = 590, even without thinking/text), Step 3 text (+1), Step 3 final (590 + 500 = 1090).
+			expect(liveOutputs).toEqual([0, 380, 590, 591, 1090]);
+			expect(writer.message.usage).toMatchObject({
+				input: 3_000,
+				cacheRead: 12_000,
+				output: 1090,
+				totalTokens: 15_500,
+			});
+		} finally {
+			await runtime.close();
+			if (saved.home === undefined) delete process.env.GEMINI_HOME;
+			else process.env.GEMINI_HOME = saved.home;
+			if (saved.id === undefined) delete process.env.FAKE_SESSION_ID;
+			else process.env.FAKE_SESSION_ID = saved.id;
+		}
+	});
+
 	it("rebuilds from Pi's context after the harness replaces history with its own summary", async () => {
 		const home = fs.mkdtempSync(path.join(os.tmpdir(), "harness-checkpoint-"));
 		directories.push(home);
@@ -83,7 +136,12 @@ describe("Pi integration with Antigravity ACP", () => {
 		const saved = { home: process.env.GEMINI_HOME, id: process.env.FAKE_SESSION_ID };
 		process.env.GEMINI_HOME = home;
 		process.env.FAKE_SESSION_ID = acpSessionId;
-		const runtime = runtimeFor("default");
+		const runtime = new AntigravityRuntime(
+			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent, "default"] }),
+			"yolo",
+			undefined,
+			() => undefined,
+		);
 		const text = (message: { content: Array<{ type: string; text?: string }> }) => message.content.map((block) => block.text ?? "").join("");
 		try {
 			const history: Message[] = [];
