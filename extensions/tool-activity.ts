@@ -305,6 +305,7 @@ export function registerToolActivity(
 						cwd,
 						expanded,
 						groupCollapsed,
+						keyHints,
 						theme,
 						width,
 					);
@@ -332,12 +333,13 @@ export function registerToolActivity(
 			},
 			render(width) {
 				const latest = currentRow.latest;
-				const isRunningExecute =
-					latest.toolCall.kind === "execute" &&
+				const isTimedKind = latest.toolCall.kind !== "read" && latest.toolCall.kind !== "edit";
+				const isRunningTimed =
+					isTimedKind &&
 					latest.toolCall.status !== "completed" &&
 					latest.toolCall.status !== "failed" &&
 					latest.observedAt !== undefined;
-				const elapsedBucket = isRunningExecute
+				const elapsedBucket = isRunningTimed
 					? Math.floor(Math.max(0, Date.now() - latest.observedAt!) / 1000)
 					: undefined;
 				if (
@@ -578,6 +580,7 @@ function renderReadGroup(
 	cwd: string,
 	expanded: boolean,
 	previewCollapsed: boolean,
+	keyHints: KeybindingHints,
 	theme: Theme,
 	width: number,
 ): string[] {
@@ -626,6 +629,7 @@ function renderReadGroup(
 					args, toolCallId: call.toolCallId, cwd, expanded: true, isPartial, isError,
 					executionStarted: false, argsComplete: true, showImages: false, durationMs: undefined,
 					outputPad: 0, state: {}, lastComponent: undefined, invalidate() {},
+					keyText: keyHints.keyText, keyHint: keyHints.keyHint,
 				};
 				const component = readRenderer.renderResult?.(
 					{ content: [{ type: "text", text: output }], details: undefined },
@@ -700,11 +704,12 @@ function renderToolRow(
 		keyText: keyHints.keyText, keyHint: keyHints.keyHint,
 	};
 	const header = renderer?.renderCall?.(args, theme, context) ??
-		new Text(theme.fg("toolTitle", theme.bold(displayText(call.title ?? call.toolCallId))), 0, 0);
+		new Text(formatGenericToolCall(displayText(call.title ?? call.toolCallId), call.rawInput, theme, expanded), 0, 0);
 	const statusColor = isError ? "error" : isPartial ? "border" : "success";
 	const lines = gutter(header, 2, theme.fg(statusColor, "⏺"), width);
+	const showTiming = call.kind === "execute" || !renderer;
 	if (previewCollapsed && !expanded) {
-		if (call.kind === "execute" && durationMs !== undefined && lines.length > 0) {
+		if (showTiming && durationMs !== undefined && lines.length > 0) {
 			const suffix = ` ${theme.fg("muted", `(${formatDuration(durationMs)})`)}`;
 			const lastIdx = lines.length - 1;
 			const lastLine = lines[lastIdx]!.trimEnd();
@@ -718,17 +723,22 @@ function renderToolRow(
 	}
 	const output = toolOutput(activity);
 	if (output) {
-		const resultRenderer = call.kind === "read" ? renderers.read : renderers.bash;
-		const component = resultRenderer.renderResult?.(
-			{ content: [{ type: "text", text: output }], details: undefined },
-			{ expanded, isPartial }, theme, context,
-		);
+		let component: Component | undefined;
+		if (!renderer) {
+			component = renderGenericResult(output, expanded, isError, durationMs, keyHints, theme);
+		} else {
+			const resultRenderer = call.kind === "read" ? renderers.read : renderers.bash;
+			component = resultRenderer.renderResult?.(
+				{ content: [{ type: "text", text: output }], details: undefined },
+				{ expanded, isPartial }, theme, context,
+			);
+		}
 		if (component) lines.push(...gutter(component, 5, `  ${theme.fg("dim", "⎿")}`, width));
-		if (call.kind === "execute" && isPartial && activity.observedAt !== undefined) {
+		if (showTiming && isPartial && activity.observedAt !== undefined) {
 			const elapsed = new Text(theme.fg("muted", `Elapsed ${formatDuration(Date.now() - activity.observedAt)}`), 0, 0);
 			lines.push(...gutter(elapsed, 5, "     ", width));
 		}
-	} else if (call.kind === "execute" && isPartial && activity.observedAt !== undefined) {
+	} else if (showTiming && isPartial && activity.observedAt !== undefined) {
 		const elapsed = new Text(theme.fg("muted", `Elapsed ${formatDuration(Date.now() - activity.observedAt)}`), 0, 0);
 		lines.push(...gutter(elapsed, 5, `  ${theme.fg("dim", "⎿")}`, width));
 	} else if (call.kind === "execute" && durationMs !== undefined) {
@@ -737,6 +747,9 @@ function renderToolRow(
 			{ expanded, isPartial }, theme, context,
 		);
 		if (component) lines.push(...gutter(component, 5, `  ${theme.fg("dim", "⎿")}`, width));
+	} else if (!renderer && durationMs !== undefined) {
+		const summary = new Text(theme.fg("muted", `Took ${formatDuration(durationMs)}`), 0, 0);
+		lines.push(...gutter(summary, 5, `  ${theme.fg("dim", "⎿")}`, width));
 	} else if (call.kind === "read" && call.status === "completed" && activity.readLines !== undefined) {
 		const count = activity.readLines;
 		const summary = new Text(theme.fg("muted", `Read ${count} ${count === 1 ? "line" : "lines"}`), 0, 0);
@@ -760,6 +773,66 @@ function renderToolRow(
 		lines.push(...gutter(new Text(text, 0, 0), 5, `  ${theme.fg("dim", "⎿")}`, width));
 	}
 	return lines;
+}
+
+const GENERIC_ARGS_PREVIEW_CHARS = 100;
+const GENERIC_RESULT_PREVIEW_LINES = 5;
+
+function formatGenericToolCall(title: string, rawInput: unknown, theme: Theme, expanded: boolean): string {
+	const header = theme.fg("toolTitle", theme.bold(title));
+	if (rawInput == null) return header;
+	const entries: Array<[string, unknown]> =
+		typeof rawInput === "object" && !Array.isArray(rawInput)
+			? Object.entries(rawInput).filter(([, value]) => value !== undefined)
+			: [["args", rawInput]];
+	if (entries.length === 0) return header;
+	if (expanded) {
+		const lines = entries.map(([key, value]) => {
+			const raw = typeof value === "string" ? value : (JSON.stringify(value, null, 2) ?? String(value));
+			const clean = displayText(raw).replace(/\t/g, "   ").replace(/\r/g, "");
+			return `  ${displayText(key)}: ${clean.split("\n").join("\n    ")}`;
+		});
+		return `${header}\n${theme.fg("muted", lines.join("\n"))}`;
+	}
+	const compactEntries = entries.filter(([, value]) => value !== "");
+	if (compactEntries.length === 0) return header;
+	const pairs = compactEntries
+		.map(([key, value]) => {
+			const serialized = typeof value === "string"
+				? JSON.stringify(displayText(value))
+				: displayText(JSON.stringify(value) ?? String(value));
+			return `${displayText(key)}=${serialized}`;
+		})
+		.join(" ");
+	const preview = pairs.length > GENERIC_ARGS_PREVIEW_CHARS
+		? `${pairs.slice(0, GENERIC_ARGS_PREVIEW_CHARS - 3)}...`
+		: pairs;
+	return `${header} ${theme.fg("muted", preview)}`;
+}
+
+function renderGenericResult(
+	output: string,
+	expanded: boolean,
+	isError: boolean,
+	durationMs: number | undefined,
+	keyHints: KeybindingHints,
+	theme: Theme,
+): Component {
+	const rawLines = output.replace(/\r/g, "").split("\n");
+	const shown = expanded ? rawLines : rawLines.slice(0, GENERIC_RESULT_PREVIEW_LINES);
+	const remaining = rawLines.length - shown.length;
+	const color = isError ? "error" : "toolOutput";
+	const renderedLines = shown.map((line) => theme.fg(color, line.replace(/\t/g, "   ")));
+	if (remaining > 0) {
+		const noun = remaining === 1 ? "line" : "lines";
+		renderedLines.push(
+			`${theme.fg("muted", `... (${remaining} more ${noun},`)} ${keyHints.keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`,
+		);
+	}
+	if (durationMs !== undefined) {
+		renderedLines.push(theme.fg("muted", `Took ${formatDuration(durationMs)}`));
+	}
+	return new Text(renderedLines.join("\n"), 0, 0);
 }
 
 /** Match Pi's tool call/result gutters while keeping wrapped lines aligned. */

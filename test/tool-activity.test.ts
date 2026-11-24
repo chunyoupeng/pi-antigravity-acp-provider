@@ -511,4 +511,105 @@ describe("tool activity entries", () => {
 		expect(restoredSecond).toContain("⏺ Read 1 file");
 		expect(restoredSecond).toContain("└─ src/c.ts");
 	});
+
+	it("renders generic ACP tools (like manage_task) with rawInput args, head-first output preview, timing, and expanded details", () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-11-24T10:34:39.000Z"));
+		const h = harness();
+		h.receive({
+			...activity,
+			update: {
+				sessionUpdate: "tool_call",
+				toolCallId: "mt-1",
+				title: "Run manage_task",
+				kind: "other",
+				status: "in_progress",
+				rawInput: { Action: "kill", TaskId: "1e5ca6bc-9a5a-4b3b-aeb2-3ddc374bbec2/task-2" },
+			},
+			toolCall: {
+				toolCallId: "mt-1",
+				title: "Run manage_task",
+				kind: "other",
+				status: "in_progress",
+				rawInput: { Action: "kill", TaskId: "1e5ca6bc-9a5a-4b3b-aeb2-3ddc374bbec2/task-2" },
+			},
+		});
+		const row = h.render(h.entry(0), { expanded: false }, theme)!;
+		vi.advanceTimersByTime(1_500);
+		const running = stripTerminalSequences(row.render(100).join("\n"));
+		expect(running).toContain('⏺ Run manage_task Action="kill" TaskId="1e5ca6bc-9a5a-4b3b-aeb2-3ddc374bbec2/task-2"');
+		expect(running).toContain("Elapsed 1.5s");
+
+		h.receive({
+			...activity,
+			update: {
+				sessionUpdate: "tool_call_update",
+				toolCallId: "mt-1",
+				title: "Run manage_task",
+				kind: "other",
+				status: "completed",
+				rawInput: { Action: "kill", TaskId: "1e5ca6bc-9a5a-4b3b-aeb2-3ddc374bbec2/task-2" },
+			},
+			toolCall: {
+				toolCallId: "mt-1",
+				title: "Run manage_task",
+				kind: "other",
+				status: "completed",
+				rawInput: { Action: "kill", TaskId: "1e5ca6bc-9a5a-4b3b-aeb2-3ddc374bbec2/task-2" },
+			},
+		});
+		const finished = stripTerminalSequences(row.render(100).join("\n"));
+		expect(finished).toContain('Action="kill"');
+		expect(finished).toContain("Took 1.5s");
+
+		h.emit("agent_end", { type: "agent_end", messages: [] });
+		const collapsed = stripTerminalSequences(row.render(100).join("\n"));
+		expect(collapsed).toContain('Run manage_task Action="kill" TaskId="1e5ca6bc-9a5a-4b3b-aeb2-3ddc374bbec2/task-2" (1.5s)');
+		expect(collapsed).not.toContain("⎿");
+
+		const expanded = stripTerminalSequences(h.render(h.entry(0), { expanded: true }, theme)!.render(100).join("\n"));
+		expect(expanded).toContain("Action: kill");
+		expect(expanded).toContain("TaskId: 1e5ca6bc-9a5a-4b3b-aeb2-3ddc374bbec2/task-2");
+		expect(expanded).toContain("Took 1.5s");
+
+		// Multi-line generic tool output previews from the first line (not bash tail) and omits empty string args when collapsed.
+		h.receive({
+			...activity,
+			update: {
+				sessionUpdate: "tool_call",
+				toolCallId: "search-1",
+				title: "Running search_web",
+				kind: "search",
+				status: "completed",
+				rawInput: { query: "pi coding agent", domain: "", summary: "" },
+				rawOutput: "line1\nline2\nline3\nline4\nline5\nline6\nline7",
+			},
+			toolCall: {
+				toolCallId: "search-1",
+				title: "Running search_web",
+				kind: "search",
+				status: "completed",
+				rawInput: { query: "pi coding agent", domain: "", summary: "" },
+				rawOutput: "line1\nline2\nline3\nline4\nline5\nline6\nline7",
+			},
+		});
+		const searchRow = h.render(h.entry(2), { expanded: false }, theme)!;
+		const preview = stripTerminalSequences(searchRow.render(100).join("\n"));
+		expect(preview).toContain('Running search_web query="pi coding agent"');
+		expect(preview).not.toContain('domain=""');
+		expect(preview).toContain("line1");
+		expect(preview).toContain("line5");
+		expect(preview).not.toContain("line6");
+		expect(preview).toContain("... (2 more lines, to expand)");
+
+		const searchExpanded = stripTerminalSequences(h.render(h.entry(2), { expanded: true }, theme)!.render(100).join("\n"));
+		expect(searchExpanded).toContain("query: pi coding agent");
+		expect(searchExpanded).toContain("line1");
+		expect(searchExpanded).toContain("line7");
+
+		for (const width of [100, 24, 10, 4, 1]) {
+			for (const line of row.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+			for (const line of searchRow.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+		}
+	});
 });
