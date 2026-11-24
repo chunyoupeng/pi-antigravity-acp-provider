@@ -13,7 +13,7 @@ import {
 
 import { AntigravityAcpError, errorMessage } from "../acp/errors.js";
 import { isJsonObject } from "./json.js";
-import { emptyUsage } from "./usage.js";
+import { contextUsage, emptyUsage } from "./usage.js";
 
 export class PiEventWriter {
 	readonly stream: AssistantMessageEventStream;
@@ -22,6 +22,8 @@ export class PiEventWriter {
 	private started = false;
 	private terminal = false;
 	private completedOutputTokens = 0;
+	private lastStepContextTokens = 0;
+	private fallbackContextTokens = 0;
 	private inFlightOutputChars = 0;
 
 	get finished(): boolean {
@@ -48,24 +50,43 @@ export class PiEventWriter {
 
 	resetOutputTracking(): void {
 		this.completedOutputTokens = 0;
+		this.lastStepContextTokens = 0;
 		this.inFlightOutputChars = 0;
 	}
 
+	/** Remembers the session's last known context fill as an end-of-turn fallback
+	 * (e.g. for `toolUse` handoffs that finish before a new `usage_update`) without
+	 * pre-seeding `message.usage.totalTokens` during streaming, which would mask
+	 * new user prompt tokens and freeze Pi's live output-based context estimate. */
+	seedFallbackContextTokens(tokens: number | undefined): void {
+		this.fallbackContextTokens =
+			tokens !== undefined && Number.isFinite(tokens) && tokens > 0 ? Math.floor(tokens) : 0;
+	}
+
 	/** Records a completed internal ACP step's usage on this assistant turn and
-	 * notifies Pi so live token counters advance across multi-step native tool
-	 * turns instead of freezing or dropping back to the last step's output. */
+	 * notifies Pi so live token and context counters advance across multi-step
+	 * native tool turns instead of freezing until the turn ends. */
 	recordStepUsage(stepUsage: Usage): void {
 		if (this.terminal) return;
 		if (stepUsage.output > 0) {
 			this.completedOutputTokens += stepUsage.output;
 			this.inFlightOutputChars = 0;
 		}
+		if (stepUsage.totalTokens > 0) {
+			this.lastStepContextTokens = stepUsage.totalTokens;
+			this.inFlightOutputChars = 0;
+		}
+		const inFlight = Math.ceil(this.inFlightOutputChars / 4);
 		const output =
 			this.completedOutputTokens > 0
-				? this.completedOutputTokens + Math.ceil(this.inFlightOutputChars / 4)
+				? this.completedOutputTokens + inFlight
 				: stepUsage.output;
-		this.message.usage = { ...stepUsage, output };
-		if (output > 0) this.notifyUsageUpdate();
+		const totalTokens =
+			this.lastStepContextTokens > 0
+				? this.lastStepContextTokens + inFlight
+				: stepUsage.totalTokens;
+		this.message.usage = { ...stepUsage, output, totalTokens };
+		if (output > 0 || totalTokens > 0) this.notifyUsageUpdate();
 	}
 
 	text(delta: string): void {
@@ -88,6 +109,13 @@ export class PiEventWriter {
 		this.inFlightOutputChars += delta.length;
 		this.syncLiveOutputUsage();
 		this.stream.push({ type: "thinking_delta", contentIndex: index, delta, partial: this.snapshot() });
+	}
+
+	/** Closes an open thinking block (for example when a native ACP tool starts
+	 * executing remotely) so Pi exits the thinking state until thinking resumes. */
+	endThinking(): void {
+		if (this.terminal || this.open?.kind !== "thinking") return;
+		this.closeOpen();
 	}
 
 	async providerEvent(data: unknown): Promise<void> {
@@ -122,6 +150,13 @@ export class PiEventWriter {
 		this.ensureStarted();
 		if (this.message.content.length === 0) this.ensureOpen("text");
 		this.closeOpen();
+		if (this.message.usage.totalTokens === 0 && this.fallbackContextTokens > 0) {
+			this.message.usage = contextUsage(this.fallbackContextTokens, {
+				input: 0,
+				cacheRead: 0,
+				output: this.message.usage.output,
+			});
+		}
 		this.terminal = true;
 		this.message.stopReason = reason;
 		this.stream.push({ type: "done", reason, message: this.message });
@@ -147,12 +182,13 @@ export class PiEventWriter {
 	}
 
 	private syncLiveOutputUsage(): void {
-		if (this.completedOutputTokens > 0) {
-			this.message.usage = {
-				...this.message.usage,
-				output: this.completedOutputTokens + Math.ceil(this.inFlightOutputChars / 4),
-			};
-		}
+		if (this.completedOutputTokens <= 0 && this.lastStepContextTokens <= 0) return;
+		const inFlight = Math.ceil(this.inFlightOutputChars / 4);
+		this.message.usage = {
+			...this.message.usage,
+			...(this.completedOutputTokens > 0 ? { output: this.completedOutputTokens + inFlight } : {}),
+			...(this.lastStepContextTokens > 0 ? { totalTokens: this.lastStepContextTokens + inFlight } : {}),
+		};
 	}
 
 	private notifyUsageUpdate(): void {
@@ -212,13 +248,13 @@ export class PiEventWriter {
 		this.open = undefined;
 		const block = this.message.content[index];
 		if (kind === "text" && block?.type === "text") {
-			this.stream.push({ type: "text_end", contentIndex: index, content: block.text, partial: this.message });
+			this.stream.push({ type: "text_end", contentIndex: index, content: block.text, partial: this.snapshot() });
 		} else if (kind === "thinking" && block?.type === "thinking") {
 			this.stream.push({
 				type: "thinking_end",
 				contentIndex: index,
 				content: block.thinking,
-				partial: this.message,
+				partial: this.snapshot(),
 			});
 		}
 	}

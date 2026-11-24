@@ -1435,6 +1435,7 @@ export class AntigravityRuntime {
 					}
 				} else if (activity.type === "tool") {
 					const toolCall = binding.toolTracker.apply(activity.update);
+					if (!replayingContext) writer.endThinking();
 					if (replayingContext || binding.bridge?.reports(toolCall.title, toolCall._meta)) continue;
 					const toolActivity: AcpToolActivity = {
 						sessionId: notification.sessionId,
@@ -1771,15 +1772,14 @@ function hasUsableLocalAuth(health: AntigravityAuthHealth): boolean {
 	return health.status === "api-key-env" || health.status === "oauth-refreshable";
 }
 
-/** A new or continuation writer starts from the session's last known context
- * fill, so Pi's context meter stays correct across tool round trips. */
+/** A new or continuation writer remembers the session's last known context fill
+ * as a fallback on completion, so Pi's context meter stays accurate across tool
+ * round trips without freezing live streaming estimates on stale prior-turn counts. */
 function attachWriter(binding: Binding, writer: PiEventWriter): void {
 	binding.writer = writer;
 	binding.lastStepUsage = undefined;
 	writer.message.responseModel = binding.modelId;
-	if (binding.contextTokens !== undefined) {
-		writer.message.usage = contextUsage(binding.contextTokens, { input: 0, cacheRead: 0, output: 0 });
-	}
+	writer.seedFallbackContextTokens(binding.contextTokens);
 }
 
 function resolveWireMode(session: SessionState, mode: PermissionMode): string | undefined {
