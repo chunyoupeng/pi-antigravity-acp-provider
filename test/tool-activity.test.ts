@@ -270,6 +270,7 @@ describe("tool activity entries", () => {
 		const bashText = stripTerminalSequences(h.render(h.entry(2), { expanded: true }, theme)!.render(100).join("\n"));
 		expect(bashText).toContain("rm foo.ts");
 		expect(bashText).toContain("(no output)");
+		expect(bashText).toContain("Took 4.0s");
 		expect(bashText).not.toContain("Created At:");
 		expect(bashText).not.toContain("ACP details");
 
@@ -283,8 +284,10 @@ describe("tool activity entries", () => {
 			},
 		});
 		const readText = stripTerminalSequences(h.render(h.entry(3), { expanded: false }, theme)!.render(100).join("\n"));
-		expect(readText).toContain("src/missing.ts");
-		expect(readText).toContain("Read 20 lines");
+		expect(readText).toContain("Read 1 file");
+		expect(readText).toContain("└─ src/missing.ts:10-29");
+		const readExpanded = stripTerminalSequences(h.render(h.entry(3), { expanded: true }, theme)!.render(100).join("\n"));
+		expect(readExpanded).toContain("Read 20 lines");
 	});
 
 	it("auto-collapses execute output on agent_end while keeping read and edit previews visible", () => {
@@ -320,7 +323,8 @@ describe("tool activity entries", () => {
 		expect(collapsedExec).toContain("ls -la");
 		expect(collapsedExec).not.toContain("sixth");
 		expect(collapsedExec).not.toContain("⎿");
-		expect(stripTerminalSequences(readRow.render(80).join("\n"))).toContain("Read 5 lines");
+		expect(stripTerminalSequences(readRow.render(80).join("\n"))).toContain("Read 1 file");
+		expect(stripTerminalSequences(readRow.render(80).join("\n"))).toContain("└─ src/a.ts:1-5");
 		expect(stripTerminalSequences(editRow.render(80).join("\n"))).toContain("+1 new");
 
 		// Expanding (Ctrl+O) still reveals the collapsed execute output.
@@ -380,5 +384,122 @@ describe("tool activity entries", () => {
 			message: { role: "assistant", content: [{ type: "text", text: "Final answer." }] },
 		});
 		expect(h.appendEntry).not.toHaveBeenCalledWith(TOOL_DIVIDER_ENTRY, expect.anything());
+	});
+
+	it("shows live elapsed time while execute runs and persists Took/collapsed duration after completion", () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-11-24T10:00:00.000Z"));
+		const h = harness();
+		h.receive(activity);
+		const row = h.render(h.entry(0), { expanded: false }, theme)!;
+
+		vi.advanceTimersByTime(2_300);
+		const running = stripTerminalSequences(row.render(80).join("\n"));
+		expect(running).toContain("Elapsed 2.3s");
+
+		vi.advanceTimersByTime(1_100);
+		h.receive(completed());
+		expect(h.entry(1).data.durationMs).toBe(3_400);
+
+		const finished = stripTerminalSequences(row.render(80).join("\n"));
+		expect(finished).toContain("Took 3.4s");
+
+		h.emit("agent_end", { type: "agent_end", messages: [] });
+		const collapsed = stripTerminalSequences(row.render(80).join("\n"));
+		expect(collapsed).toContain("ls -la");
+		expect(collapsed).toContain("(3.4s)");
+		expect(collapsed).not.toContain("⎿");
+		for (const width of [80, 20, 10, 4]) {
+			for (const line of row.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+		}
+
+		const expanded = stripTerminalSequences(h.render(h.entry(0), { expanded: true }, theme)!.render(80).join("\n"));
+		expect(expanded).toContain("Took 3.4s");
+
+		// Restored session preserves duration on collapsed header and expanded output.
+		const restored = harness();
+		restored.emit("session_start", {}, { cwd: process.cwd(), sessionManager: { getBranch: () => [h.entry(0), h.entry(1)] } });
+		const restoredCollapsed = stripTerminalSequences(restored.render(h.entry(0), { expanded: false }, theme)!.render(80).join("\n"));
+		expect(restoredCollapsed).toContain("(3.4s)");
+		const restoredExpanded = stripTerminalSequences(restored.render(h.entry(0), { expanded: true }, theme)!.render(80).join("\n"));
+		expect(restoredExpanded).toContain("Took 3.4s");
+	});
+
+	it("groups consecutive read activities into Reading/Read N files with branch paths and seals across non-read boundaries", () => {
+		const h = harness();
+		h.receive({
+			...activity,
+			update: { sessionUpdate: "tool_call", toolCallId: "r1", title: "Read file", kind: "read", status: "in_progress" },
+			toolCall: { toolCallId: "r1", title: "Read file", kind: "read", status: "in_progress", rawInput: { Path: "src/a.ts", StartLine: 1, EndLine: 20 } },
+		});
+		h.receive({
+			...activity,
+			update: { sessionUpdate: "tool_call", toolCallId: "r2", title: "Read file", kind: "read", status: "in_progress" },
+			toolCall: { toolCallId: "r2", title: "Read file", kind: "read", status: "in_progress", rawInput: { Path: "src/b.ts" } },
+		});
+
+		const groupComp = h.render(h.entry(0), { expanded: false }, theme)!;
+		expect(h.render(h.entry(1), { expanded: false }, theme)).toBeUndefined();
+		const running = stripTerminalSequences(groupComp.render(80).join("\n"));
+		expect(running).toContain("⏺ Reading 2 files...");
+		expect(running).toContain("└─ src/a.ts:1-20");
+		expect(running).toContain("└─ src/b.ts");
+
+		h.receive({
+			...activity,
+			update: { sessionUpdate: "tool_call_update", toolCallId: "r1", status: "completed", rawOutput: "const a = 1;" },
+			toolCall: { toolCallId: "r1", title: "Read file", kind: "read", status: "completed", rawInput: { Path: "src/a.ts", StartLine: 1, EndLine: 20 }, rawOutput: "const a = 1;" },
+		});
+		h.receive({
+			...activity,
+			update: { sessionUpdate: "tool_call_update", toolCallId: "r2", status: "failed", rawOutput: "ENOENT: no such file" },
+			toolCall: { toolCallId: "r2", title: "Read file", kind: "read", status: "failed", rawInput: { Path: "src/b.ts" }, rawOutput: "ENOENT: no such file" },
+		});
+		expect(h.render(h.entry(2), { expanded: false }, theme)).toBeUndefined();
+		expect(h.render(h.entry(3), { expanded: false }, theme)).toBeUndefined();
+
+		const finished = stripTerminalSequences(groupComp.render(80).join("\n"));
+		expect(finished).toContain("⏺ Read 2 files");
+		expect(finished).toContain("└─ src/a.ts:1-20");
+		expect(finished).toContain("└─ src/b.ts ENOENT: no such file");
+		expect(finished).not.toContain("const a = 1;");
+
+		const expanded = stripTerminalSequences(h.render(h.entry(0), { expanded: true }, theme)!.render(80).join("\n"));
+		expect(expanded).toContain("const a = 1;");
+		expect(expanded).toContain("ENOENT: no such file");
+
+		for (const width of [80, 24, 10, 4]) {
+			for (const line of groupComp.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+		}
+
+		// Non-read tool seals the previous read group; a later read starts a new group.
+		h.receive(completed());
+		h.receive({
+			...activity,
+			update: { sessionUpdate: "tool_call", toolCallId: "r3", title: "Read file", kind: "read", status: "completed" },
+			toolCall: { toolCallId: "r3", title: "Read file", kind: "read", status: "completed", rawInput: { Path: "src/c.ts" } },
+		});
+		const secondGroup = h.render(h.entry(5), { expanded: false }, theme)!;
+		expect(secondGroup).toBeDefined();
+		const secondText = stripTerminalSequences(secondGroup.render(80).join("\n"));
+		expect(secondText).toContain("⏺ Read 1 file");
+		expect(secondText).toContain("└─ src/c.ts");
+
+		// Session restore reproduces the same two separate read groups.
+		const restored = harness();
+		restored.emit("session_start", {}, {
+			cwd: process.cwd(),
+			sessionManager: {
+				getBranch: () => [h.entry(0), h.entry(1), h.entry(2), h.entry(3), h.entry(4), h.entry(5)],
+			},
+		});
+		expect(restored.render(h.entry(1), { expanded: false }, theme)).toBeUndefined();
+		const restoredFirst = stripTerminalSequences(restored.render(h.entry(0), { expanded: false }, theme)!.render(80).join("\n"));
+		expect(restoredFirst).toContain("⏺ Read 2 files");
+		expect(restoredFirst).toContain("└─ src/a.ts:1-20");
+		expect(restoredFirst).toContain("└─ src/b.ts ENOENT: no such file");
+		const restoredSecond = stripTerminalSequences(restored.render(h.entry(5), { expanded: false }, theme)!.render(80).join("\n"));
+		expect(restoredSecond).toContain("⏺ Read 1 file");
+		expect(restoredSecond).toContain("└─ src/c.ts");
 	});
 });

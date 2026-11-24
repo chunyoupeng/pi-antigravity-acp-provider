@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import {
 	createBashToolDefinition,
@@ -28,6 +29,8 @@ export interface ToolActivityEntry extends AcpToolActivity {
 	rowId: string;
 	/** Receipt time of the first notification. */
 	observedAt?: number;
+	/** Measured execution duration in milliseconds once completed or failed. */
+	durationMs?: number;
 	/** Pre-computed compact diff lines so full oldText/newText files are not persisted or re-diffed per frame. */
 	diffs?: CompactDiff[];
 	/** Line count inferred for native read_file calls that omit file text in ACP updates. */
@@ -38,6 +41,13 @@ interface ToolRow {
 	latest: ToolActivityEntry;
 	owner?: string;
 	previewCollapsed: boolean;
+}
+
+interface ReadGroup {
+	owner?: string;
+	rows: ToolRow[];
+	version: number;
+	sealed: boolean;
 }
 
 export interface RegisterToolActivityOptions {
@@ -76,13 +86,31 @@ export function registerToolActivity(
 	options?: RegisterToolActivityOptions,
 ): (activity: AcpToolActivity) => void {
 	const rows = new Map<string, ToolRow>();
+	const readGroups = new Map<string, ReadGroup>();
 	const activeCalls = new Map<string, string>();
 	const turnRows = new Set<ToolRow>();
+	let activeReadGroup: ReadGroup | undefined;
 	let cwd = process.cwd();
 	let outputPad = options?.outputPad ? options.outputPad() : readOutputPad(cwd);
 	let pendingAcpTool = false;
 	let piWillAddDivider = false;
 	const shouldCollapse = () => (options?.collapseToolOutput ? options.collapseToolOutput() : readCollapseToolOutput(cwd));
+	const sealReadGroup = () => {
+		if (activeReadGroup) {
+			activeReadGroup.sealed = true;
+			activeReadGroup = undefined;
+		}
+	};
+	const attachToReadGroup = (rowId: string, row: ToolRow, owner?: string) => {
+		let group = activeReadGroup;
+		if (!group || group.sealed) {
+			group = { ...(owner !== undefined ? { owner } : {}), rows: [], version: 0, sealed: false };
+			activeReadGroup = group;
+		}
+		group.rows.push(row);
+		group.version += 1;
+		readGroups.set(rowId, group);
+	};
 	// Only the presentation functions are used; execute() is never called.
 	const bashDefinition = createBashToolDefinition(cwd);
 	const readDefinition = createReadToolDefinition(cwd);
@@ -120,37 +148,73 @@ export function registerToolActivity(
 
 	const restore = (_event: unknown, ctx: ExtensionContext) => {
 		rows.clear();
+		readGroups.clear();
 		activeCalls.clear();
 		turnRows.clear();
+		activeReadGroup = undefined;
 		pendingAcpTool = false;
 		piWillAddDivider = false;
 		cwd = ctx.cwd;
 		outputPad = options?.outputPad ? options.outputPad() : readOutputPad(cwd);
 		const collapse = shouldCollapse();
 		for (const entry of ctx.sessionManager.getBranch()) {
+			if (entry.type === "custom" && entry.customType === TOOL_DIVIDER_ENTRY) {
+				sealReadGroup();
+				continue;
+			}
+			if (entry.type === "message") {
+				const msg = (entry as { message?: { role?: string; content?: unknown } }).message;
+				if (msg?.role === "user" || msg?.role === "toolResult") {
+					sealReadGroup();
+				} else if (msg?.role === "assistant") {
+					const content = Array.isArray(msg.content) ? msg.content : [];
+					const hasVisible = content.some(
+						(block: { type?: string; text?: string }) =>
+							block.type === "toolCall" || (block.type === "text" && typeof block.text === "string" && block.text.trim().length > 0),
+					);
+					if (hasVisible) sealReadGroup();
+				}
+				continue;
+			}
 			if (entry.type !== "custom" || entry.customType !== TOOL_ACTIVITY_ENTRY) continue;
 			const data = entry.data as ToolActivityEntry | undefined;
 			if (!data?.rowId) continue;
 			const row = rows.get(data.rowId);
+			const finished = data.toolCall.status === "completed" || data.toolCall.status === "failed";
+			const observedAt = row?.latest.observedAt ?? data.observedAt ?? Date.parse(entry.timestamp);
+			const durationMs =
+				data.durationMs ??
+				row?.latest.durationMs ??
+				(finished && data.toolCall.kind === "execute" ? parseExecuteDurationMs(rawToolText(data)) : undefined);
 			const restored: ToolActivityEntry = {
 				...data,
-				observedAt: row?.latest.observedAt ?? data.observedAt ?? Date.parse(entry.timestamp),
+				observedAt,
+				...(durationMs !== undefined ? { durationMs } : {}),
 			};
-			const finished = restored.toolCall.status === "completed" || restored.toolCall.status === "failed";
 			const previewCollapsed = collapse && finished && isCollapsibleKind(restored.toolCall.kind);
 			if (row) {
 				row.latest = restored;
 				row.previewCollapsed = previewCollapsed;
+				const group = readGroups.get(data.rowId);
+				if (group) group.version += 1;
 			} else {
-				rows.set(data.rowId, { latest: restored, owner: entry.id, previewCollapsed });
+				const nextRow: ToolRow = { latest: restored, owner: entry.id, previewCollapsed };
+				rows.set(data.rowId, nextRow);
+				if (restored.toolCall.kind === "read") {
+					attachToReadGroup(data.rowId, nextRow, entry.id);
+				} else {
+					sealReadGroup();
+				}
 			}
 			activeCalls.set(callKey(data), data.rowId);
 		}
+		sealReadGroup();
 	};
 	pi.on("session_start", restore);
 	pi.on("session_tree", restore);
 	pi.on("message_start", (event) => {
 		if (event.message.role === "user") {
+			sealReadGroup();
 			pendingAcpTool = false;
 			piWillAddDivider = false;
 		}
@@ -160,6 +224,9 @@ export function registerToolActivity(
 		const content = Array.isArray(event.message.content) ? event.message.content : [];
 		const hasToolCall = content.some((block) => block.type === "toolCall");
 		const hasText = content.some((block) => block.type === "text" && block.text.trim().length > 0);
+		if (hasToolCall || hasText) {
+			sealReadGroup();
+		}
 		if (pendingAcpTool && !piWillAddDivider && !hasToolCall && hasText) {
 			pi.appendEntry(TOOL_DIVIDER_ENTRY, {});
 			pendingAcpTool = false;
@@ -173,6 +240,7 @@ export function registerToolActivity(
 		}
 	});
 	pi.on("agent_end", () => {
+		sealReadGroup();
 		if (shouldCollapse()) {
 			for (const row of turnRows) {
 				if (isCollapsibleKind(row.latest.toolCall.kind)) {
@@ -191,29 +259,93 @@ export function registerToolActivity(
 		if (!row) {
 			row = { latest: data, owner: entry.id, previewCollapsed: false };
 			rows.set(rowId, row);
+			if (data.toolCall.kind === "read") {
+				const standaloneGroup: ReadGroup = { owner: entry.id, rows: [row], version: 1, sealed: true };
+				readGroups.set(rowId, standaloneGroup);
+			}
+		}
+		const group = readGroups.get(rowId);
+		if (group) {
+			group.owner ??= entry.id;
+			if (group.owner !== entry.id) return undefined;
+			const currentGroup = group;
+			let cachedGroup:
+				| {
+					version: number;
+					width: number;
+					expanded: boolean;
+					previewCollapsed: boolean;
+					lines: string[];
+				}
+				| undefined;
+			return {
+				invalidate() {
+					cachedGroup = undefined;
+				},
+				render(width) {
+					const groupCollapsed = currentGroup.rows.every((item) => item.previewCollapsed);
+					if (
+						cachedGroup &&
+						cachedGroup.version === currentGroup.version &&
+						cachedGroup.width === width &&
+						cachedGroup.expanded === expanded &&
+						cachedGroup.previewCollapsed === groupCollapsed
+					) {
+						return cachedGroup.lines;
+					}
+					const lines = renderReadGroup(
+						currentGroup.rows.map((item) => item.latest),
+						read,
+						cwd,
+						expanded,
+						groupCollapsed,
+						theme,
+						width,
+					);
+					cachedGroup = { version: currentGroup.version, width, expanded, previewCollapsed: groupCollapsed, lines };
+					return lines;
+				},
+			} satisfies Component;
 		}
 		row.owner ??= entry.id;
 		if (row.owner !== entry.id) return undefined;
 		const currentRow = row;
 		let cached:
-			| { latest: ToolActivityEntry; width: number; expanded: boolean; previewCollapsed: boolean; lines: string[] }
+			| {
+				latest: ToolActivityEntry;
+				width: number;
+				expanded: boolean;
+				previewCollapsed: boolean;
+				elapsedBucket: number | undefined;
+				lines: string[];
+			}
 			| undefined;
 		return {
 			invalidate() {
 				cached = undefined;
 			},
 			render(width) {
+				const latest = currentRow.latest;
+				const isRunningExecute =
+					latest.toolCall.kind === "execute" &&
+					latest.toolCall.status !== "completed" &&
+					latest.toolCall.status !== "failed" &&
+					latest.observedAt !== undefined;
+				const elapsedBucket = isRunningExecute
+					? Math.floor(Math.max(0, Date.now() - latest.observedAt!) / 1000)
+					: undefined;
 				if (
 					cached &&
-					cached.latest === currentRow.latest &&
+					cached.latest === latest &&
 					cached.width === width &&
 					cached.expanded === expanded &&
-					cached.previewCollapsed === currentRow.previewCollapsed
+					cached.previewCollapsed === currentRow.previewCollapsed &&
+					cached.elapsedBucket === elapsedBucket
 				) {
 					return cached.lines;
 				}
 				const lines = renderToolRow(
-					currentRow.latest,
+					latest,
 					{ bash, read, edit },
 					cwd,
 					expanded,
@@ -221,7 +353,7 @@ export function registerToolActivity(
 					theme,
 					width,
 				);
-				cached = { latest: currentRow.latest, width, expanded, previewCollapsed: currentRow.previewCollapsed, lines };
+				cached = { latest, width, expanded, previewCollapsed: currentRow.previewCollapsed, elapsedBucket, lines };
 				return lines;
 			},
 		} satisfies Component;
@@ -246,13 +378,31 @@ export function registerToolActivity(
 			activeCalls.set(key, rowId);
 		}
 		let row = rows.get(rowId);
-		const data = compactActivityEntry(activity, rowId, row?.latest.observedAt ?? Date.now(), cwd);
+		const now = Date.now();
+		const observedAt = row?.latest.observedAt ?? now;
+		const finished = activity.toolCall.status === "completed" || activity.toolCall.status === "failed";
+		let durationMs = row?.latest.durationMs;
+		if (finished && durationMs === undefined) {
+			if (row) {
+				durationMs = Math.max(0, now - observedAt);
+			} else if (activity.toolCall.kind === "execute") {
+				durationMs = parseExecuteDurationMs(rawToolText(activity));
+			}
+		}
+		const data = compactActivityEntry(activity, rowId, observedAt, durationMs, cwd);
 		if (row) {
 			row.latest = data;
 			row.previewCollapsed = false;
+			const group = readGroups.get(rowId);
+			if (group) group.version += 1;
 		} else {
 			row = { latest: data, previewCollapsed: false };
 			rows.set(rowId, row);
+			if (activity.toolCall.kind === "read") {
+				attachToReadGroup(rowId, row);
+			} else {
+				sealReadGroup();
+			}
 		}
 		turnRows.add(row);
 		pi.appendEntry(TOOL_ACTIVITY_ENTRY, data);
@@ -338,6 +488,7 @@ function compactActivityEntry(
 	activity: AcpToolActivity,
 	rowId: string,
 	observedAt: number,
+	durationMs: number | undefined,
 	cwd: string,
 ): ToolActivityEntry {
 	const rawDiffs = (activity.toolCall.content ?? []).filter(
@@ -356,6 +507,7 @@ function compactActivityEntry(
 		toolCall,
 		rowId,
 		observedAt,
+		...(durationMs !== undefined ? { durationMs } : {}),
 		...(diffs ? { diffs } : {}),
 		...(readLines !== undefined ? { readLines } : {}),
 	};
@@ -379,6 +531,123 @@ function entryDiffs(activity: ToolActivityEntry): CompactDiff[] {
 
 function callKey(activity: AcpToolActivity): string {
 	return JSON.stringify([activity.sessionId, activity.toolCall.toolCallId]);
+}
+
+function formatReadDisplayPath(rawPath: string, cwd: string): string {
+	const cleaned = displayText(rawPath);
+	if (!cleaned) return "";
+	if (path.isAbsolute(cleaned)) {
+		const rel = path.relative(cwd, cleaned);
+		if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) {
+			return rel;
+		}
+		const home = os.homedir();
+		if (home && (cleaned === home || cleaned.startsWith(`${home}${path.sep}`))) {
+			return `~${cleaned.slice(home.length)}`;
+		}
+	}
+	return cleaned;
+}
+
+function formatReadRange(input: Record<string, unknown>): string {
+	const start = input.StartLine ?? input.start_line ?? input.offset;
+	const end = input.EndLine ?? input.end_line;
+	const limit = input.limit;
+	if (typeof start === "number" && typeof end === "number" && end >= start) {
+		return `:${start}-${end}`;
+	}
+	if (typeof start === "number" && typeof limit === "number" && limit > 0) {
+		return `:${start}-${start + limit - 1}`;
+	}
+	if (typeof start === "number") {
+		return `:${start}`;
+	}
+	return "";
+}
+
+function renderReadGroup(
+	entries: ToolActivityEntry[],
+	readRenderer: ToolRenderers,
+	cwd: string,
+	expanded: boolean,
+	previewCollapsed: boolean,
+	theme: Theme,
+	width: number,
+): string[] {
+	if (entries.length === 0) return [];
+	const count = entries.length;
+	const noun = count === 1 ? "file" : "files";
+	const isInProgress = entries.some((entry) => entry.toolCall.status !== "completed" && entry.toolCall.status !== "failed");
+	const hasError = entries.some((entry) => entry.toolCall.status === "failed");
+	const label = isInProgress ? `Reading ${count} ${noun}...` : `Read ${count} ${noun}`;
+	const statusColor = isInProgress ? "border" : hasError ? "error" : "success";
+	const lines = gutter(new Text(theme.fg("toolTitle", theme.bold(label)), 0, 0), 2, theme.fg(statusColor, "⏺"), width);
+
+	for (const entry of entries) {
+		const call = entry.toolCall;
+		const input = record(call.rawInput);
+		const rawPath =
+			input.path ?? input.Path ?? input.file_path ?? input.filePath ??
+			input.AbsolutePath ?? input.absolute_path ?? call.locations?.[0]?.path;
+		const filePath = typeof rawPath === "string" && rawPath.trim() ? formatReadDisplayPath(rawPath, cwd) : displayText(call.title ?? call.toolCallId);
+		const range = formatReadRange(input);
+		const isPartial = call.status !== "completed" && call.status !== "failed";
+		const isError = call.status === "failed";
+		let entryLine = `${theme.fg("accent", filePath)}${range ? theme.fg("warning", range) : ""}`;
+		const output = toolOutput(entry);
+		if (!expanded && isError) {
+			const firstErrorLine = output
+				.split("\n")
+				.map((line) => line.trim())
+				.find((line) => line.length > 0);
+			const summary = firstErrorLine ? truncateToWidth(firstErrorLine, 80, "…") : "error";
+			entryLine += ` ${theme.fg("error", summary)}`;
+		}
+		lines.push(...gutter(new Text(entryLine, 0, 0), 5, `  ${theme.fg("dim", "└─")}`, width));
+
+		if (expanded) {
+			const start = input.StartLine ?? input.start_line ?? input.offset;
+			const end = input.EndLine ?? input.end_line;
+			const args = {
+				...input,
+				path: displayText(typeof rawPath === "string" ? rawPath : filePath),
+				...(typeof start === "number" ? { offset: start } : {}),
+				...(typeof start === "number" && typeof end === "number" ? { limit: end - start + 1 } : {}),
+			};
+			if (output) {
+				const context = {
+					args, toolCallId: call.toolCallId, cwd, expanded: true, isPartial, isError,
+					executionStarted: false, argsComplete: true, showImages: false, durationMs: undefined,
+					outputPad: 0, state: {}, lastComponent: undefined, invalidate() {},
+				};
+				const component = readRenderer.renderResult?.(
+					{ content: [{ type: "text", text: output }], details: undefined },
+					{ expanded: true, isPartial },
+					theme,
+					context,
+				);
+				if (component) lines.push(...gutter(component, 5, "     ", width));
+			} else if (call.status === "completed" && entry.readLines !== undefined) {
+				const lineCount = entry.readLines;
+				const summary = new Text(theme.fg("muted", `Read ${lineCount} ${lineCount === 1 ? "line" : "lines"}`), 0, 0);
+				lines.push(...gutter(summary, 5, "     ", width));
+			}
+		}
+
+		if (!previewCollapsed || expanded) {
+			for (const item of call.content ?? []) {
+				if (item.type !== "content" || item.content.type !== "image") continue;
+				let image = images.get(item.content);
+				if (!image) {
+					image = new Image(item.content.data, item.content.mimeType, { fallbackColor: (text) => theme.fg("muted", text) }, { maxWidthCells: 60 });
+					images.set(item.content, image);
+				}
+				lines.push(...gutter(image, 5, "     ", width));
+			}
+		}
+	}
+
+	return lines;
 }
 
 function renderToolRow(
@@ -415,21 +684,47 @@ function renderToolRow(
 		renderer = renderers.edit;
 		args = { path: displayText(filePath) };
 	}
+	const durationMs = !isPartial ? activity.durationMs : undefined;
 	const context = {
 		args, toolCallId: call.toolCallId, cwd, expanded, isPartial, isError,
-		executionStarted: false, argsComplete: true, showImages: false, durationMs: undefined,
+		executionStarted: false, argsComplete: true, showImages: false, durationMs,
 		outputPad: 0, state: {}, lastComponent: undefined, invalidate() {},
 	};
 	const header = renderer?.renderCall?.(args, theme, context) ??
 		new Text(theme.fg("toolTitle", theme.bold(displayText(call.title ?? call.toolCallId))), 0, 0);
 	const statusColor = isError ? "error" : isPartial ? "border" : "success";
 	const lines = gutter(header, 2, theme.fg(statusColor, "⏺"), width);
-	if (previewCollapsed && !expanded) return lines;
+	if (previewCollapsed && !expanded) {
+		if (call.kind === "execute" && durationMs !== undefined && lines.length > 0) {
+			const suffix = ` ${theme.fg("muted", `(${formatDuration(durationMs)})`)}`;
+			const lastIdx = lines.length - 1;
+			const lastLine = lines[lastIdx]!.trimEnd();
+			if (visibleWidth(lastLine) + visibleWidth(suffix) <= width) {
+				lines[lastIdx] = lastLine + suffix;
+			} else if (visibleWidth(suffix) < width) {
+				lines[lastIdx] = truncateToWidth(lastLine, Math.max(1, width - visibleWidth(suffix)), "…") + suffix;
+			}
+		}
+		return lines;
+	}
 	const output = toolOutput(activity);
 	if (output) {
 		const resultRenderer = call.kind === "read" ? renderers.read : renderers.bash;
 		const component = resultRenderer.renderResult?.(
 			{ content: [{ type: "text", text: output }], details: undefined },
+			{ expanded, isPartial }, theme, context,
+		);
+		if (component) lines.push(...gutter(component, 5, `  ${theme.fg("dim", "⎿")}`, width));
+		if (call.kind === "execute" && isPartial && activity.observedAt !== undefined) {
+			const elapsed = new Text(theme.fg("muted", `Elapsed ${formatDuration(Date.now() - activity.observedAt)}`), 0, 0);
+			lines.push(...gutter(elapsed, 5, "     ", width));
+		}
+	} else if (call.kind === "execute" && isPartial && activity.observedAt !== undefined) {
+		const elapsed = new Text(theme.fg("muted", `Elapsed ${formatDuration(Date.now() - activity.observedAt)}`), 0, 0);
+		lines.push(...gutter(elapsed, 5, `  ${theme.fg("dim", "⎿")}`, width));
+	} else if (call.kind === "execute" && durationMs !== undefined) {
+		const component = renderers.bash.renderResult?.(
+			{ content: [], details: undefined },
 			{ expanded, isPartial }, theme, context,
 		);
 		if (component) lines.push(...gutter(component, 5, `  ${theme.fg("dim", "⎿")}`, width));
@@ -472,6 +767,26 @@ function gutter(component: Component, indent: number, marker: string, width: num
 	));
 }
 
+function formatDuration(ms: number): string {
+	const seconds = Math.max(0, ms) / 1000;
+	if (seconds < 60) return `${seconds.toFixed(1)}s`;
+	const totalSeconds = Math.floor(seconds);
+	const minutes = Math.floor(totalSeconds / 60);
+	const remainder = totalSeconds % 60;
+	if (minutes < 60) return `${minutes}m ${remainder}s`;
+	return `${Math.floor(minutes / 60)}h ${minutes % 60}m ${remainder}s`;
+}
+
+function parseExecuteDurationMs(text: string): number | undefined {
+	const created = /^Created At:\s*([^\n]+)$/mu.exec(text)?.[1]?.trim();
+	const completed = /^Completed At:\s*([^\n]+)$/mu.exec(text)?.[1]?.trim();
+	if (!created || !completed) return undefined;
+	const start = Date.parse(created);
+	const end = Date.parse(completed);
+	if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return undefined;
+	return end - start;
+}
+
 function cleanExecuteOutput(text: string): string {
 	let cleaned = text.replace(/^(?:(?:Created|Completed) At:[^\n]*\n)+/u, "");
 	cleaned = cleaned.replace(/^Command exited with code 0\.\n+(?:Command output:\n)?/u, "");
@@ -479,7 +794,7 @@ function cleanExecuteOutput(text: string): string {
 	return cleaned;
 }
 
-function toolOutput(activity: AcpToolActivity): string {
+function rawToolText(activity: AcpToolActivity): string {
 	const texts: string[] = [];
 	for (const item of activity.toolCall.content ?? []) {
 		if (item.type === "content") {
@@ -505,7 +820,11 @@ function toolOutput(activity: AcpToolActivity): string {
 			texts.push(JSON.stringify(raw, null, 2));
 		}
 	}
-	const joined = displayText(texts.join("\n"));
+	return displayText(texts.join("\n"));
+}
+
+function toolOutput(activity: AcpToolActivity): string {
+	const joined = rawToolText(activity);
 	return activity.toolCall.kind === "execute" ? cleanExecuteOutput(joined) : joined;
 }
 

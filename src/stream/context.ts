@@ -132,6 +132,13 @@ export const NATIVE_READ_EXAMINE_RULE =
 	"- Use read_file to examine files and images instead of cat or sed.";
 export const NATIVE_READ_FALLBACK_RULE =
 	"- Use read_file to examine files and images.";
+export const ANTIGRAVITY_TOOL_EFFICIENCY_RULES = [
+	"- Prefer fast-path run_command allowlist commands over non-allowlisted tools (e.g. use `grep`/`egrep`/`fgrep` instead of `rg`, `git ls-files` instead of `find`): `grep`, `egrep`, `fgrep`, `ls`, `head`, `tail`, `wc`, `diff`, `comm`, `jq`, `stat`, `du`, `df`, `ps`, `which`, `pwd`, `realpath`, `strings`, and read-only `git` (`log`, `diff`, `status`, `show`, `rev-parse`, `ls-files`, `rev-list`, `describe`).",
+	"- Keep allowlisted commands as clean single commands or pipes of allowlisted commands (e.g. `grep ... | head`, `git ls-files | grep ...`) without `;`, `&&`, `||`, or non-allowlisted pipe stages (`rg`, `find`, `sed`, `awk`, `sort`, `uniq`) so they stay on the fast path.",
+	"- Batch related non-fast-path commands (rg, find, python3, tests, builds) into one run_command call instead of firing many tiny calls.",
+	"- Keep run_command and MCP outputs under ~10 KB (filter paths, use head) to avoid truncation and an extra read_file round-trip.",
+	"- Minimize separate pi_* MCP calls; batch multiple Pi tool operations in one pi_codemode call when available.",
+] as const;
 
 /** Rules that only restate what tool descriptions already say or apply only to Pi's edit schema. */
 const SCHEMA_DUPLICATE_RULES = new Set([
@@ -180,6 +187,10 @@ export function adaptInstructionsForAntigravity(instructions: string): string {
 			content = content.replace(/\bUse codemode\b/gu, "Use pi_codemode");
 			content = content.replace(/\bUse generate_image\b/gu, "Use pi_generate_image");
 			content = content.replace(/\bUse read to inspect images\b/gu, "Use read_file to inspect images");
+			const missingEfficiencyRules = ANTIGRAVITY_TOOL_EFFICIENCY_RULES.filter((rule) => !content.includes(rule));
+			if (missingEfficiencyRules.length > 0) {
+				content = `${content.trimEnd()}\n${missingEfficiencyRules.join("\n")}\n`;
+			}
 			return `<rules>${content}</rules>`;
 		});
 	} else {

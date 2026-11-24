@@ -2,6 +2,7 @@ import { type Context, normalizeContext } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 
 import {
+	ANTIGRAVITY_TOOL_EFFICIENCY_RULES,
 	buildPromptParts,
 	MAX_PROMPT_BYTES,
 	MAX_REPLAY_BATCHES,
@@ -201,6 +202,7 @@ describe("prompt context", () => {
 		expect(rules).toEqual([
 			"- Use run_command for file operations",
 			"- When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
+			...ANTIGRAVITY_TOOL_EFFICIENCY_RULES,
 		]);
 	});
 
@@ -238,6 +240,12 @@ describe("prompt context", () => {
 		expect(text).toContain("Do not use Antigravity's native skill loader for these files.");
 		expect(text).toContain("<location>/home/test/.pi/agent/skills/libgen/SKILL.md</location>");
 		expect(text).toContain("When a skill file references a relative path, resolve it against the skill directory.");
+		for (const rule of ANTIGRAVITY_TOOL_EFFICIENCY_RULES) {
+			expect(text).toContain(rule);
+		}
+		expect(text).toContain("Prefer fast-path run_command allowlist commands");
+		expect(text).toContain("`grep`, `egrep`, `fgrep`");
+		expect(text).toContain("`git` (`log`, `diff`, `status`, `show`, `rev-parse`, `ls-files`, `rev-list`, `describe`)");
 	});
 });
 
