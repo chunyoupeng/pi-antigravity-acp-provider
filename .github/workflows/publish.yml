@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   publish:
-    if: github.repository_owner == 'zacbemis'
+    if: github.repository_owner == 'chunyoupeng'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

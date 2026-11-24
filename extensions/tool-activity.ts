@@ -8,6 +8,7 @@ import {
 	SettingsManager,
 	type ExtensionAPI,
 	type ExtensionContext,
+	type KeybindingHints,
 	type Theme,
 	type ToolRenderers,
 	renderDiff,
@@ -251,7 +252,12 @@ export function registerToolActivity(
 		turnRows.clear();
 	});
 
-	pi.registerEntryRenderer<ToolActivityEntry>(TOOL_ACTIVITY_ENTRY, (entry, { expanded }, theme) => {
+	pi.registerEntryRenderer<ToolActivityEntry>(TOOL_ACTIVITY_ENTRY, (entry, renderOptions, theme) => {
+		const { expanded } = renderOptions;
+		const keyHints: KeybindingHints = {
+			keyText: renderOptions.keyText ?? (() => ""),
+			keyHint: renderOptions.keyHint ?? ((_key, description) => description),
+		};
 		const data = entry.data;
 		if (!data) return undefined;
 		const rowId = data.rowId ?? entry.id;
@@ -350,6 +356,7 @@ export function registerToolActivity(
 					cwd,
 					expanded,
 					currentRow.previewCollapsed,
+					keyHints,
 					theme,
 					width,
 				);
@@ -656,6 +663,7 @@ function renderToolRow(
 	cwd: string,
 	expanded: boolean,
 	previewCollapsed: boolean,
+	keyHints: KeybindingHints,
 	theme: Theme,
 	width: number,
 ): string[] {
@@ -689,6 +697,7 @@ function renderToolRow(
 		args, toolCallId: call.toolCallId, cwd, expanded, isPartial, isError,
 		executionStarted: false, argsComplete: true, showImages: false, durationMs,
 		outputPad: 0, state: {}, lastComponent: undefined, invalidate() {},
+		keyText: keyHints.keyText, keyHint: keyHints.keyHint,
 	};
 	const header = renderer?.renderCall?.(args, theme, context) ??
 		new Text(theme.fg("toolTitle", theme.bold(displayText(call.title ?? call.toolCallId))), 0, 0);

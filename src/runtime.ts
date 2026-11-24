@@ -2036,10 +2036,9 @@ function isAbort(error: unknown): boolean {
 		: error instanceof DOMException && error.name === "AbortError";
 }
 
-/** Detects synthetic error messages `agy_acp_server.par` emits as normal
+/** Detects synthetic error messages the Antigravity ACP server emits as normal
  * `agent_message_chunk` text before returning `stop_reason: "end_turn"` when
- * `localharness_external` fails with `AntigravityExecutionError` or a broken
- * WebSocket connection (`server.py` + `api_errors.py`). */
+ * the backend fails or a connection drops. */
 export function isSyntheticExecutionErrorChunk(delta: string): boolean {
 	const trimmed = delta.trim();
 	return (

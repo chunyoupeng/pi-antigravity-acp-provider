@@ -297,7 +297,6 @@ describe("applyDefaultTlsEnvironment", () => {
 					NIX_SSL_CERT_FILE: certFile,
 				};
 				delete env.SSL_CERT_FILE;
-				delete env.AGY_ACP_FORCE_FILE_STORAGE;
 				const child = new AntigravityProcess({
 					cwd: process.cwd(),
 					entryPath: envDumpFixture,
@@ -311,7 +310,7 @@ describe("applyDefaultTlsEnvironment", () => {
 						}),
 					]);
 					expect(exit.code).toBe(0);
-					expect(JSON.parse(exit.stderrTail)).toEqual({ sslCertFile: certFile, forceFileStorage: null });
+					expect(JSON.parse(exit.stderrTail)).toEqual({ sslCertFile: certFile });
 				} finally {
 					await child.close();
 				}

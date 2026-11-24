@@ -24,7 +24,7 @@
    ```
 
    - 回归测试默认使用模型 `antigravity-acp/gemini-4-neon`。如需确认可用模型，用 `pi --no-extensions -e ./extensions/index.ts --list-models antigravity` 查看。
-   - 至少要确认：扩展能正常加载、模型能返回回答、Pi 的工具调用（read / bash / edit 等经 MCP bridge）能成功执行并回传结果。
+   - 至少要确认：扩展能正常加载、模型能返回回答、原生工具调用（`read_file` / `run_command` / `edit_file` / `write_file`）及经 MCP bridge 的 Pi 扩展工具都能成功执行并回传结果。
    - 改动涉及哪块功能，就针对那块写 prompt 去测（比如工具渲染、权限模式、session 恢复、图片输入、reasoning effort 等）。交互式或 session 恢复相关的改动，要开交互式 `pi --no-extensions -e ./extensions/index.ts` 手动测，必要时用 `-c` / `--session` 恢复会话。
    - 回归测试失败或出现异常输出，就继续修，不能直接报告完成。
 3. 汇报时写明跑了哪些命令、用的哪个模型、结果是什么。

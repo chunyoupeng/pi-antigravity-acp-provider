@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 
 const { GITHUB_REPOSITORY: repo, GITHUB_RUN_ID: runId, GITHUB_SHA: sha } = process.env;
-if (repo !== "zacbemis/pi-antigravity-acp-provider" || !/^\d+$/u.test(runId ?? "") || !/^[0-9a-f]{40}$/u.test(sha ?? "")) {
+if (repo !== "chunyoupeng/pi-antigravity-acp-provider" || !/^\d+$/u.test(runId ?? "") || !/^[0-9a-f]{40}$/u.test(sha ?? "")) {
 	throw new Error("CI reporting requires the official repository and exact Actions run/commit identity");
 }
 const api = (...args) => execFileSync("gh", ["api", ...args], { encoding: "utf8", timeout: 60_000 }).trim();

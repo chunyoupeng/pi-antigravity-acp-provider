@@ -1,42 +1,22 @@
 # Antigravity migration
 
-Status date: 2026-09-04
+Status date: 2026-11-23
 
-## Why the target changed
+## Current runtime: native `agy acp`
 
-The original implementation bundled `@google/gemini-cli@0.58.0` and attempted its `oauth-personal` ACP authentication flow. That flow now reports that Gemini Code Assist for individuals is no longer supported. Treating this as a missing local credential was an architectural error: retrying `/login` could not make the retired service path viable.
+The provider now runs directly on Google's native Antigravity CLI (`agy acp`), replacing both the retired `@google/gemini-cli` bundle and the intermediate `agy_acp_server.par` signed-manifest installer:
 
-The provider now targets Google's Antigravity product surface instead:
+- **Launch command:** `agy acp --process-per-session --agent pi-acp-bridge --disable-telemetry` (plus `--dangerously-skip-permissions` when requested and `--cloud_code_endpoint` pointing to the local CCPA relay).
+- **Custom agent definition:** auto-provisioned at `$GEMINI_HOME/antigravity-cli/agents/pi-acp-bridge/agent.md` with `excludeDefaultComponents: true`, keeping the CCPA-required `<identity>` block and native `read_file`, `write_file`, `edit_file`, and `run_command` tools.
+- **Pi MCP bridge:** core file/shell tools (`read`, `write`, `edit`, `bash`) are superseded by native `agy` tools; remaining Pi and extension tools are exposed over the authenticated loopback HTTP MCP bridge (`pi-bridge`).
+- **544K auto-patch (`src/acp/agy-patch.ts`):** on macOS ARM64, inspects `utils.GetCheckpointConfig` in the official `agy` binary without modifying it. If the binary still hard-caps checkpoints at 256K, a private ad-hoc codesigned copy is written to `$PI_CODING_AGENT_DIR/antigravity-acp-provider/runtime/` with a 544K limit so Pi can compact cleanly around 512K. When `agy` updates and natively lifts the cap, the stale copy is cleaned up automatically.
+- **HTTP/2 CCPA relay (`src/acp/ccpa-relay.mjs`):** the supervisor starts a loopback relay that multiplexes upstream requests over a persistent HTTP/2 session (direct or via HTTP/HTTPS/SOCKS5 proxies) with transparent HTTP/1.1 fallback, 5xx retries, and streaming heartbeats.
+- **Compact native tool UI (`extensions/tool-activity.ts`):** pre-computes compact diffs at ingestion time, caches row renders, shows full uncollapsed edit diffs, strips `agy` command timestamps, and displays `Read N lines` summaries.
+- **Auth & profile storage:** OAuth credentials are owned by `agy` (macOS Keychain service `gemini`, account `antigravity`), or `GEMINI_API_KEY` for API-key auth. Conversation history and transcripts live under `$GEMINI_HOME/antigravity-cli/`.
 
-- official `agy_acp_server.par` ACP server;
-- Antigravity OAuth/token state under `~/.gemini/antigravity-acp/`;
-- Antigravity model slugs and effort tiers;
-- `@estebanforge/pi-antigravity-bridge` 1.4.1 as the primary setup and behavior reference.
+## Historical transitions
 
-## Implemented migration
+1. **Superseded: `@google/gemini-cli@0.58.0`** — retired after Google ended the individual Code Assist login path.
+2. **Superseded: `agy_acp_server.par` + signed `runtime-manifest.json`** — removed in commit `363cecf` along with `src/acp/setup.ts`, `src/acp/runtime-manifest.ts`, `src/acp/update-notice.ts`, `src/acp/credential-storage.ts`, `src/acp/client-fs.ts`, `src/acp/native-read-results.ts`, and `extensions/safe-read.ts` in favor of native `agy acp`.
 
-- Removed the production dependency on `@google/gemini-cli`.
-- Launches the Antigravity ACP server under the existing process-tree supervisor.
-- Resolves `AGY_ACP_BIN`, user and managed install paths, and `PATH`.
-- Uses the bridge's reviewed ACP registry installer when no server is present.
-- Renamed Pi login/provider presentation to **Google Antigravity (ACP)**.
-- Adds an SSH/headless OAuth relay because ACP 1.1.1 keeps its browser URL internal: a private `BROWSER` shim captures the URL, Pi displays it, and a user-pasted loopback callback is strictly validated and forwarded to the remote listener.
-- Reads only Antigravity auth presence, never token values.
-- Replaced stale Gemini 2.5 fallbacks with current Antigravity models. Effort-qualified ACP IDs are collapsed into one Pi model and selected dynamically through Pi's reasoning level.
-- Updated real and authenticated tests to assert `agentInfo.name === "antigravity-acp"`.
-
-## Verified live
-
-Against authenticated `agy_acp_server_1.1.1` on Linux:
-
-- ACP initialization negotiated protocol 1.
-- The server advertised `oauth-personal`, enterprise, API-key, and agent-platform authentication.
-- `session/new` returned the authenticated Antigravity catalog, including Gemini 3.8/3.7/3.6 Flash effort variants and Gemini 3.1 Pro variants.
-- A real prompt completed with `stopReason: "end_turn"` and streamed the requested exact response.
-- Both `session/set_model` and `session/set_config_option` were accepted by this server build.
-- Pi reasoning levels now map to exact ACP variants (`low`, `medium`, or `high`) through `session/set_model`; unsupported levels are hidden or safely clamped.
-- Antigravity session permissions support persisted `default`, `auto_edit`, and `yolo` modes through `session/set_mode`; per user request, fresh installations default to `yolo`.
-
-## Documentation status
-
-The older design/research documents contain useful Pi and ACP analysis, but statements requiring bundled Gemini CLI or individual Gemini Code Assist authentication are superseded by this document. They must not be used as current setup guidance.
+Older design and research documents under `docs/` remain for historical context and should not be used as current setup instructions.

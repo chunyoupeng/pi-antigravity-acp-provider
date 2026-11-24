@@ -1,7 +1,6 @@
 import packageJson from "../package.json" with { type: "json" };
 
 export const PACKAGE_VERSION = packageJson.version;
-export const ANTIGRAVITY_ACP_VERSION = "1.1.1";
 export const ACP_SDK_VERSION = "1.8.0";
 export const ACP_PROTOCOL_VERSION = 1;
 export const MANAGED_AUTH_MARKER = "pi-antigravity-acp:managed-by-antigravity";

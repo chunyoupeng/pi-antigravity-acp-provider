@@ -1,40 +1,40 @@
 # @chunyoupeng/pi-antigravity-acp-provider
 
-A [Pi](https://github.com/earendil-works/pi) provider for **Google Antigravity** through its official ACP server, in which Pi runs the tools.
+A [Pi](https://github.com/earendil-works/pi) provider for **Google Antigravity** backed by the native `agy acp` CLI, with automatic 544K context-window patching, an HTTP/2 multiplexed CCPA relay, compact native tool rendering, and an authenticated loopback MCP bridge for Pi extension tools.
 
-This is a fork of [zacbemis/pi-antigravity-acp-provider](https://github.com/zacbemis/pi-antigravity-acp-provider) and keeps its runtime installer, signed runtime catalog, authentication and turn recovery. It differs from upstream in these ways:
+This is a fork of [zacbemis/pi-antigravity-acp-provider](https://github.com/zacbemis/pi-antigravity-acp-provider). Compared to upstream:
 
-- Antigravity's file and shell built-ins are disabled per session, so the model works through Pi's tools over the MCP bridge and Pi's permissions, hooks and tool cards apply. Upstream lets Antigravity run them natively and shows a text line per tool update.
-- Native tools that remain are rendered with Pi's shell/file renderers and real diffs, and survive session restore.
-- About 3k prompt tokens per turn are saved by disabling `schedule`, `ask_question` and `generate_image`, and subagent tools are disabled.
-- Images from Pi tools reach the model inside the tool result, and Pi tool calls still running near Antigravity's 3-minute MCP deadline are handed back and answered in the next prompt.
-- Idle Antigravity conversation history that no Pi session can resume is pruned.
+- Launches native `agy acp` (`--process-per-session --agent pi-acp-bridge --disable-telemetry`) instead of downloading and maintaining a separate `agy_acp_server.par` runtime catalog.
+- Auto-provisions a minimal `pi-acp-bridge` custom agent under `$GEMINI_HOME/antigravity-cli/agents/pi-acp-bridge/agent.md` (`excludeDefaultComponents: true`, keeping the CCPA-required `<identity>` header and native `read_file`, `write_file`, `edit_file`, `run_command` tools) while exposing non-core Pi and extension tools over an authenticated loopback MCP bridge (`pi-bridge`).
+- On macOS ARM64, automatically patches a private copy of `agy` to raise `utils.GetCheckpointConfig` from 256K to 544K without ever modifying the official binary, so Pi can manage a 512K context window and compact cleanly before the harness checkpoints on its own.
+- Runs a local HTTP/2 multiplexed CCPA relay (`src/acp/ccpa-relay.mjs`) with direct, HTTP, and SOCKS5 proxy support, transparent HTTP/1.1 fallback, retry handling, and streaming heartbeats.
+- Renders native tool activity with Pi's shell/file/diff renderers, pre-computing compact diffs on ingestion, caching row renders, showing full uncollapsed edit diffs, stripping `agy` command timestamps, and summarizing reads as `Read N lines`.
+- Prunes idle Antigravity CLI conversation history (`$GEMINI_HOME/antigravity-cli/{conversations,brain}/`) that no saved Pi session references.
 
-The provider ID, commands and config directory are the same as upstream, so remove the upstream package before installing this one.
+The provider ID, command name, and config directory are the same as upstream, so remove the upstream package before installing this one.
 
-> **Important:** this package no longer uses `@google/gemini-cli`. The Gemini CLI individual Code Assist login path was retired and is not a supported authentication route. Antigravity/`agy` is the target runtime.
+> **Important:** this package requires the native Google Antigravity CLI (`agy`). `@google/gemini-cli` and the legacy `agy_acp_server.par` managed installer are no longer used.
 
 ## Features
 
-- Registers `antigravity-acp/*` models backed by Google Antigravity.
-- Uses ACP protocol v1 and the official TypeScript SDK.
-- Collapses Antigravity's effort-qualified IDs into one entry per model; Pi's Shift+Tab reasoning control selects low/medium/high dynamically.
-- Supports Pi streaming, cancellation, usage/quota metadata, lifecycle cleanup, and persisted ACP session restoration across Pi restarts.
-- Reports Antigravity's `usage_update` context fill as Pi usage, so Pi's context meter and auto-compaction work even though the server returns no token counts.
-- Routes compatible Pi tools from transcript system messages through an authenticated loopback MCP bridge, using Pi's standard tool-call/result lifecycle; doctor/status names omitted tools and their reasons.
-- Each session sets `_meta.antigravity.mcpMaxOutputBytes` to 1 MiB, so Pi tool results, including images up to Pi's 512 KiB / 1536px cap, reach the model inline instead of as an offloaded file path. The harness still cuts any text result over 48 KiB, so for Antigravity `pi_read` pages text at 45 KiB (2000 lines) with Pi's `Use offset=N to continue` note, and `pi_bash` keeps the last 45 KiB of output and names a file holding all of it. Text from any other Pi tool over 46 KiB keeps its head inline and is saved in full to a temp file. Other providers keep Pi's original behavior.
-- By default Pi owns file and shell work: Antigravity's built-in `view_file`, `run_command`, `create_file`, `edit_file`, `list_directory`, `search_directory`, `find_file`, and `start_subagent` (which removes all subagent tools) are disabled per session (`_meta.antigravity.disabledTools`), so the model reads, runs and edits only through Pi's tools and Pi's hooks and rendering apply. Pi skill instructions route skill files through `pi_read`, because Antigravity's native skill loader may reject skill paths outside its workspace. Antigravity's permission prompt for bridged calls is approved once automatically. Web search and URL fetch stay native. `schedule`, `ask_question`, and `generate_image` are disabled in both tool modes to keep about 3k tokens out of every prompt.
-- Displays Antigravity-native tools with Pi's built-in shell/file renderers, status bullets, output previews, and colored diffs. Updates for the same invocation share one live row; expanding shows output and ACP details. Display-only entries retain every raw update for JSON/RPC clients (`entry_appended`) and session restore. Native `view_file` text results are recovered read-only from the current session's Antigravity conversation database, matching the original tool ID, path, range, and timestamps. Recorded content confirms success; explicit response errors confirm failure even if the step is `DONE`. Confirmed results survive unrelated later ACP failures, without altering the raw notifications or model context. Native actions are not executed again by Pi.
-- Read-result recovery requires Node's optional `node:sqlite` module and the current upstream protobuf layout. It uses `$GEMINI_HOME/antigravity-acp/conversations/<session-id>.db` (default `~/.gemini`), checks immediately on tool notifications, and retries every 300 ms while the agent is active. It also backfills saved rows on session restore. Missing/locked/corrupt databases, unknown layouts, and ambiguous matches leave ACP data unchanged; a generic `Tool execution failed` with no verified result remains an unconfirmed warning. Scans are bounded to 4096 recent completed native steps and 64 MiB, with a 16 MiB per-step limit. Recovered display output is capped at 64k characters; the full original response stays in Antigravity.
-- Preserves Pi project instructions (including `AGENTS.md` and named prompt sections) separately from truncated conversation history.
-- Supports persisted `default`, `auto-edit`, and `yolo` Antigravity permission modes. The requested default is `yolo`; switching to a prompting mode retains the single-use, fail-closed Pi permission broker.
-- With `tools native`, keeps Antigravity's built-ins but advertises ACP `fs`, so its file reads and writes go through the provider, confined to the workspace, `GEMINI_HOME`, and the temp directory. ACP terminal is never advertised; the server does not use it.
-- On the first session start of each Pi process, removes Antigravity conversations (`$GEMINI_HOME/antigravity-acp/conversations/<id>.*` and `brain/<id>/`) that no saved Pi session references and that have not changed for 7 days. Credentials, settings and non-session files are left alone.
-- Provides setup, auth-health, logout/account-switching, qualification, quota, and runtime-update commands.
-- Automatically checks for newer managed ACP runtimes once per day, with `automatic`, `notify`, and `manual` update modes.
-- Uses an Ed25519-signed runtime catalog with exact Google artifact URLs, archive hashes and sizes, strict two-file extraction, pre-activation ACP identity/version validation, immutable releases, rollback retention, musl rejection, macOS quarantine cleanup, and Windows process-tree handling.
+- **Native `agy acp` runtime:** resolves `AGY_ACP_BIN`, `~/.local/bin/agy`, or `agy` on `PATH`, and automatically maintains the minimal `pi-acp-bridge` custom agent.
+- **Automatic 544K context-window patcher (`src/acp/agy-patch.ts`):** inspects `utils.GetCheckpointConfig` on macOS ARM64 binaries, copies and ad-hoc codesigns a patched binary under `$PI_CODING_AGENT_DIR/antigravity-acp-provider/runtime/`, re-checks automatically when `agy` updates, and cleans up the private copy if upstream natively lifts the 256K cap. Exposes a 512K context window to Pi so Pi's context meter and auto-compaction stay ahead of harness checkpointing. Set `PI_ANTIGRAVITY_PATCH_AGY=0` to disable patching.
+- **Persistent HTTP/2 CCPA relay (`src/acp/ccpa-relay.mjs`):** started by the ACP supervisor and passed via `--cloud_code_endpoint`, multiplexing upstream requests over HTTP/2 (direct or via HTTP/HTTPS/SOCKS5 proxies) with transparent HTTP/1.1 fallback, 5xx retries, and stall diagnostics.
+- **Model & reasoning projection:** collapses Antigravity's effort-qualified ACP model IDs into one Pi model entry; Shift+Tab dynamically selects advertised `low` / `medium` / `high` / `xhigh` tiers via ACP configuration options.
+- **Hybrid tool execution:** core file and shell tools (`read`, `write`, `edit`, `bash`) execute natively through `agy`'s `read_file`, `write_file`, `edit_file`, and `run_command`; all other compatible Pi and extension tools are routed through the authenticated loopback MCP bridge (`pi-bridge`, `pi_` prefix). Bridged tool text over 46 KiB keeps its head inline and saves the full payload to a temporary file; inline images are capped at 512 KiB / 1536px; long-running bridged calls are handed back at 150s before Antigravity's 3-minute MCP deadline and answered on the next prompt.
+- **Compact native tool UI (`extensions/tool-activity.ts`):** renders native file, diff, and shell activity with Pi's built-in renderers, pre-computes compact diffs at ingestion time so session files stay small and redraws stay fast, caches rendered rows, and survives session restore.
+- **Session persistence & lifecycle:** supports ACP protocol v1 via the official TypeScript SDK, streaming, cancellation, usage/quota reporting, persisted session resume/load across Pi restarts, warm connection prewarming, idle binding hibernation (6h default), idle compaction, and 7-day unreferenced history cleanup.
+- **Permission modes:** supports persisted `default`, `auto-edit`, and `yolo` (default) permission modes with a single-use, fail-closed Pi permission broker in prompting modes.
+- **Instruction preservation:** keeps Pi project instructions (including `AGENTS.md` and named prompt sections) separate from truncated conversation history, up to 256 KiB UTF-8.
 
 ## New-user setup
+
+### Prerequisites
+
+1. Install [Google Antigravity CLI (`agy`)](https://www.antigravity.google/) and verify `agy --version` works.
+2. Node.js `>=22.19.0` (standalone Pi builds also need `node` or `nodejs` on `PATH`, or `NODE` set to its path).
+
+### Install
 
 Install from GitHub:
 
@@ -44,7 +44,7 @@ pi install git:github.com/chunyoupeng/pi-antigravity-acp-provider
 pi
 ```
 
-To run from source instead:
+To run from a local checkout:
 
 ```bash
 git clone https://github.com/chunyoupeng/pi-antigravity-acp-provider.git
@@ -53,60 +53,49 @@ npm install
 pi --no-extensions -e ./extensions/index.ts
 ```
 
-To replace an existing installation with a persistent local development package:
+To install a persistent local development checkout into Pi:
 
 ```bash
 pi remove git:github.com/chunyoupeng/pi-antigravity-acp-provider
 pi install "$PWD"
 ```
 
-Pi loads the local directory without copying it. Restart Pi or run `/reload` after switching. Full ACP notifications are also forwarded to Pi's `provider_stream_event` hook before conversion; native tool records never enter the model transcript.
+Pi loads the local directory without copying it. Restart Pi or run `/reload` after switching. Full ACP notifications are forwarded to Pi's `provider_stream_event` hook before conversion; display-only native tool records never enter the model transcript.
 
-In Pi:
+### First-run flow in Pi
 
-1. Optionally run `/antigravity-acp setup` for a runtime/auth preflight.
-2. Run `/login`.
-3. Choose **Sign in with an account**.
-4. Choose **Google Antigravity (ACP)**.
-5. If needed, wait for the official ACP server download and extraction. Progress is shown; the Linux build observed during development expands to about 1.8 GB.
-6. Complete the Google login in the browser.
-7. Run `/antigravity-acp setup` again to perform a network auth probe and model discovery.
-8. Run `/model` and select one of the `antigravity-acp` models.
-9. Press **Shift+Tab** to choose the reasoning effort. Only tiers advertised by Antigravity are exposed. A model with a single tier (for example Argon Medium during rollout) remains a reasoning model with that tier; the provider does not invent Low/High variants.
-10. Send a prompt. The default permission mode is `yolo`, so Antigravity-native commands and edits can run without confirmation.
+1. Optionally run `/antigravity-acp setup` for a CLI/auth preflight and permission mode selection.
+2. Run `/login` → **Sign in with an account** → **Google Antigravity (ACP)** (or authenticate `agy` directly).
+3. Run `/antigravity-acp doctor` to verify CLI resolution, 544K patch status, authentication, and active bindings.
+4. Run `/model` and choose an `antigravity-acp/*` model.
+5. Press **Shift+Tab** to pick the reasoning effort tier advertised by Antigravity.
 
-The provider first looks at `AGY_ACP_BIN`, then its verified managed `~/.local/opt/agy-acp/current/` release, `~/.local/bin/agy_acp_server.par`, and `PATH`. Set `AGY_ACP_BIN` to explicitly prefer an externally managed runtime. If absent, it installs the platform build published in the ACP registry. A global `agy` or `gemini` command is not required.
+### Binary resolution & proxy / TLS behavior
 
-Loopback MCP traffic is exempted from proxies in the ACP child environment. Explicit `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (and lowercase variants) are preserved. On macOS, when none are explicitly set, the provider probes enabled system HTTP proxy settings to avoid automatic SOCKS selection unsupported by the bundled Python runtime. Set `PI_ANTIGRAVITY_ACP_PROXY` to an absolute HTTP/HTTPS proxy URL to explicitly override child proxy settings; the provider does not log the override or change its parent environment. Existing `NO_PROXY` lists and TLS certificate overrides are retained.
+The provider resolves `agy` in this order: `AGY_ACP_BIN`, `~/.local/bin/agy` (`agy.exe` on Windows), then `PATH`.
 
-Standalone Pi builds also need Node.js to run the ACP supervisor. The provider looks for `node` or `nodejs` on `PATH`; set `NODE` to the executable path if neither is available. On NixOS with Home Manager, `programs.pi-coding-agent.extraPackages = [ pkgs.nodejs ];` adds Node to Pi's `PATH`. An explicit `SSL_CERT_FILE` is preserved; otherwise the provider uses `NIX_SSL_CERT_FILE` or a readable system CA bundle when available.
+Loopback MCP and relay traffic is exempted from proxies in the ACP child environment (`localhost`, `127.0.0.1`, `::1`). Explicit `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (and lowercase variants) are preserved. On macOS, when none are explicitly set, enabled system HTTP/HTTPS proxy settings are probed automatically; set `PI_ANTIGRAVITY_ACP_PROXY` to an absolute HTTP/HTTPS proxy URL to explicitly override child proxy settings. An explicit `SSL_CERT_FILE` is preserved; otherwise `NIX_SSL_CERT_FILE` or a readable system CA bundle is used when available.
 
 ### SSH and headless Google login
 
-When Pi is running over SSH, or on Linux without `DISPLAY`/`WAYLAND_DISPLAY`, `/login` automatically uses a manual browser relay:
+When Pi runs over SSH, or on Linux without `DISPLAY`/`WAYLAND_DISPLAY`, `/login` automatically uses a manual browser relay:
 
-1. Pi prints the Google authorization URL instead of trying to launch a browser on the server.
-2. Open that URL in a browser on your local machine and finish Google sign-in.
-3. Google redirects to an Antigravity loopback URL. The page may show a connection error because `127.0.0.1` refers to your local machine; copy the **complete final URL** from the browser address bar.
-4. Paste that URL into Pi. The provider validates its host, port, path, and OAuth state, then relays it to Antigravity's loopback listener on the server. An SSH port-forward is not required.
+1. Pi prints the Google authorization URL instead of launching a remote browser.
+2. Open that URL locally and complete Google sign-in.
+3. Copy the **complete final loopback URL** (`http://127.0.0.1:...`) from the browser address bar even if the page fails to connect locally.
+4. Paste that URL into Pi; the provider validates its host, port, path, and OAuth state and relays it to the local listener on the server.
 
-Set `PI_ANTIGRAVITY_ACP_OAUTH_MODE=manual` to force this flow, or `PI_ANTIGRAVITY_ACP_OAUTH_MODE=browser` to force normal browser launch. OAuth URLs and callback codes are kept in a private temporary directory only for the duration of login and are never logged or persisted by this package.
+Set `PI_ANTIGRAVITY_ACP_OAUTH_MODE=manual` to force this flow or `PI_ANTIGRAVITY_ACP_OAUTH_MODE=browser` to force normal browser launch.
 
-For API-key authentication, choose **Enter an API key** and then **Antigravity Gemini API key** in `/login`, or set `GEMINI_API_KEY` before starting Pi.
+For API-key authentication, choose **Enter an API key** → **Antigravity Gemini API key** in `/login`, or set `GEMINI_API_KEY`.
 
-Antigravity owns OAuth tokens under `~/.gemini/antigravity-acp/` (on macOS, in the Keychain under service `gemini`); Pi stores only a non-secret configured marker. Existing `agy` CLI credentials and Gemini CLI credentials should not be assumed to authenticate this separate ACP server.
+On macOS, `agy` stores OAuth credentials in the login Keychain under service `gemini`, account `antigravity`; Pi stores only a non-secret configured marker.
 
-### Model availability
+### Diagnostics & logs
 
-The model catalog comes from the official ACP server. A successful model listing or selection is not an inference/access probe: newly listed models can still fail because of plan eligibility, staged rollout, or backend availability. As of October 13, 2026, Google's [Argon announcement](https://www.antigravity.google/blog/gemini-4-argon-in-google-antigravity) and [model availability table](https://www.antigravity.google/docs/models/) list Gemini 4 Argon for Google AI Ultra and eligible Enterprise subscriptions, not AI Pro. If it returns `Requested entity was not found`, check access in the official Antigravity app/CLI with the same account; do not guess alternate model IDs or assume the listing proves access. Use another advertised model while investigating.
-
-### macOS credential storage
-
-On macOS the Antigravity server prefers the login keychain (service `gemini`, accounts `antigravity-acp` / `antigravity-acp-business`), but decides that at every process start with a set/get/delete probe bounded to 3 seconds. Under load -- for example many concurrent Pi sessions, each spawning its own server -- the probe can time out; the server then silently falls back to the empty secure file, reports `Credentials missing or invalid`, and opens interactive Google consent although a valid login exists. This provider therefore pins every spawned server to the secure-file backend by default (`AGY_ACP_FORCE_FILE_STORAGE=1`, the server's documented switch and its default off macOS): credentials live in the 0600 files `~/.gemini/antigravity-acp/acp_token.json` and `acp_business_token.json`. Before spawning, a login that exists only in the keychain is copied once into the matching absent file, so switching backends never forces a new login; an existing file is never overwritten. Logout clears both the files and the keychain entries so the old account cannot be migrated back. Set `AGY_ACP_FORCE_FILE_STORAGE` yourself (for example `0` to return to the keychain) to take full control of the choice. `doctor`/`status` reports the expected backend as `Credential storage (preflight):`. An explicit `GEMINI_HOME` relocates the whole tree, including the token files, and is honored by setup, health checks, logout, migration, and the credential-storage decision.
-
-The server's stderr is appended, redacted and tagged with its pid, to `$PI_CODING_AGENT_DIR/antigravity-acp-provider/logs/acp-server.log` (rotated once to `.1` past 5 MB). Search it for `Launching browser login flow`, `Failed to refresh token` or `Wiping credentials` when a saved login stops being reused.
-
-The provider's own session decisions go to `logs/bindings.jsonl` in the same directory (also rotated past 5 MB): one line each time a Pi session binds to an Antigravity session (new, resume or load), sends a prompt (fresh history or delta, message range, bytes), ends a turn, drops a binding (with the reason) or sees the server process exit. From a checkout, `node scripts/diagnose-session.mjs [session.jsonl | session id | cwd]` lines a Pi session up with that log and the Antigravity transcripts it used, in local time, and flags context jumps, Pi history replayed into a non-empty session, harness checkpoints and backend errors.
+- Redacted ACP server and relay stderr: `$PI_CODING_AGENT_DIR/antigravity-acp-provider/logs/acp-server.log` (rotated to `.1` past 5 MiB).
+- Session binding and turn decisions: `$PI_CODING_AGENT_DIR/antigravity-acp-provider/logs/bindings.jsonl` (rotated past 5 MiB).
+- Timeline diagnostic tool: `node scripts/diagnose-session.mjs [session.jsonl | session id | cwd] [--all]` aligns a Pi session with `bindings.jsonl` and `$GEMINI_HOME/antigravity-cli/brain/<id>/.system_generated/logs/transcript_full.jsonl` in local time, flagging context jumps, duplicate replays, harness checkpoints, and backend errors.
 
 ## Commands
 
@@ -117,8 +106,6 @@ The provider's own session decisions go to `logs/bindings.jsonl` in the same dir
 /antigravity-acp status
 /antigravity-acp usage
 /antigravity-acp quota
-/antigravity-acp update
-/antigravity-acp updates [automatic|notify|manual]
 /antigravity-acp qualify
 /antigravity-acp logout
 /antigravity-acp account
@@ -126,58 +113,76 @@ The provider's own session decisions go to `logs/bindings.jsonl` in the same dir
 /antigravity-acp permissions default
 /antigravity-acp permissions auto-edit
 /antigravity-acp permissions yolo
-/antigravity-acp tools [pi|native]
 /antigravity-acp sessions
 /antigravity-acp plan <task>
 ```
 
-Permission and runtime-update modes are saved in `$PI_CODING_AGENT_DIR/antigravity-acp-provider/config.json` (where `PI_CODING_AGENT_DIR` defaults to `~/.pi/agent`). Runtime updates default to `automatic`; only provider-managed installations are replaced. ACP session bindings are saved beside the config in `sessions.json`.
+Permission mode is saved in `$PI_CODING_AGENT_DIR/antigravity-acp-provider/config.json` (where `PI_CODING_AGENT_DIR` defaults to `~/.pi/agent`). ACP session bindings are stored beside it in `sessions.json`, and the auto-patched `agy` binary + `patch-state.json` live under `runtime/`.
 
-On first use of a custom profile without a config, existing permission/update settings are copied from the default agent directory (or the legacy Gemini-provider config). Existing custom configs are never overwritten, and saved sessions are not copied. **Custom Pi profiles do not isolate Antigravity accounts or managed runtimes:** Antigravity's OAuth credentials and runtime installation remain in their shared locations.
+On first use of a custom `PI_CODING_AGENT_DIR` without a config, an existing config from `~/.pi/agent/antigravity-acp-provider/config.json` is copied once (existing configs are never overwritten, and sessions are not copied). **Custom Pi profiles do not isolate Antigravity OAuth credentials or `$GEMINI_HOME/antigravity-cli`.**
 
-`tools` switches who runs file and shell operations; it applies from the next prompt. `sessions` lists Antigravity sessions for the current directory and attaches one to the current Pi session; the next prompt resumes it. `plan` sends Antigravity's built-in `/plan`.
+- `usage` queries `agy -p "/usage"` and formats remaining quota windows in local time.
+- `quota` shows current-process token totals, latest server quota metadata, and latest context fill.
+- `sessions` lists Antigravity sessions for the current working directory and attaches one to the current Pi session.
+- `plan <task>` sends Antigravity's built-in `/plan` command.
+- `logout` / `account` invokes ACP `logout`, clears Keychain credentials on macOS, and forgets saved ACP sessions. Run Pi's `/logout` afterward to remove the Pi marker, then `/login` for another account.
 
-`logout`/`account` signs out through the server's ACP `logout` method, which also clears OAuth tokens kept in the macOS Keychain (service `gemini`), then clears local state and saved ACP sessions. Run Pi's `/logout` afterward to remove the Pi credential marker, then `/login` for the new account. `update` checks the official registry and installs its newest release only after matching it to the provider's signed runtime catalog. See [`docs/RUNTIME-UPDATES.md`](docs/RUNTIME-UPDATES.md).
+## Environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `AGY_ACP_BIN` | Explicit path to the `agy` executable |
+| `PI_ANTIGRAVITY_PATCH_AGY` | Set to `0`/`false`/`no`/`off` to disable automatic 544K binary patching |
+| `PI_ANTIGRAVITY_ACP_PROXY` | Override HTTP/HTTPS proxy URL for the ACP child process |
+| `PI_ANTIGRAVITY_ACP_OAUTH_MODE` | Force `manual` or `browser` OAuth flow |
+| `PI_ANTIGRAVITY_IDLE_TIMEOUT_MS` | Override idle ACP binding timeout (default 6 hours) |
+| `PI_ANTIGRAVITY_MODEL_CATALOG_TTL_MS` | Override cached model catalog TTL (default 6 hours) |
+| `PI_ANTIGRAVITY_CCPA_RELAY` | Set to `0`/`false` to disable the local CCPA relay |
+| `PI_ANTIGRAVITY_CCPA_HTTP2` | Set to `0`/`false` to force HTTP/1.1 in the CCPA relay |
+| `GEMINI_API_KEY` | Authenticate with a Gemini API key |
+| `GEMINI_HOME` | Relocate Antigravity CLI data directory (default `~/.gemini`) |
+| `PI_CODING_AGENT_DIR` | Relocate Pi agent config, sessions, logs, and patched runtime cache |
+| `NODE` | Explicit Node.js executable for launching the ACP supervisor |
+| `SSL_CERT_FILE` | Explicit CA bundle path for TLS verification |
 
 ## Development
 
 ```bash
-npm run check
-npm run test:real-acp  # initializes the installed Antigravity ACP server
+npm run check          # tsc --noEmit && vitest run
+npm run test:real-acp  # initializes the installed agy acp CLI
 npm run test:live      # sends a real authenticated prompt
 npm run test:qualify   # live cancel, restore, MCP, model, and permission qualification
-npm run test:packed
+npm run pack:check     # npm pack --dry-run
+npm run test:packed    # isolated tarball install + Pi model-registration smoke test
 npm audit --audit-level=moderate
-
-# Maintainer-only runtime catalog refresh/signing
-npm run refresh:runtime-manifest
-ACP_RUNTIME_MANIFEST_PRIVATE_KEY_PATH=/secure/key.pem npm run sign:runtime-manifest
 ```
 
-CI checks Node 22.19.0 and 24, including typechecking, unit tests, packed installation and the full dependency audit. Live authenticated tests are opt-in and are not part of PR CI. See [`docs/MAINTENANCE.md`](docs/MAINTENANCE.md) for update and release policy.
+Manual regression check against a real Pi process (required after source changes per [`AGENTS.md`](AGENTS.md)):
+
+```bash
+pi --no-extensions -e ./extensions/index.ts --no-session \
+   --model "antigravity-acp/gemini-4-neon" \
+   -p "Read package.json and tell me the package name, then run \`ls\`."
+```
+
+CI (`workflow_dispatch`) checks Node 22.19.0 and 24 with typechecking, unit tests, packed installation smoke tests, and `npm audit --audit-level=moderate`. Live authenticated tests are opt-in and never run in CI. See [`docs/MAINTENANCE.md`](docs/MAINTENANCE.md) for maintenance and release guidelines.
 
 ### Turn progress and recovery
 
-Prompts are bounded by inactivity, not total turn duration: streaming progress resets a 10-minute idle window. An outstanding native tool, parked Pi tool, or permission request gets a **finite 60-minute no-progress window** instead, so long work survives the former two-minute Pi-tool deadline without making stuck tools wait forever. Cancellation still sends `session/cancel`, answers parked requests, and closes an unresponsive agent after its 1.5-second grace period. The interactive permission broker retains its two-minute response limit. Integrations can override `promptIdleTimeoutMs` and `promptWorkIdleTimeoutMs` in connection options with positive finite durations; initialize/auth/session-setup deadlines are unchanged.
+Prompts are bounded by inactivity rather than total duration: streaming progress resets a 10-minute idle window, while an outstanding native tool, parked Pi tool, or permission request gets a finite 60-minute no-progress window. Cancellation sends `session/cancel`, resolves parked requests, and terminates unresponsive processes after a 1.5-second grace period. Interactive permission requests keep a 2-minute limit.
 
-After 90 seconds without ACP updates, Pi warns and gives an idle prompt another 90 seconds before aborting; outstanding tool/permission work keeps its longer window. Both the warning and timeout report the latest recognized inference error observed in this prompt's server/relay stderr (for example HTTP 503 model capacity unavailable, HTTP 500, or EOF), including the relay attempt when available. Silence alone reports an unknown cause, not a guessed 502 or outage. Error response bodies are never copied into the warning; only fixed diagnostic categories are displayed. Relay logs retain recognized capacity/unreachable reasons even while retrying. Errors from previous prompts and model-catalog polling are excluded.
-
-System instructions are kept outside truncated conversation history. Instructions larger than 256 KiB UTF-8 fail clearly rather than being silently shortened. ACP has no mid-prompt system-update RPC: an instruction change received with tool/permission results finishes the existing prompt under its original instructions, then forces reconstruction before the next prompt. Such a stale binding is not persisted for restoration.
+After 90 seconds without ACP updates, Pi warns and grants another 90 seconds for idle prompts before aborting, reporting the latest recognized inference error observed in this prompt's server/relay stderr (e.g. HTTP 503 capacity unavailable, HTTP 500, EOF) without echoing raw response bodies.
 
 ## Security boundary
 
-This launches a full coding agent with the user's OS privileges. **The default `yolo` mode permits Antigravity-native commands and edits without confirmation.** Use `/antigravity-acp permissions default` for confirmation prompts. Pi hooks govern tools routed through the `pi_` MCP namespace; with the default `tools pi` these replace Antigravity's file and shell built-ins. The remaining native tools (web search, URL fetch) and everything under `tools native` stay governed by Antigravity policy and ACP permission requests. ACP fs confinement in `tools native` covers only file reads and writes; native shell commands are not sandboxed by Pi. New/restored sessions must advertise and confirm the requested permission mode. Unsupported or failed mode changes close affected sessions; an executing turn is stopped before changing its policy. Unexpected mode-change notifications also invalidate the session. Doctor/status distinguishes requested policy from each live binding's confirmed mode. This protocol enforcement is not a sandbox.
+This provider launches a full coding agent with the user's OS privileges. **The default `yolo` mode permits native commands and file edits without confirmation.** Switch to `/antigravity-acp permissions default` or `auto-edit` if you want confirmation prompts. Pi hooks govern tools routed through the `pi_` MCP bridge; native `read_file`, `write_file`, `edit_file`, and `run_command` are governed by Antigravity's permission mode and ACP permission requests. New and restored sessions must advertise and confirm the requested permission mode; unsupported changes or unexpected mode drift invalidate the binding. This protocol check is not an OS sandbox.
 
 ## Compatibility
 
-This release requires Pi 1.1.x and Node.js 22.19.0 or newer; development is pinned to Pi 1.1.0, ACP SDK 1.8.0, and ACP protocol 1. The provider supports stable session configuration options and retains compatibility with older Antigravity model-selection metadata; it does not enable experimental ACP v2. Upgrade Pi before upgrading from provider 0.1.12. Pi supplies the host packages at runtime, so their peer ranges remain `*` as required by Pi's package contract; this is not a promise of compatibility with every Pi version. Transcript system instructions and tool additions/removals are replayed into ACP checkpoints, replacing stale warm sessions when that state changes. The bundled signed catalog bootstraps Antigravity ACP 1.1.1 and can accept newer signed catalog releases without an npm update. ACP session setup allows up to two minutes for slow first-run initialization, while transport shutdown rejects pending requests immediately. The current official registry and signed catalog provide Linux x64/ARM64, Windows x64/ARM64, and macOS Intel/ARM64 artifacts. Intel macOS artifacts exist, but the proposed local re-signing workaround is not enabled or qualified by this package. Alpine/musl is rejected because Google's Linux build targets glibc.
+Requires Pi 1.6.x (development is pinned to Pi 1.6.0), Node.js `>=22.19.0`, and an installed `agy` CLI (tested with `agy` 1.5.x). Uses `@agentclientprotocol/sdk` 1.8.0 and ACP protocol v1. Pi supplies host packages at runtime, so peer ranges remain `*` per Pi's package contract.
 
-During browser authentication, Chromium may write `Opening in existing browser session.` to the ACP process's inherited stdout. The transport ignores only that exact known compatibility line and reports its count in `doctor`; all other non-JSON stdout remains a fatal protocol error.
-
-Managed installations also repair executable permissions for both the ACP server and its `localharness_external` helper. This repairs installations created by 0.1.3 and earlier, where OAuth could succeed but session creation failed with an opaque ACP `Internal error` because the extracted helper was not executable.
-
-Earlier repository documents analyzing `@google/gemini-cli@0.58.0` describe the superseded implementation and are retained only as historical research. See [`docs/ANTIGRAVITY-MIGRATION.md`](docs/ANTIGRAVITY-MIGRATION.md).
+Earlier repository documents analyzing `@google/gemini-cli` or the superseded `agy_acp_server.par` installer are retained under [`docs/`](docs/README.md) for historical reference.
 
 ## License
 
-MIT. The original work is by Zac Bemis and the upstream contributors; see [LICENSE](LICENSE).
+MIT. Original work by Zac Bemis and upstream contributors; see [LICENSE](LICENSE).

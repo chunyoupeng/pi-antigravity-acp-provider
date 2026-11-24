@@ -1,4 +1,4 @@
-import { initTheme, type EntryRenderer, type ExtensionAPI, type Theme } from "@earendil-works/pi-coding-agent";
+import { initTheme, type CustomEntry, type EntryRenderOptions, type EntryRenderer, type ExtensionAPI, type Theme } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -26,8 +26,17 @@ function harness(options?: RegisterToolActivityOptions) {
 	const registerTool = vi.fn();
 	const pi = { appendEntry, registerEntryRenderer, on, sendMessage, registerTool } as unknown as ExtensionAPI;
 	const receive = registerToolActivity(pi, { collapseToolOutput: () => true, outputPad: () => 1, ...options });
-	const render = registerEntryRenderer.mock.calls.find(([type]) => type === TOOL_ACTIVITY_ENTRY)?.[1] as EntryRenderer<ToolActivityEntry>;
-	const renderDivider = registerEntryRenderer.mock.calls.find(([type]) => type === TOOL_DIVIDER_ENTRY)?.[1] as EntryRenderer<Record<string, never>>;
+	const rawRender = registerEntryRenderer.mock.calls.find(([type]) => type === TOOL_ACTIVITY_ENTRY)?.[1] as EntryRenderer<ToolActivityEntry>;
+	const rawRenderDivider = registerEntryRenderer.mock.calls.find(([type]) => type === TOOL_DIVIDER_ENTRY)?.[1] as EntryRenderer<Record<string, never>>;
+	const withKeyHints = (opts: { expanded: boolean } & Partial<EntryRenderOptions>): EntryRenderOptions => ({
+		keyText: () => "",
+		keyHint: (_key, description) => description,
+		...opts,
+	});
+	const render = (entry: CustomEntry<ToolActivityEntry>, opts: { expanded: boolean } & Partial<EntryRenderOptions>, t: Theme) =>
+		rawRender(entry, withKeyHints(opts), t);
+	const renderDivider = (entry: CustomEntry<Record<string, never>>, opts: { expanded: boolean } & Partial<EntryRenderOptions>, t: Theme) =>
+		rawRenderDivider(entry, withKeyHints(opts), t);
 	const emit = (eventName: string, event: unknown, ctx?: unknown) => {
 		for (const [name, handler] of on.mock.calls) {
 			if (name === eventName) handler(event, ctx);

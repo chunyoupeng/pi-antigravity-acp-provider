@@ -1,43 +1,26 @@
 # Implementation status
 
-Status as of 2026-09-06 for package version 0.1.8.
+Status as of 2026-11-23.
 
-The bundled Gemini CLI implementation was superseded after its individual Code Assist authentication path was retired. See [ANTIGRAVITY-MIGRATION.md](ANTIGRAVITY-MIGRATION.md).
+The provider targets native `agy acp` directly. Earlier `@google/gemini-cli` and `agy_acp_server.par` managed-runtime implementations have been superseded and removed; see [ANTIGRAVITY-MIGRATION.md](ANTIGRAVITY-MIGRATION.md).
 
 ## Implemented
 
-- Pi provider registration and marketplace package metadata.
-- Google Antigravity ACP server resolution plus self-service installation based on `@estebanforge/pi-antigravity-bridge` 1.4.1.
-- Official ACP SDK 0.19.1 transport using stable protocol v1, including upstream fixes that close failed transports, reject pending requests, and observe internal rejection paths.
-- Strict bounded NDJSON framing, two-minute session-operation deadlines, cancellation, redacted errors, and bounded stderr. Process shutdown leaves stdin ownership with the Web Streams adapter to prevent `ERR_STREAM_WRITE_AFTER_END`. The exact Chromium `Opening in existing browser session.` compatibility line is filtered and counted without weakening rejection of other non-protocol stdout; genuine framing failures reject active operations without escaping through the SDK as uncaught exceptions.
-- Packaged parent-death supervisor with TERM/KILL escalation and POSIX process-group cleanup.
-- Antigravity Google/API-key `/login`, automatic SSH/headless OAuth URL capture and validated loopback-callback relay, structural local auth health (token file or macOS Keychain entry presence), network validation through setup/qualification, ACP `logout` with local fallback, and account-switch reset flow.
-- Antigravity fallback models, authenticated ACP model discovery, catalog refresh, and model/mode switching through `session/set_config_option` (falling back to `session/set_model`/`session/set_mode`). Server-side `config_option_update` replacements set `responseModel`; Pi's selection is re-applied on the next turn.
-- Pi-to-ACP text/image/context conversion with bounded fresh-session reconstruction.
-- ACP text, thought, plan, and native-tool activity mapping to balanced Pi events.
-- ACP usage/quota metadata mapping to Pi usage and `/antigravity-acp quota` process metrics. Antigravity 1.3 sends no prompt token counts, so `usage_update` context fill becomes Pi usage.
-- Pi tool ownership (default): `_meta.antigravity.disabledTools` (with `mcpMaxOutputBytes`) on `session/new`/`resume`/`load` disables Antigravity's file and shell built-ins so the model uses bridged Pi tools (`schedule`, `ask_question` and `generate_image` are disabled in both modes); Antigravity permission prompts for bridged calls are approved once, and their duplicate activity rows are hidden. `tools native` instead advertises ACP `fs` and serves `fs/read_text_file`/`fs/write_text_file` with realpath confinement.
-- `session/list` with attach-to-Pi-session, and an `/antigravity-acp plan` shortcut for Antigravity's built-in `/plan`.
-- Persistent ACP bindings keyed by Pi session ID, serialized turns, on-disk restoration through `session/resume`/`session/load`, reconstruction fallback, rewind detection, and cleanup.
-- Persisted Antigravity permission modes (`default`, `auto_edit`, and `yolo`), with `yolo` as the requested default. Prompting modes retain single-use, fail-closed ACP permission continuation through a real Pi tool round trip.
-- Authenticated loopback MCP exposure of active Pi tools with `pi_` namespacing, schema sanitization, original-schema revalidation, bounded catalogs/bodies, and genuine Pi tool-result continuation.
-- Setup wizard and automatic/notify/manual runtime updates backed by a remotely refreshable Ed25519-signed catalog. Installation enforces exact Google URLs, archive hashes and decoded sizes, exact executable/helper names and sizes, strict two-file extraction, pre-activation ACP identity/version checks, immutable hash-addressed releases, a cross-process update lock, rollback retention, managed server/helper executable-permission repair, musl detection, macOS quarantine cleanup, and Windows `taskkill /T` process-tree cleanup.
-- Unit, fake-subprocess, cancellation, supervisor, packed-install, real-server initialize, live authenticated prompt, and live cancellation/session-restore/MCP/permission/model qualification tests.
-- Primary package/provider/command branding renamed to `pi-antigravity-acp-provider` / `antigravity-acp`; `/gemini-acp` remains a deprecated command alias.
+- Pi provider registration (`antigravity-acp`) and package metadata for `@chunyoupeng/pi-antigravity-acp-provider`.
+- Native `agy acp` launcher (`AGY_ACP_BIN`, `~/.local/bin/agy`, `PATH`) with auto-provisioned `pi-acp-bridge` custom agent (`$GEMINI_HOME/antigravity-cli/agents/pi-acp-bridge/agent.md`).
+- Automatic private-copy 544K checkpoint patcher (`src/acp/agy-patch.ts`) for macOS ARM64 `agy` binaries, with `patch-state.json` caching, automatic cleanup if upstream lifts the 256K cap, and `PI_ANTIGRAVITY_PATCH_AGY=0` opt-out.
+- Official ACP SDK 1.8.0 transport using stable protocol v1, bounded NDJSON framing, two-minute session-operation deadlines, cancellation, redacted errors, bounded stderr, and Chromium `Opening in existing browser session.` stdout noise filtering.
+- Packaged parent-death supervisor (`src/acp/supervisor.mjs`) with TERM/KILL escalation, POSIX process-group cleanup, Windows `taskkill /T` cleanup, and embedded HTTP/2 CCPA relay (`src/acp/ccpa-relay.mjs`) with direct/HTTP/SOCKS5 proxy support and HTTP/1.1 fallback.
+- Antigravity Google OAuth and Gemini API-key `/login`, automatic SSH/headless OAuth URL capture and validated loopback callback relay, macOS Keychain auth health check, setup wizard, `/antigravity-acp usage` (via `agy -p "/usage"`), `/antigravity-acp quota`, and ACP `logout`.
+- Fallback model catalog, authenticated ACP model discovery, 6h catalog TTL caching, and effort-tier collapsing (`low` / `medium` / `high` / `xhigh`) mapped via `session/set_config_option` (falling back to `session/set_model`/`session/set_mode`).
+- Pi-to-ACP text/image/context conversion, separate system-instruction preservation (up to 256 KiB UTF-8), transcript-based context usage accounting (`512_000` context window), idle binding hibernation (6h default), idle compaction, and bounded fresh-session reconstruction.
+- Hybrid tool ownership: native `agy` tools (`read_file`, `write_file`, `edit_file`, `run_command`) replace Pi's `read`, `write`, `edit`, `bash`; all other compatible Pi/extension tools are bridged through an authenticated loopback Streamable HTTP MCP server (`pi-bridge`) with schema sanitization, original-schema validation, 46 KiB inline text cap + temp-file overflow, inline image support, and 150s long-tool handoff.
+- Compact native tool activity rendering (`extensions/tool-activity.ts`) using Pi's shell/file/diff renderers with ingestion-time compact diffs, cached row renders, uncollapsed edit diffs, stripped command timestamps, and `Read N lines` summaries.
+- Persistent ACP session bindings (`sessions.json`), decision logging (`logs/bindings.jsonl`), redacted server stderr logging (`logs/acp-server.log`), `session/list` attachment (`/antigravity-acp sessions`), `/antigravity-acp plan <task>`, and 7-day unreferenced history cleanup.
+- Persisted Antigravity permission modes (`default`, `auto_edit`, `yolo`, defaulting to `yolo`) with single-use, fail-closed Pi permission continuation in prompting modes.
+- Unit, fake-subprocess, patcher, HTTP/2 relay, cancellation, supervisor, packed-install, real-CLI initialize, live authenticated prompt, and live qualification test suites.
 
-## Live validation
+## Remaining qualification areas
 
-Against `agy_acp_server` 1.3.0 on macOS ARM64 (2026-10-06): the tool filter removed the native built-ins and the model completed a file task through Pi's `read`; `tools native` served file reads through `fs/read_text_file`; `usage_update` produced non-zero Pi usage; `session/list` returned workspace sessions. `session/fork`/`session/close` return `{}` without advertising capabilities, and `additionalDirectories` is accepted but not enforced, so neither is used. Re-verified 2026-10-12 with a live `session/new` probe: passing `additionalDirectories` does not expand the server-side `view_file` whitelist, which stays derived from `cwd`, `GEMINI_HOME` and skill directories.
-
-On Linux with authenticated `agy_acp_server_1.1.1`, ACP protocol 1 initialization, authenticated model discovery, session creation, model control, streaming, cancellation recovery, cross-process session resume, native permission requests, authenticated loopback MCP execution, and exact-response prompts completed successfully.
-
-## Remaining before stable 1.0
-
-- Run and record fresh Antigravity OAuth and API-key login tests on clean accounts.
-- Run packed installation matrices on Debian/glibc, macOS ARM64, and Windows x64/ARM64, including the large ACP binary download; verify Alpine/musl rejection and the absence of an Intel macOS artifact.
-- Run Windows-native process-tree lifecycle tests for the implemented `taskkill /T` cleanup.
-- Expand chaos tests for parallel MCP calls, network disconnects, permission timeout races, and malformed ACP streams.
-- Confirm transcript prefix fingerprints and unseen external-delta replay against real Pi branch/fork/compaction behavior.
-- Complete public beta publishing and Pi marketplace installation verification.
-
-Version 0.1.8 remains a beta implementation.
+- Cross-platform live qualification on Linux and Windows (native `agy` binary behavior, Windows `taskkill /T` cleanup, non-macOS OAuth health checks).
+- Live re-qualification whenever upstream `agy` updates its checkpoint threshold, transcript schema, or ACP model/config options.

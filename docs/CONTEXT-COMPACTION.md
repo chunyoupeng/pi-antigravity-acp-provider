@@ -1,5 +1,7 @@
 # 上下文压缩：由 Pi 接管
 
+> **注（2026-11-23）：** 仓库已切换至原生 `agy acp` 并引入 544K 自动 patch（`src/acp/agy-patch.ts`），`CONTEXT_WINDOW` 已从历史值 `240k` 提升至 `512_000`，transcript 路径现位于 `$GEMINI_HOME/antigravity-cli/brain/<id>/.system_generated/logs/transcript_full.jsonl`。下文保留 2026-10-17 针对 `agy_acp_server` 1.4.0 的原始实测记录与方法论。
+
 2026-10-17 实测，Antigravity ACP server 1.4.0，模型 `gemini-4-argon`。
 
 现在由 Pi 先压缩，Antigravity（下文 AGY）自己的截断在实测中没有再出现。Pi 压缩后，provider 丢掉旧的 AGY 会话，用 Pi 压缩后的上下文重建，所以 AGY 手里的历史始终就是 Pi 的上下文。万一 AGY 抢先截断，provider 也会丢掉它的版本，换回 Pi 的。按当前设置，日常写代码时真实上下文能用到约 18 万 token，然后 Pi 压缩；纯中文对话约 15 万。
