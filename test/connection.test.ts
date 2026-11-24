@@ -278,16 +278,13 @@ describe("AntigravityAcpConnection", () => {
 		} finally { await connection.close(); }
 	});
 
-	it("warns about a silent backend, then aborts the idle prompt itself", async () => {
-		const stalls: { busy: boolean; silentMs: number; abortInMs?: number }[] = [];
+	it("aborts a silent idle prompt itself", async () => {
 		const connection = new AntigravityAcpConnection({ cwd: process.cwd(), command: process.execPath,
-			args: [fakeAgent], promptIdleTimeoutMs: 60_000, promptWorkIdleTimeoutMs: 1000, promptStallWarnMs: 100, promptStallAbortMs: 150,
-			handlers: { onStall: (info) => { stalls.push(info); } } });
+			args: [fakeAgent], promptIdleTimeoutMs: 60_000, promptWorkIdleTimeoutMs: 1000, promptStallAbortMs: 250 });
 		try {
 			const session = await connection.newSession(process.cwd());
 			await expect(connection.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "hang" }] }))
 				.rejects.toThrow("no progress for 250ms");
-			expect(stalls).toEqual([{ busy: false, silentMs: 100, abortInMs: 150 }]);
 			await connection.process.exited;
 			expect(connection.process.alive).toBe(false);
 		} finally { await connection.close(); }

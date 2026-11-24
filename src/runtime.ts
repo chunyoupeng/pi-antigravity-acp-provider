@@ -32,7 +32,6 @@ import {
 	AntigravityAcpConnection,
 	isSessionNewTimeout,
 	type AntigravityConnectionOptions,
-	type PromptStallInfo,
 } from "./acp/connection.js";
 
 /** session/new attempts per binding; each timed-out attempt respawns the Antigravity process. */
@@ -40,7 +39,6 @@ const SESSION_NEW_ATTEMPTS = 3;
 /** Delay before spawning a spare warm process, so it does not compete with the turn that needed one. */
 const WARM_REPLENISH_DELAY_MS = 2_000;
 import { DecisionLog, type DecisionFields } from "./acp/decision-log.js";
-import { describeBackendSilence } from "./acp/backend-diagnostics.js";
 import { abortError, AntigravityAcpError, errorMessage } from "./acp/errors.js";
 import { AcpSessionStore } from "./acp/session-store.js";
 import { contextUsageInUse, transcriptCheckpoints, type TranscriptContextUsage } from "./acp/transcript-usage.js";
@@ -1089,7 +1087,6 @@ export class AntigravityRuntime {
 		const epoch = this.bindingEpoch;
 		const handlers: NonNullable<AntigravityConnectionOptions["handlers"]> = {
 			onUpdate: (notification) => this.consumeUpdate(binding, notification),
-			onStall: (info) => this.noteBackendStall(binding, info),
 			onPermission: async (request) => {
 				await binding?.updateQueue;
 				return this.requestPermission(binding, request);
@@ -1373,20 +1370,6 @@ export class AntigravityRuntime {
 		writer.text(
 			"\n\n⚠️ Antigravity replaced this conversation's history with its own summary. " +
 				"Pi's context replaces it in a fresh Antigravity session from the next step.\n\n",
-		);
-	}
-
-	private noteBackendStall(binding: Binding | undefined, info: PromptStallInfo): void {
-		const writer = binding?.writer;
-		if (!writer || writer.finished || info.streamingBytes !== undefined) return;
-		const seconds = Math.max(1, Math.round(info.silentMs / 1000));
-		const work = info.busy ? " with tool/permission work still outstanding" : "";
-		const abort = info.abortInMs === undefined
-			? "The turn keeps waiting; Esc aborts it."
-			: `It will abort itself in ${Math.max(1, Math.round(info.abortInMs / 1000))}s if there is still no response; Esc aborts it now.`;
-		writer.text(
-			`\n\n⚠️ No response from Antigravity for ${seconds}s${work}. ${describeBackendSilence(info.upstreamError)} ` +
-			`${abort} After it fails, retry later or switch models.\n\n`,
 		);
 	}
 

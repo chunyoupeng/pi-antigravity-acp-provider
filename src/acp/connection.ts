@@ -45,19 +45,8 @@ export function isSessionNewTimeout(error: unknown): boolean {
 		error.message.startsWith(`Antigravity ACP ${SESSION_NEW_PHASE} timed out`);
 }
 
-export interface PromptStallInfo {
-	busy: boolean;
-	silentMs: number;
-	abortInMs?: number;
-	upstreamError?: string;
-	/** Set while the relay still receives the model's response: bytes received so far. */
-	streamingBytes?: number;
-}
-
 export interface AntigravityConnectionHandlers {
 	onUpdate?: (notification: SessionNotification) => void | Promise<void>;
-	/** Fires once per silence streak while a prompt waits on a mute backend. abortInMs is set when the idle prompt will abort itself afterwards. */
-	onStall?: (info: PromptStallInfo) => void;
 	onPermission?: (request: RequestPermissionRequest) => Promise<RequestPermissionResponse>;
 }
 
@@ -73,9 +62,7 @@ export interface AntigravityConnectionOptions extends AntigravityProcessOptions 
 	promptIdleTimeoutMs?: number;
 	/** No inbound progress while a tool/permission is outstanding (default 60 minutes). */
 	promptWorkIdleTimeoutMs?: number;
-	/** Surface a stall warning after this much silence; the hard timeout still applies (default 90 seconds). */
-	promptStallWarnMs?: number;
-	/** Abort an idle prompt this long after the stall warning when silence continues (default 90 seconds). */
+	/** Abort an idle prompt after this much silence when no upstream stream is active (default 180 seconds). */
 	promptStallAbortMs?: number;
 	maxFrameBytes?: number;
 }
@@ -88,7 +75,6 @@ export class AntigravityAcpConnection {
 	private readonly sessionNewTimeoutMs: number;
 	private readonly promptIdleTimeoutMs: number;
 	private readonly promptWorkIdleTimeoutMs: number;
-	private readonly promptStallWarnMs: number;
 	private readonly promptStallAbortMs: number;
 	private readonly watchdogs = new Map<string, PromptWatchdog>();
 	private readonly protocolFailure: Promise<never>;
@@ -104,11 +90,10 @@ export class AntigravityAcpConnection {
 			Math.min(this.operationTimeoutMs, DEFAULT_SESSION_NEW_TIMEOUT_MS);
 		this.promptIdleTimeoutMs = options.promptIdleTimeoutMs ?? 10 * 60_000;
 		this.promptWorkIdleTimeoutMs = options.promptWorkIdleTimeoutMs ?? 60 * 60_000;
-		this.promptStallWarnMs = options.promptStallWarnMs ?? 90_000;
-		this.promptStallAbortMs = options.promptStallAbortMs ?? 90_000;
+		this.promptStallAbortMs = options.promptStallAbortMs ?? 180_000;
 		// Validate before spawning a process, including programmatic timeout overrides.
 		new PromptWatchdog(
-			this.promptIdleTimeoutMs, this.promptWorkIdleTimeoutMs, () => undefined, this.promptStallWarnMs, undefined, this.promptStallAbortMs,
+			this.promptIdleTimeoutMs, this.promptWorkIdleTimeoutMs, () => undefined, this.promptStallAbortMs,
 		).dispose();
 		this.process = new AntigravityProcess(options);
 		let rejectProtocolFailure!: (error: Error) => void;
@@ -534,11 +519,6 @@ export class AntigravityAcpConnection {
 				`Antigravity ACP session/prompt timed out: no ${busy ? "tool/permission " : ""}progress for ${ms}ms; ` +
 				describeBackendSilence(diagnostics.error) + " Retry the turn later or switch models."));
 			void this.close().catch(() => undefined);
-		}, this.promptStallWarnMs, (busy, silentMs, abortInMs) => {
-			const upstreamError = diagnostics.error;
-			const streamingBytes = diagnostics.streamingBytes;
-			this.handlers.onStall?.({ busy, silentMs, ...(abortInMs === undefined ? {} : { abortInMs }),
-				...(upstreamError ? { upstreamError } : {}), ...(streamingBytes === undefined ? {} : { streamingBytes }) });
 		}, this.promptStallAbortMs, () => diagnostics.streamingBytes !== undefined);
 		this.watchdogs.set(request.sessionId, watchdog);
 		watchdog.arm();
