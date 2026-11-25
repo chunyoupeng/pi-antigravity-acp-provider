@@ -111,10 +111,11 @@ export class PiEventWriter {
 		this.stream.push({ type: "thinking_delta", contentIndex: index, delta, partial: this.snapshot() });
 	}
 
-	/** Closes an open thinking block (for example when a native ACP tool starts
-	 * executing remotely) so Pi exits the thinking state until thinking resumes. */
-	endThinking(): void {
-		if (this.terminal || this.open?.kind !== "thinking") return;
+	/** Closes the open text or thinking block when a native ACP tool starts executing
+	 * remotely, so later output starts a new block. Pi exits the thinking state, and
+	 * text after the tool renders below the tool row instead of growing the block above it. */
+	endBlock(): void {
+		if (this.terminal) return;
 		this.closeOpen();
 	}
 

@@ -19,7 +19,6 @@ import { structuredPatch } from "diff";
 import type { AcpToolActivity } from "../src/acp/events.js";
 
 export const TOOL_ACTIVITY_ENTRY = "antigravity-acp-tool-activity";
-export const TOOL_DIVIDER_ENTRY = "antigravity-acp-tool-divider";
 const NON_COLLAPSIBLE_KINDS = new Set<string>(["read", "edit"]);
 export interface CompactDiff {
 	path: string;
@@ -53,7 +52,6 @@ interface ReadGroup {
 
 export interface RegisterToolActivityOptions {
 	collapseToolOutput?: () => boolean;
-	outputPad?: () => number;
 }
 
 function isCollapsibleKind(kind: AcpToolActivity["toolCall"]["kind"]): boolean {
@@ -73,14 +71,6 @@ function readCollapseToolOutput(cwd: string): boolean {
 	}
 }
 
-function readOutputPad(cwd: string): number {
-	try {
-		return SettingsManager.create(cwd).getOutputPad();
-	} catch {
-		return 1;
-	}
-}
-
 /** Display-only session entries: never queued as model input or executable Pi calls. */
 export function registerToolActivity(
 	pi: ExtensionAPI,
@@ -92,9 +82,6 @@ export function registerToolActivity(
 	const turnRows = new Set<ToolRow>();
 	let activeReadGroup: ReadGroup | undefined;
 	let cwd = process.cwd();
-	let outputPad = options?.outputPad ? options.outputPad() : readOutputPad(cwd);
-	let pendingAcpTool = false;
-	let piWillAddDivider = false;
 	const shouldCollapse = () => (options?.collapseToolOutput ? options.collapseToolOutput() : readCollapseToolOutput(cwd));
 	const sealReadGroup = () => {
 		if (activeReadGroup) {
@@ -153,16 +140,9 @@ export function registerToolActivity(
 		activeCalls.clear();
 		turnRows.clear();
 		activeReadGroup = undefined;
-		pendingAcpTool = false;
-		piWillAddDivider = false;
 		cwd = ctx.cwd;
-		outputPad = options?.outputPad ? options.outputPad() : readOutputPad(cwd);
 		const collapse = shouldCollapse();
 		for (const entry of ctx.sessionManager.getBranch()) {
-			if (entry.type === "custom" && entry.customType === TOOL_DIVIDER_ENTRY) {
-				sealReadGroup();
-				continue;
-			}
 			if (entry.type === "message") {
 				const msg = (entry as { message?: { role?: string; content?: unknown } }).message;
 				if (msg?.role === "user" || msg?.role === "toolResult") {
@@ -214,11 +194,7 @@ export function registerToolActivity(
 	pi.on("session_start", restore);
 	pi.on("session_tree", restore);
 	pi.on("message_start", (event) => {
-		if (event.message.role === "user") {
-			sealReadGroup();
-			pendingAcpTool = false;
-			piWillAddDivider = false;
-		}
+		if (event.message.role === "user") sealReadGroup();
 	});
 	pi.on("message_end", (event) => {
 		if (event.message.role !== "assistant") return;
@@ -227,17 +203,6 @@ export function registerToolActivity(
 		const hasText = content.some((block) => block.type === "text" && block.text.trim().length > 0);
 		if (hasToolCall || hasText) {
 			sealReadGroup();
-		}
-		if (pendingAcpTool && !piWillAddDivider && !hasToolCall && hasText) {
-			pi.appendEntry(TOOL_DIVIDER_ENTRY, {});
-			pendingAcpTool = false;
-		}
-		if (hasToolCall) {
-			piWillAddDivider = true;
-			pendingAcpTool = false;
-		} else if (hasText) {
-			piWillAddDivider = false;
-			pendingAcpTool = false;
 		}
 	});
 	pi.on("agent_end", () => {
@@ -368,18 +333,7 @@ export function registerToolActivity(
 		} satisfies Component;
 	});
 
-	pi.registerEntryRenderer(TOOL_DIVIDER_ENTRY, (_entry, _options, theme) => ({
-		invalidate() {},
-		render(width) {
-			if (width <= 0) return [];
-			const pad = Math.min(outputPad, Math.max(0, Math.floor((width - 1) / 2)));
-			const contentWidth = Math.max(1, width - pad * 2);
-			return [" ".repeat(pad) + theme.fg("mdHr", "─".repeat(Math.min(contentWidth, 80)))];
-		},
-	}));
-
 	return (activity) => {
-		pendingAcpTool = true;
 		const key = callKey(activity);
 		let rowId = activeCalls.get(key);
 		if (!rowId || activity.update.sessionUpdate === "tool_call") {

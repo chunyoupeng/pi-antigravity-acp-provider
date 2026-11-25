@@ -2,7 +2,7 @@ import { initTheme, type CustomEntry, type EntryRenderOptions, type EntryRendere
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { registerToolActivity, TOOL_ACTIVITY_ENTRY, TOOL_DIVIDER_ENTRY, type RegisterToolActivityOptions, type ToolActivityEntry } from "../extensions/tool-activity.js";
+import { registerToolActivity, TOOL_ACTIVITY_ENTRY, type RegisterToolActivityOptions, type ToolActivityEntry } from "../extensions/tool-activity.js";
 import type { AcpToolActivity } from "../src/acp/events.js";
 
 afterEach(() => {
@@ -25,9 +25,8 @@ function harness(options?: RegisterToolActivityOptions) {
 	const sendMessage = vi.fn();
 	const registerTool = vi.fn();
 	const pi = { appendEntry, registerEntryRenderer, on, sendMessage, registerTool } as unknown as ExtensionAPI;
-	const receive = registerToolActivity(pi, { collapseToolOutput: () => true, outputPad: () => 1, ...options });
+	const receive = registerToolActivity(pi, { collapseToolOutput: () => true, ...options });
 	const rawRender = registerEntryRenderer.mock.calls.find(([type]) => type === TOOL_ACTIVITY_ENTRY)?.[1] as EntryRenderer<ToolActivityEntry>;
-	const rawRenderDivider = registerEntryRenderer.mock.calls.find(([type]) => type === TOOL_DIVIDER_ENTRY)?.[1] as EntryRenderer<Record<string, never>>;
 	const withKeyHints = (opts: { expanded: boolean } & Partial<EntryRenderOptions>): EntryRenderOptions => ({
 		keyText: () => "",
 		keyHint: (_key, description) => description,
@@ -35,8 +34,6 @@ function harness(options?: RegisterToolActivityOptions) {
 	});
 	const render = (entry: CustomEntry<ToolActivityEntry>, opts: { expanded: boolean } & Partial<EntryRenderOptions>, t: Theme) =>
 		rawRender(entry, withKeyHints(opts), t);
-	const renderDivider = (entry: CustomEntry<Record<string, never>>, opts: { expanded: boolean } & Partial<EntryRenderOptions>, t: Theme) =>
-		rawRenderDivider(entry, withKeyHints(opts), t);
 	const emit = (eventName: string, event: unknown, ctx?: unknown) => {
 		for (const [name, handler] of on.mock.calls) {
 			if (name === eventName) handler(event, ctx);
@@ -50,7 +47,7 @@ function harness(options?: RegisterToolActivityOptions) {
 		customType: appendEntry.mock.calls[index]?.[0] as string,
 		data: appendEntry.mock.calls[index]?.[1] as ToolActivityEntry,
 	});
-	return { receive, render, renderDivider, emit, entry, appendEntry, registerEntryRenderer, on, sendMessage, registerTool };
+	return { receive, render, emit, entry, appendEntry, registerEntryRenderer, on, sendMessage, registerTool };
 }
 
 function completed(): AcpToolActivity {
@@ -347,52 +344,6 @@ describe("tool activity entries", () => {
 		const execRow = h.render(h.entry(0), { expanded: false }, theme)!;
 		h.emit("agent_end", { type: "agent_end", messages: [] });
 		expect(stripTerminalSequences(execRow.render(80).join("\n"))).toContain("sixth");
-	});
-
-	it("appends a divider before final assistant text after native ACP tools without duplicating Pi's divider", () => {
-		const h = harness();
-		// Turn 1: native ACP tool followed by final assistant text -> divider appended.
-		h.emit("message_start", { type: "message_start", message: { role: "user", content: "hi" } });
-		h.receive(completed());
-		h.emit("message_end", {
-			type: "message_end",
-			message: { role: "assistant", content: [{ type: "text", text: "Done." }] },
-		});
-		expect(h.appendEntry).toHaveBeenCalledWith(TOOL_DIVIDER_ENTRY, {});
-		const dividerComponent = h.renderDivider(
-			{ type: "custom", id: "div-1", parentId: null, timestamp: "2026-01-01T00:00:00.000Z", customType: TOOL_DIVIDER_ENTRY, data: {} },
-			{ expanded: false },
-			theme,
-		)!;
-		expect(dividerComponent.render(90)).toEqual([` ${"─".repeat(80)}`]);
-		expect(dividerComponent.render(20)).toEqual([` ${"─".repeat(18)}`]);
-		for (const width of [20, 4, 1]) {
-			for (const line of dividerComponent.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
-		}
-
-		// Turn 2: no tools -> no divider.
-		h.appendEntry.mockClear();
-		h.emit("message_start", { type: "message_start", message: { role: "user", content: "plain" } });
-		h.emit("message_end", {
-			type: "message_end",
-			message: { role: "assistant", content: [{ type: "text", text: "Hello." }] },
-		});
-		expect(h.appendEntry).not.toHaveBeenCalledWith(TOOL_DIVIDER_ENTRY, expect.anything());
-
-		// Turn 3: native ACP tool + Pi MCP toolCall -> Pi will add the divider, so extension must not duplicate it.
-		h.appendEntry.mockClear();
-		h.emit("message_start", { type: "message_start", message: { role: "user", content: "mixed" } });
-		h.receive(completed());
-		h.emit("message_end", {
-			type: "message_end",
-			message: { role: "assistant", content: [{ type: "toolCall", id: "t1", name: "memory", arguments: {} }] },
-		});
-		h.receive(completed());
-		h.emit("message_end", {
-			type: "message_end",
-			message: { role: "assistant", content: [{ type: "text", text: "Final answer." }] },
-		});
-		expect(h.appendEntry).not.toHaveBeenCalledWith(TOOL_DIVIDER_ENTRY, expect.anything());
 	});
 
 	it("shows live elapsed time while execute runs and persists Took/collapsed duration after completion", () => {

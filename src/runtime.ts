@@ -1435,7 +1435,7 @@ export class AntigravityRuntime {
 					}
 				} else if (activity.type === "tool") {
 					const toolCall = binding.toolTracker.apply(activity.update);
-					if (!replayingContext) writer.endThinking();
+					if (!replayingContext) writer.endBlock();
 					if (replayingContext || binding.bridge?.reports(toolCall.title, toolCall._meta)) continue;
 					const toolActivity: AcpToolActivity = {
 						sessionId: notification.sessionId,

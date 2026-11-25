@@ -170,14 +170,14 @@ describe("PiEventWriter", () => {
 		expect(writer.message.usage).toMatchObject({ input: 0, cacheRead: 0, output: 0, totalTokens: 30_000 });
 	});
 
-	it("closes an open thinking block on endThinking and reopens cleanly on subsequent thinking", async () => {
+	it("closes an open block on endBlock and reopens cleanly on subsequent thinking", async () => {
 		const writer = new PiEventWriter(model);
 		writer.thinking("step 1");
-		writer.endThinking();
-		writer.endThinking();
+		writer.endBlock();
+		writer.endBlock();
 		writer.thinking("step 2");
 		writer.text("done");
-		writer.endThinking();
+		writer.endBlock();
 		writer.done("stop");
 		const events = [];
 		for await (const event of writer.stream) events.push(event);
