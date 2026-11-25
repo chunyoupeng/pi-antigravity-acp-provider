@@ -603,7 +603,7 @@ function renderReadGroup(
 		const range = formatReadRange(input);
 		const isPartial = call.status !== "completed" && call.status !== "failed";
 		const isError = call.status === "failed";
-		let entryLine = `${theme.fg("accent", filePath)}${range ? theme.fg("warning", range) : ""}`;
+		let entryLine = theme.fg("muted", `${filePath}${range}`);
 		const output = toolOutput(entry);
 		if (!expanded && isError) {
 			const firstErrorLine = output

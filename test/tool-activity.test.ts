@@ -473,6 +473,16 @@ describe("tool activity entries", () => {
 		expect(finished).toContain("└─ src/b.ts ENOENT: no such file");
 		expect(finished).not.toContain("const a = 1;");
 
+		const taggedTheme = {
+			fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
+			bg: (_color: string, text: string) => text,
+			bold: (text: string) => text,
+		} as Theme;
+		const taggedFinished = h.render(h.entry(0), { expanded: false }, taggedTheme)!.render(80).join("\n");
+		expect(taggedFinished).toContain("<muted>src/a.ts:1-20</muted>");
+		expect(taggedFinished).not.toContain("<accent>src/a.ts</accent>");
+		expect(taggedFinished).not.toContain("<warning>:1-20</warning>");
+
 		const expanded = stripTerminalSequences(h.render(h.entry(0), { expanded: true }, theme)!.render(80).join("\n"));
 		expect(expanded).toContain("const a = 1;");
 		expect(expanded).toContain("ENOENT: no such file");
