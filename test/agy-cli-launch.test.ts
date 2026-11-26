@@ -57,6 +57,8 @@ describe("agy CLI ACP launch", () => {
 		const content = fs.readFileSync(agentFile, "utf8");
 		expect(content).toContain("excludeDefaultComponents: true");
 		expect(content).toContain("You are Antigravity");
+		expect(AGY_CLI_NATIVE_TOOLS).toContain("search_web");
+		expect(AGY_CLI_NATIVE_TOOLS).toContain("generate_image");
 		for (const tool of AGY_CLI_NATIVE_TOOLS) expect(content).toContain(`- ${tool}`);
 	});
 

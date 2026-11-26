@@ -26,13 +26,15 @@ export const AGY_CLI_NATIVE_TOOLS = [
 	"write_file",
 	"edit_file",
 	"run_command",
+	"search_web",
+	"generate_image",
 ] as const;
 
 // Keep Antigravity's <identity> header in custom agent.md: CCPA enforces it
 // server-side and returns HTTP 429 RESOURCE_EXHAUSTED when it is omitted.
 const AGY_CLI_AGENT_MARKDOWN = `---
 name: ${AGY_CLI_AGENT_NAME}
-description: Minimal Antigravity ACP agent for Pi (native file and shell tools plus Pi MCP bridge)
+description: Minimal Antigravity ACP agent for Pi (native file, shell, web search, and image tools plus Pi MCP bridge)
 mainAgent: true
 excludeDefaultComponents: true
 tools:

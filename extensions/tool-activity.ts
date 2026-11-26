@@ -662,8 +662,11 @@ function renderToolRow(
 		outputPad: 0, state: {}, lastComponent: undefined, invalidate() {},
 		keyText: keyHints.keyText, keyHint: keyHints.keyHint,
 	};
+	const webSearch = !renderer ? extractWebSearchArgs(call, input) : undefined;
 	const header = renderer?.renderCall?.(args, theme, context) ??
-		new Text(formatGenericToolCall(displayText(call.title ?? call.toolCallId), call.rawInput, theme, expanded), 0, 0);
+		(webSearch
+			? createWebSearchHeaderComponent(webSearch, theme, expanded)
+			: new Text(formatGenericToolCall(displayText(call.title ?? call.toolCallId), call.rawInput, theme, expanded), 0, 0));
 	const statusColor = isError ? "error" : isPartial ? "border" : "success";
 	const lines = gutter(header, 2, theme.fg(statusColor, "⏺"), width);
 	const showTiming = call.kind === "execute" || !renderer;
@@ -736,6 +739,90 @@ function renderToolRow(
 
 const GENERIC_ARGS_PREVIEW_CHARS = 100;
 const GENERIC_RESULT_PREVIEW_LINES = 5;
+const WEB_SEARCH_HEADER_LINES = 2;
+
+interface WebSearchArgs {
+	query: string;
+	domain?: string;
+}
+
+function extractWebSearchArgs(call: AcpToolActivity["toolCall"], input: Record<string, unknown>): WebSearchArgs | undefined {
+	const name = (call as { name?: unknown }).name;
+	const rawTitle = typeof call.title === "string" ? call.title.trim() : "";
+	const isOnWebTitle = /^".*" on Web$/su.test(rawTitle);
+	const isNamedSearchWeb = name === "search_web" || /\bsearch_web\b/u.test(rawTitle);
+	const hasQuery = typeof input.query === "string";
+	if (call.kind !== "search" && !isNamedSearchWeb && !isOnWebTitle) return undefined;
+	if (!hasQuery && !isNamedSearchWeb && !isOnWebTitle) return undefined;
+
+	let query = hasQuery ? displayText(input.query as string).replace(/\s+/gu, " ").trim() : "";
+	if (!query && isOnWebTitle) {
+		const quoted = rawTitle.slice(0, -" on Web".length);
+		try {
+			const parsed = JSON.parse(quoted);
+			if (typeof parsed === "string") {
+				query = displayText(parsed).replace(/\s+/gu, " ").trim();
+			}
+		} catch {
+			query = displayText(quoted.slice(1, -1)).replace(/\s+/gu, " ").trim();
+		}
+	}
+	const rawDomain = typeof input.domain === "string" ? displayText(input.domain).trim() : "";
+	return {
+		query,
+		...(rawDomain ? { domain: rawDomain } : {}),
+	};
+}
+
+function createWebSearchHeaderComponent(search: WebSearchArgs, theme: Theme, expanded: boolean): Component {
+	const queryText = search.query || "...";
+	const header = theme.fg("toolTitle", theme.bold(`WebSearch(${queryText})`));
+	const domainSuffix = search.domain ? theme.fg("muted", ` in ${search.domain}`) : "";
+	const combined = `${header}${domainSuffix}`;
+	return {
+		invalidate() {},
+		render(width: number): string[] {
+			if (width <= 0) return [];
+			const allLines = new Text(combined, 0, 0).render(width).map((line) => line.trimEnd());
+			if (expanded || allLines.length <= WEB_SEARCH_HEADER_LINES) {
+				return allLines;
+			}
+			const marker = theme.fg("toolTitle", theme.bold("…)"));
+			if (!domainSuffix) {
+				const truncated = allLines.slice(0, WEB_SEARCH_HEADER_LINES);
+				const lastIdx = truncated.length - 1;
+				const maxBeforeMarker = Math.max(0, width - visibleWidth(marker));
+				if (maxBeforeMarker > 0) {
+					const last = truncated[lastIdx]!;
+					const clipped = visibleWidth(last) > maxBeforeMarker
+						? truncateToWidth(last, maxBeforeMarker, "", false)
+						: last;
+					truncated[lastIdx] = `${clipped}${marker}`;
+				} else {
+					truncated[lastIdx] = truncateToWidth(marker, width, "");
+				}
+				return truncated;
+			}
+			const headerLines = new Text(header, 0, 0).render(width).map((line) => line.trimEnd());
+			const tail = `${marker}${domainSuffix}`;
+			const maxBeforeTail = width - visibleWidth(tail);
+			if (headerLines.length >= WEB_SEARCH_HEADER_LINES && maxBeforeTail > 0) {
+				const truncated = headerLines.slice(0, WEB_SEARCH_HEADER_LINES);
+				const lastIdx = truncated.length - 1;
+				const last = truncated[lastIdx]!;
+				const clipped = visibleWidth(last) > maxBeforeTail
+					? truncateToWidth(last, maxBeforeTail, "", false)
+					: last;
+				truncated[lastIdx] = `${clipped}${tail}`;
+				return truncated;
+			}
+			const truncated = allLines.slice(0, WEB_SEARCH_HEADER_LINES);
+			const lastIdx = truncated.length - 1;
+			truncated[lastIdx] = truncateToWidth(truncated[lastIdx]!, width, "…");
+			return truncated;
+		},
+	};
+}
 
 function formatGenericToolCall(title: string, rawInput: unknown, theme: Theme, expanded: boolean): string {
 	const header = theme.fg("toolTitle", theme.bold(title));

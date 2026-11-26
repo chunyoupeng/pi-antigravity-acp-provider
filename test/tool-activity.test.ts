@@ -538,39 +538,189 @@ describe("tool activity entries", () => {
 			...activity,
 			update: {
 				sessionUpdate: "tool_call",
-				toolCallId: "search-1",
-				title: "Running search_web",
-				kind: "search",
+				toolCallId: "generic-1",
+				title: "Run list_resources",
+				kind: "other",
 				status: "completed",
-				rawInput: { query: "pi coding agent", domain: "", summary: "" },
+				rawInput: { server: "pi-bridge", cursor: "", filter: "" },
 				rawOutput: "line1\nline2\nline3\nline4\nline5\nline6\nline7",
 			},
 			toolCall: {
-				toolCallId: "search-1",
-				title: "Running search_web",
-				kind: "search",
+				toolCallId: "generic-1",
+				title: "Run list_resources",
+				kind: "other",
 				status: "completed",
-				rawInput: { query: "pi coding agent", domain: "", summary: "" },
+				rawInput: { server: "pi-bridge", cursor: "", filter: "" },
 				rawOutput: "line1\nline2\nline3\nline4\nline5\nline6\nline7",
 			},
 		});
-		const searchRow = h.render(h.entry(2), { expanded: false }, theme)!;
-		const preview = stripTerminalSequences(searchRow.render(100).join("\n"));
-		expect(preview).toContain('Running search_web query="pi coding agent"');
-		expect(preview).not.toContain('domain=""');
+		const genericRow = h.render(h.entry(2), { expanded: false }, theme)!;
+		const preview = stripTerminalSequences(genericRow.render(100).join("\n"));
+		expect(preview).toContain('Run list_resources server="pi-bridge"');
+		expect(preview).not.toContain('cursor=""');
 		expect(preview).toContain("line1");
 		expect(preview).toContain("line5");
 		expect(preview).not.toContain("line6");
 		expect(preview).toContain("... (2 more lines, to expand)");
 
-		const searchExpanded = stripTerminalSequences(h.render(h.entry(2), { expanded: true }, theme)!.render(100).join("\n"));
-		expect(searchExpanded).toContain("query: pi coding agent");
-		expect(searchExpanded).toContain("line1");
-		expect(searchExpanded).toContain("line7");
+		const genericExpanded = stripTerminalSequences(h.render(h.entry(2), { expanded: true }, theme)!.render(100).join("\n"));
+		expect(genericExpanded).toContain("server: pi-bridge");
+		expect(genericExpanded).toContain("line1");
+		expect(genericExpanded).toContain("line7");
 
 		for (const width of [100, 24, 10, 4, 1]) {
 			for (const line of row.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
-			for (const line of searchRow.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+			for (const line of genericRow.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+		}
+	});
+
+	it("renders search_web as clean WebSearch(...) without duplicated query, escaped quotes, or 'on Web'", () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-11-26T14:32:22.000Z"));
+		const h = harness();
+		const quotedQuery = '"Rex" "Superlogical" iOS OR TestFlight OR mobile connect server ssh http tailscale';
+		const agyTitle = `${JSON.stringify(quotedQuery)} on Web`;
+
+		h.receive({
+			...activity,
+			update: {
+				sessionUpdate: "tool_call",
+				toolCallId: "search-1",
+				title: agyTitle,
+				kind: "search",
+				status: "in_progress",
+				rawInput: { query: quotedQuery },
+			},
+			toolCall: {
+				toolCallId: "search-1",
+				title: agyTitle,
+				kind: "search",
+				status: "in_progress",
+				rawInput: { query: quotedQuery },
+			},
+		});
+		const row = h.render(h.entry(0), { expanded: false }, theme)!;
+		vi.advanceTimersByTime(3_500);
+		const running = stripTerminalSequences(row.render(120).join("\n"));
+		expect(running).toContain(`⏺ WebSearch(${quotedQuery})`);
+		expect(running).toContain("Elapsed 3.5s");
+		expect(running).not.toContain("on Web");
+		expect(running).not.toContain("query=");
+		expect(running).not.toContain('\\"');
+		expect(running.split("Superlogical").length - 1).toBe(1);
+
+		h.receive({
+			...activity,
+			update: {
+				sessionUpdate: "tool_call_update",
+				toolCallId: "search-1",
+				title: agyTitle,
+				kind: "search",
+				status: "completed",
+				rawInput: { query: quotedQuery },
+			},
+			toolCall: {
+				toolCallId: "search-1",
+				title: agyTitle,
+				kind: "search",
+				status: "completed",
+				rawInput: { query: quotedQuery },
+			},
+		});
+		const finished = stripTerminalSequences(row.render(120).join("\n"));
+		expect(finished).toContain(`⏺ WebSearch(${quotedQuery})`);
+		expect(finished).toContain("Took 3.5s");
+
+		h.emit("agent_end", { type: "agent_end", messages: [] });
+		const collapsed = stripTerminalSequences(row.render(120).join("\n"));
+		expect(collapsed).toContain(`⏺ WebSearch(${quotedQuery}) (3.5s)`);
+		expect(collapsed).not.toContain("⎿");
+
+		// Domain suffix is shown cleanly and empty domain is omitted.
+		h.receive({
+			...activity,
+			update: {
+				sessionUpdate: "tool_call",
+				toolCallId: "search-domain",
+				title: '"rex mobile" on Web',
+				kind: "search",
+				status: "completed",
+				rawInput: { query: "rex mobile", domain: "superlogical.com" },
+			},
+			toolCall: {
+				toolCallId: "search-domain",
+				title: '"rex mobile" on Web',
+				kind: "search",
+				status: "completed",
+				rawInput: { query: "rex mobile", domain: "superlogical.com" },
+			},
+		});
+		const domainText = stripTerminalSequences(h.render(h.entry(2), { expanded: false }, theme)!.render(100).join("\n"));
+		expect(domainText).toContain("⏺ WebSearch(rex mobile) in superlogical.com");
+		expect(domainText).not.toContain("on Web");
+		expect(domainText).not.toContain("domain=");
+
+		// Title-only '"..." on Web' without rawInput unescapes and extracts the query.
+		h.receive({
+			...activity,
+			update: {
+				sessionUpdate: "tool_call",
+				toolCallId: "search-title-only",
+				title: '"\\"Rex\\" terminal" on Web',
+				kind: "search",
+				status: "completed",
+			},
+			toolCall: {
+				toolCallId: "search-title-only",
+				title: '"\\"Rex\\" terminal" on Web',
+				kind: "search",
+				status: "completed",
+			},
+		});
+		const titleOnlyText = stripTerminalSequences(h.render(h.entry(3), { expanded: false }, theme)!.render(100).join("\n"));
+		expect(titleOnlyText).toContain('⏺ WebSearch("Rex" terminal)');
+		expect(titleOnlyText).not.toContain("on Web");
+
+		// Long query truncates to 2 visual lines with …) when collapsed and expands fully when expanded.
+		const longQuery = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega";
+		h.receive({
+			...activity,
+			update: {
+				sessionUpdate: "tool_call",
+				toolCallId: "search-long",
+				title: `${JSON.stringify(longQuery)} on Web`,
+				kind: "search",
+				status: "completed",
+				rawInput: { query: longQuery, domain: "docs.example.com" },
+				rawOutput: "result-1\nresult-2\nresult-3\nresult-4\nresult-5\nresult-6",
+			},
+			toolCall: {
+				toolCallId: "search-long",
+				title: `${JSON.stringify(longQuery)} on Web`,
+				kind: "search",
+				status: "completed",
+				rawInput: { query: longQuery, domain: "docs.example.com" },
+				rawOutput: "result-1\nresult-2\nresult-3\nresult-4\nresult-5\nresult-6",
+			},
+		});
+		const longRow = h.render(h.entry(4), { expanded: false }, theme)!;
+		const longCollapsedLines = longRow.render(60);
+		const longCollapsed = stripTerminalSequences(longCollapsedLines.join("\n"));
+		const headerLines = longCollapsed.split("\n").filter((line) => !line.includes("result-") && !line.includes("more line"));
+		expect(headerLines.length).toBeLessThanOrEqual(2);
+		expect(headerLines.join(" ")).toContain("…) in docs.example.com");
+		expect(longCollapsed).toContain("result-1");
+		expect(longCollapsed).toContain("result-5");
+		expect(longCollapsed).not.toContain("result-6");
+
+		const longExpanded = stripTerminalSequences(h.render(h.entry(4), { expanded: true }, theme)!.render(60).join("\n"));
+		expect(longExpanded).toContain("omega)");
+		expect(longExpanded).toContain("in docs.example.com");
+		expect(longExpanded).toContain("result-6");
+
+		for (const width of [100, 40, 24, 10, 4, 1]) {
+			for (const line of row.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+			for (const line of longRow.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 		}
 	});
 
