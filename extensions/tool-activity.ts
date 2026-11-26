@@ -81,6 +81,7 @@ export function registerToolActivity(
 	const activeCalls = new Map<string, string>();
 	const turnRows = new Set<ToolRow>();
 	let activeReadGroup: ReadGroup | undefined;
+	let activeSessionId: string | undefined;
 	let cwd = process.cwd();
 	const shouldCollapse = () => (options?.collapseToolOutput ? options.collapseToolOutput() : readCollapseToolOutput(cwd));
 	const sealReadGroup = () => {
@@ -140,6 +141,7 @@ export function registerToolActivity(
 		activeCalls.clear();
 		turnRows.clear();
 		activeReadGroup = undefined;
+		activeSessionId = ctx.sessionManager.getSessionId?.();
 		cwd = ctx.cwd;
 		const collapse = shouldCollapse();
 		for (const entry of ctx.sessionManager.getBranch()) {
@@ -334,6 +336,9 @@ export function registerToolActivity(
 	});
 
 	return (activity) => {
+		if (activeSessionId !== undefined && activity.piSessionId !== activeSessionId) {
+			return;
+		}
 		const key = callKey(activity);
 		let rowId = activeCalls.get(key);
 		if (!rowId || activity.update.sessionUpdate === "tool_call") {

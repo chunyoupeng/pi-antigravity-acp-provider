@@ -13,7 +13,11 @@ const RETRY_DELAYS_MS = [50, 100, 200, 400];
  * compacts first. */
 export const HARNESS_BYTES_PER_TOKEN = 2.6;
 const RECENT_STEPS = 16;
-const TRUNCATION_NOTE = /<truncated (\d+)(?:\s+of\s+\d+)?\s+bytes/u;
+// Matches transcript-logger truncation (`<truncated N bytes>` on its own line).
+// Intentionally excludes `agy` tool-output spill previews (`<truncated N of M bytes
+// from the middle of the output>`), whose dropped bytes are written to disk and
+// never enter the model prompt or the harness's checkpoint counter.
+const TRUNCATION_NOTE = /^<truncated (\d+) bytes>$/mu;
 
 interface StepTokens {
 	input: number;

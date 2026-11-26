@@ -79,6 +79,25 @@ describe("AntigravityRuntime", () => {
 		}
 	});
 
+	it("preserves piSessionId on tool activities even for ephemeral cacheRetention=none turns", async () => {
+		const activities: AcpToolActivity[] = [];
+		const runtime = new AntigravityRuntime(
+			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent, "native-tools"] }),
+			"yolo", undefined, (activity) => activities.push(activity),
+		);
+		try {
+			const writer = runtime.stream(model, normalizeContext({ messages: [{ role: "user", content: "hello", timestamp: 1 }] }), {
+				sessionId: "ephemeral-owner", cacheRetention: "none", apiKey: "test-key",
+			});
+			for await (const _event of writer.stream) void _event;
+			expect(activities).toHaveLength(2);
+			expect(activities[0]?.piSessionId).toBe("ephemeral-owner");
+			expect(activities[1]?.piSessionId).toBe("ephemeral-owner");
+		} finally {
+			await runtime.close();
+		}
+	});
+
 	it("retains normalized project instructions when ACP only accepts plain text", async () => {
 		const runtime = new AntigravityRuntime(
 			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent, "text-only"] }),

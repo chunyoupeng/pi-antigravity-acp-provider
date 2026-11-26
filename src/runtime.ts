@@ -143,6 +143,8 @@ interface Binding {
 	/** True while silent context-replay batches are running ahead of the active prompt. */
 	replayingContext: boolean;
 	piSessionId: string | undefined;
+	/** Owning Pi session ID for tool activity attribution, including ephemeral turns. */
+	activitySessionId: string | undefined;
 	restored: boolean;
 	contextTokens: number | undefined;
 	lastStepUsage: TranscriptContextUsage | undefined;
@@ -605,14 +607,14 @@ export class AntigravityRuntime {
 			: (this.findContinuationKey(context) ?? `ephemeral:${crypto.randomUUID()}`);
 		const tools = getCurrentTools(normalizeContext(context).messages);
 		const acpModelId = resolveAcpModelId(model, options.reasoning);
-		let binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
+		let binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal, options.sessionId);
 		await this.modeChanges;
 		this.assertEpoch(epoch);
 		// Check before continuation early returns as well as before fresh prompts.
 		if (binding.mode !== this.permissionMode || this.confirmedMode(binding) !== binding.wireMode ||
 			binding.toolFingerprint !== piToolFingerprint(tools)) {
 			await this.invalidateBinding(binding, "permission mode or tools changed");
-			binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
+			binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal, options.sessionId);
 		}
 
 		// Pi compacted (or otherwise rewrote) the history this session holds while
@@ -630,7 +632,7 @@ export class AntigravityRuntime {
 			if (!result || diverged) {
 				cancelPermission(binding);
 				await this.dropBinding(key, binding, diverged ? "history diverged" : "permission left unanswered", diverged);
-				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
+				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal, options.sessionId);
 			} else {
 				binding.turnOutputOffset += binding.writer?.message.usage.output ?? 0;
 				attachWriter(binding, writer);
@@ -664,7 +666,7 @@ export class AntigravityRuntime {
 					? "Antigravity restarts from Pi's context"
 					: "Pi continued without returning every requested tool result");
 				await this.dropBinding(key, binding, diverged ? "history diverged" : "tool results missing", diverged);
-				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
+				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal, options.sessionId);
 			} else {
 				binding.turnOutputOffset += binding.writer?.message.usage.output ?? 0;
 				attachWriter(binding, writer);
@@ -695,11 +697,11 @@ export class AntigravityRuntime {
 			await this.modeChanges;
 			this.assertEpoch(epoch);
 			// A queued caller may hold an obsolete binding after shutdown/mode changes.
-			binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
+			binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal, options.sessionId);
 			const stale = this.staleReason(binding, context, tools);
 			if (stale) {
 				await this.dropBinding(key, binding, stale, true);
-				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
+				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal, options.sessionId);
 			}
 
 			if (binding.modelId !== acpModelId) {
@@ -794,7 +796,7 @@ export class AntigravityRuntime {
 						throw new AntigravityAcpError("protocol", executionError);
 					}
 					retriedExecutionError = true;
-					binding = await this.getBinding(key, model, acpModelId, options.apiKey, activeWriter, tools, options.signal);
+					binding = await this.getBinding(key, model, acpModelId, options.apiKey, activeWriter, tools, options.signal, options.sessionId);
 					if (binding.modelId !== acpModelId) {
 						try {
 							await binding.connection.setModel(
@@ -1024,15 +1026,17 @@ export class AntigravityRuntime {
 		writer: PiEventWriter,
 		tools: Context["tools"],
 		signal?: AbortSignal,
+		activitySessionId?: string,
 	): Promise<Binding> {
 		this.assertActive();
 		const existing = this.bindings.get(key);
 		if (existing) {
 			const resolved = await existing;
 			this.clearBindingIdleTimer(resolved);
+			if (activitySessionId) resolved.activitySessionId = activitySessionId;
 			return resolved;
 		}
-		const created = this.createBindingWithRetry(key, model, acpModelId, apiKey, writer, tools ?? [], signal).catch((error) => {
+		const created = this.createBindingWithRetry(key, model, acpModelId, apiKey, writer, tools ?? [], signal, activitySessionId).catch((error) => {
 			if (this.bindings.get(key) === created) this.bindings.delete(key);
 			throw error;
 		});
@@ -1053,11 +1057,12 @@ export class AntigravityRuntime {
 		writer: PiEventWriter,
 		tools: NonNullable<Context["tools"]>,
 		signal?: AbortSignal,
+		activitySessionId?: string,
 	): Promise<Binding> {
 		const epoch = this.bindingEpoch;
 		for (let attempt = 1; ; attempt += 1) {
 			try {
-				return await this.createBinding(key, model, acpModelId, apiKey, writer, tools, signal);
+				return await this.createBinding(key, model, acpModelId, apiKey, writer, tools, signal, activitySessionId);
 			} catch (error) {
 				if (
 					attempt >= SESSION_NEW_ATTEMPTS ||
@@ -1080,6 +1085,7 @@ export class AntigravityRuntime {
 		writer: PiEventWriter,
 		tools: NonNullable<Context["tools"]>,
 		signal?: AbortSignal,
+		activitySessionId?: string,
 	): Promise<Binding> {
 		const cwd = process.cwd();
 		let binding: Binding | undefined;
@@ -1203,6 +1209,7 @@ export class AntigravityRuntime {
 				abortRequested: false,
 				replayingContext: false,
 				piSessionId,
+				activitySessionId: activitySessionId ?? piSessionId,
 				restored,
 				contextTokens: undefined,
 				lastStepUsage: undefined,
@@ -1437,9 +1444,10 @@ export class AntigravityRuntime {
 					const toolCall = binding.toolTracker.apply(activity.update);
 					if (!replayingContext) writer.endBlock();
 					if (replayingContext || binding.bridge?.reports(toolCall.title, toolCall._meta)) continue;
+					const activitySessionId = binding.piSessionId ?? binding.activitySessionId;
 					const toolActivity: AcpToolActivity = {
 						sessionId: notification.sessionId,
-						...(binding.piSessionId ? { piSessionId: binding.piSessionId } : {}),
+						...(activitySessionId ? { piSessionId: activitySessionId } : {}),
 						update: activity.update,
 						toolCall,
 					};

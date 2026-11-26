@@ -99,15 +99,25 @@ describe("contextTokensInUse", () => {
 		await expect(contextTokensInUse(sessionId, 1010, profile, [])).resolves.toBe(Math.ceil((192_000 + 25 + 68_000) / 2.6));
 	});
 
-	it("counts middle-truncated bytes reported by agy CLI transcripts", async () => {
+	it("does not count tool-output bytes spilled to disk by agy middle truncation", async () => {
 		const note = "<truncated 36263 of 46151 bytes from the middle of the output>";
+		const content = `${"x".repeat(10_000)}\n${note}\n`;
 		const profile = profileWith([
-			JSON.stringify({ step_index: 2, type: "GENERIC", content: `${"x".repeat(10_000)}\n${note}\n` }),
+			JSON.stringify({ step_index: 2, type: "GENERIC", content }),
 			planner(3, 1000, 0, 10),
 		]);
 		await expect(contextTokensInUse(sessionId, 1010, profile, [])).resolves.toBe(
-			Math.ceil((10_000 + 2 + note.length + 36_263) / 2.6),
+			Math.ceil(Buffer.byteLength(content, "utf8") / 2.6),
 		);
+	});
+
+	it("ignores inline <truncated N bytes> mentions in code or prose", async () => {
+		const content = 'const example = `${"x".repeat(192_000)}\\n<truncated 68000 bytes>\\n`;';
+		const profile = profileWith([
+			JSON.stringify({ step_index: 2, type: "GENERIC", content }),
+			planner(3, 1000, 0, 10),
+		]);
+		await expect(contextTokensInUse(sessionId, 1010, profile, [])).resolves.toBe(1010);
 	});
 
 	it("keeps counting through the harness's checkpoint so Pi compacts", async () => {

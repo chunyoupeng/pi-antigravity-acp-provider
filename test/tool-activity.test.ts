@@ -573,4 +573,67 @@ describe("tool activity entries", () => {
 			for (const line of searchRow.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 		}
 	});
+
+	it("ignores tool activities from other sessions (such as swarm workers) and unattributed side streams", () => {
+		const h = harness();
+		h.emit("session_start", {}, {
+			cwd: process.cwd(),
+			sessionManager: { getSessionId: () => "main-session", getBranch: () => [] },
+		});
+
+		// Main session read starts a read group.
+		h.receive({
+			...activity,
+			sessionId: "acp-main",
+			piSessionId: "main-session",
+			update: { sessionUpdate: "tool_call", toolCallId: "r1", title: "Read file", kind: "read", status: "completed" },
+			toolCall: { toolCallId: "r1", title: "Read file", kind: "read", status: "completed", rawInput: { Path: "src/a.ts" } },
+		});
+
+		// Swarm worker edit and unattributed side-thread read must be ignored and must not seal the main read group.
+		h.receive({
+			...activity,
+			sessionId: "acp-worker",
+			piSessionId: "swarm-worker-1",
+			update: { sessionUpdate: "tool_call", toolCallId: "e1", title: "Edit file", kind: "edit", status: "completed" },
+			toolCall: {
+				toolCallId: "e1",
+				title: "Edit file",
+				kind: "edit",
+				status: "completed",
+				content: [{ type: "diff", path: "src/worker.ts", oldText: "a", newText: "b" }],
+			},
+		});
+		h.receive({
+			sessionId: "acp-side",
+			update: { sessionUpdate: "tool_call", toolCallId: "s1", title: "Read file", kind: "read", status: "completed" },
+			toolCall: { toolCallId: "s1", title: "Read file", kind: "read", status: "completed", rawInput: { Path: "src/side.ts" } },
+		});
+		expect(h.appendEntry).toHaveBeenCalledTimes(1);
+
+		// A subsequent main session read stays in the same read group.
+		h.receive({
+			...activity,
+			sessionId: "acp-main",
+			piSessionId: "main-session",
+			update: { sessionUpdate: "tool_call", toolCallId: "r2", title: "Read file", kind: "read", status: "completed" },
+			toolCall: { toolCallId: "r2", title: "Read file", kind: "read", status: "completed", rawInput: { Path: "src/b.ts" } },
+		});
+		expect(h.appendEntry).toHaveBeenCalledTimes(2);
+		const grouped = stripTerminalSequences(h.render(h.entry(0), { expanded: false }, theme)!.render(80).join("\n"));
+		expect(grouped).toContain("⏺ Read 2 files");
+		expect(grouped).toContain("└─ src/a.ts");
+		expect(grouped).toContain("└─ src/b.ts");
+		expect(h.render(h.entry(1), { expanded: false }, theme)).toBeUndefined();
+
+		// Switching sessions updates the filter so old-session activities are dropped and new-session ones pass.
+		h.emit("session_start", {}, {
+			cwd: process.cwd(),
+			sessionManager: { getSessionId: () => "next-session", getBranch: () => [] },
+		});
+		h.receive({ ...activity, piSessionId: "main-session" });
+		expect(h.appendEntry).toHaveBeenCalledTimes(2);
+		h.receive({ ...activity, piSessionId: "next-session" });
+		expect(h.appendEntry).toHaveBeenCalledTimes(3);
+	});
 });
