@@ -25,7 +25,8 @@ function harness(options?: RegisterToolActivityOptions) {
 	const sendMessage = vi.fn();
 	const registerTool = vi.fn();
 	const pi = { appendEntry, registerEntryRenderer, on, sendMessage, registerTool } as unknown as ExtensionAPI;
-	const receive = registerToolActivity(pi, { collapseToolOutput: () => true, ...options });
+	// Rendering tests see full rows; tests about collapsing pass `collapseToolOutput: () => true`.
+	const receive = registerToolActivity(pi, { collapseToolOutput: () => false, outputPad: () => 1, ...options });
 	const rawRender = registerEntryRenderer.mock.calls.find(([type]) => type === TOOL_ACTIVITY_ENTRY)?.[1] as EntryRenderer<ToolActivityEntry>;
 	const withKeyHints = (opts: { expanded: boolean } & Partial<EntryRenderOptions>): EntryRenderOptions => ({
 		keyText: () => "",
@@ -50,6 +51,15 @@ function harness(options?: RegisterToolActivityOptions) {
 	return { receive, render, emit, entry, appendEntry, registerEntryRenderer, on, sendMessage, registerTool };
 }
 
+/** Streams one line of visible assistant narration, which ends the current activity group. */
+function narrate(h: ReturnType<typeof harness>, text = "Next I'll check the next part."): void {
+	h.emit("message_update", {
+		type: "message_update",
+		message: {},
+		assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: text, partial: {} },
+	});
+}
+
 function completed(): AcpToolActivity {
 	return {
 		...activity,
@@ -68,15 +78,18 @@ describe("tool activity entries", () => {
 		expect(h.registerTool).not.toHaveBeenCalled();
 	});
 
-	it("uses Pi's native shell header, output preview, and gutters", () => {
+	it("renders a lone shell command as a one-command group with an output tail and full output when expanded", () => {
 		const h = harness();
 		h.receive(completed());
 		const component = h.render(h.entry(0), { expanded: false }, theme);
 		const compact = stripTerminalSequences(component!.render(80).join("\n"));
-		expect(compact).toMatch(/⏺ (?:\$ ls -la|Bash\(ls -la\))/u);
-		expect(compact).toContain("⎿");
+		expect(compact).toContain("Ran 1 shell command");
+		expect(compact).toContain("└─ $ ls -la");
+		expect(compact).not.toContain("⏺");
+		// The live tail keeps the last four lines.
 		expect(compact).toContain("sixth");
-		expect(compact).toContain("to expand");
+		expect(compact).toContain("third");
+		expect(compact).not.toContain("second");
 		expect(compact).not.toContain("Antigravity tool:");
 		expect(compact).not.toContain("rawInput");
 		const expanded = stripTerminalSequences(h.render(h.entry(0), { expanded: true }, theme)!.render(80).join("\n"));
@@ -111,16 +124,18 @@ describe("tool activity entries", () => {
 	});
 
 	it("restores one row at the latest status from persisted entries and collapses finished execute previews", () => {
-		const source = harness();
+		const source = harness({ collapseToolOutput: () => true });
 		source.receive(activity);
 		source.receive(completed());
-		const restored = harness();
+		const restored = harness({ collapseToolOutput: () => true });
 		restored.emit("session_start", {}, { cwd: process.cwd(), sessionManager: { getBranch: () => [source.entry(0), source.entry(1)] } });
 		expect(restored.render(source.entry(1), { expanded: false }, theme)).toBeUndefined();
 		const collapsed = stripTerminalSequences(restored.render(source.entry(0), { expanded: false }, theme)!.render(80).join("\n"));
-		expect(collapsed).toContain("ls -la");
+		expect(collapsed).toContain("Ran 1 shell command");
+		expect(collapsed).not.toContain("ls -la");
 		expect(collapsed).not.toContain("sixth");
 		const expanded = stripTerminalSequences(restored.render(source.entry(0), { expanded: true }, theme)!.render(80).join("\n"));
+		expect(expanded).toContain("└─ $ ls -la");
 		expect(expanded).toContain("sixth");
 	});
 
@@ -185,6 +200,7 @@ describe("tool activity entries", () => {
 				rawOutput: "line 10",
 			},
 		});
+		narrate(h);
 		h.receive({
 			...activity,
 			toolCall: {
@@ -276,10 +292,12 @@ describe("tool activity entries", () => {
 		const bashText = stripTerminalSequences(h.render(h.entry(2), { expanded: true }, theme)!.render(100).join("\n"));
 		expect(bashText).toContain("rm foo.ts");
 		expect(bashText).toContain("(no output)");
-		expect(bashText).toContain("Took 4.0s");
+		// The duration parsed from agy's Created/Completed timestamps shows on the command line.
+		expect(bashText).toContain("$ rm foo.ts (4.0s)");
 		expect(bashText).not.toContain("Created At:");
 		expect(bashText).not.toContain("ACP details");
 
+		narrate(h);
 		h.receive({
 			...activity,
 			toolCall: {
@@ -296,9 +314,10 @@ describe("tool activity entries", () => {
 		expect(readExpanded).toContain("Read 20 lines");
 	});
 
-	it("auto-collapses execute output on agent_end while keeping read and edit previews visible", () => {
-		const h = harness();
+	it("keeps execute output and read lists visible during the turn and folds them on agent_end, keeping edit diffs", () => {
+		const h = harness({ collapseToolOutput: () => true });
 		h.receive(completed());
+		narrate(h);
 		h.receive({
 			...activity,
 			update: { sessionUpdate: "tool_call", toolCallId: "read-1", title: "Read file", kind: "read", status: "completed" },
@@ -320,18 +339,22 @@ describe("tool activity entries", () => {
 		const readRow = h.render(h.entry(1), { expanded: false }, theme)!;
 		const editRow = h.render(h.entry(2), { expanded: false }, theme)!;
 
-		// Before agent_end, execute preview is visible.
+		// During the turn, the execute preview and the read path are visible.
 		expect(stripTerminalSequences(execRow.render(80).join("\n"))).toContain("sixth");
+		expect(stripTerminalSequences(readRow.render(80).join("\n"))).toContain("└─ src/a.ts:1-5");
 
-		// After agent_end, execute collapses to header only; read and edit stay visible.
+		// After agent_end, execute folds to its header, the read group to its summary; edit diffs stay.
 		h.emit("agent_end", { type: "agent_end", messages: [] });
 		const collapsedExec = stripTerminalSequences(execRow.render(80).join("\n"));
-		expect(collapsedExec).toContain("ls -la");
+		expect(collapsedExec).toContain("Ran 1 shell command");
+		expect(collapsedExec).not.toContain("ls -la");
 		expect(collapsedExec).not.toContain("sixth");
-		expect(collapsedExec).not.toContain("⎿");
-		expect(stripTerminalSequences(readRow.render(80).join("\n"))).toContain("Read 1 file");
-		expect(stripTerminalSequences(readRow.render(80).join("\n"))).toContain("└─ src/a.ts:1-5");
+		const readText = stripTerminalSequences(readRow.render(80).join("\n"));
+		expect(readText).toContain("Read 1 file");
+		expect(readText).not.toContain("└─ src/a.ts:1-5");
 		expect(stripTerminalSequences(editRow.render(80).join("\n"))).toContain("+1 new");
+		const expandedRead = stripTerminalSequences(h.render(h.entry(1), { expanded: true }, theme)!.render(80).join("\n"));
+		expect(expandedRead).toContain("└─ src/a.ts:1-5");
 
 		// Expanding (Ctrl+O) still reveals the collapsed execute output.
 		const expandedExec = stripTerminalSequences(h.render(h.entry(0), { expanded: true }, theme)!.render(80).join("\n"));
@@ -346,46 +369,68 @@ describe("tool activity entries", () => {
 		expect(stripTerminalSequences(execRow.render(80).join("\n"))).toContain("sixth");
 	});
 
-	it("shows live elapsed time while execute runs and persists Took/collapsed duration after completion", () => {
+	it("shows live elapsed time on the command line while it runs and its duration once finished", () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(new Date("2026-11-24T10:00:00.000Z"));
-		const h = harness();
+		const h = harness({ collapseToolOutput: () => true });
 		h.receive(activity);
 		const row = h.render(h.entry(0), { expanded: false }, theme)!;
 
 		vi.advanceTimersByTime(2_300);
 		const running = stripTerminalSequences(row.render(80).join("\n"));
-		expect(running).toContain("Elapsed 2.3s");
+		expect(running).toContain("Running 1 shell command...");
+		expect(running).toContain("└─ $ ls -la (2.3s)");
 
 		vi.advanceTimersByTime(1_100);
 		h.receive(completed());
 		expect(h.entry(1).data.durationMs).toBe(3_400);
 
 		const finished = stripTerminalSequences(row.render(80).join("\n"));
-		expect(finished).toContain("Took 3.4s");
+		expect(finished).toContain("Ran 1 shell command");
+		expect(finished).toContain("└─ $ ls -la (3.4s)");
 
 		h.emit("agent_end", { type: "agent_end", messages: [] });
 		const collapsed = stripTerminalSequences(row.render(80).join("\n"));
-		expect(collapsed).toContain("ls -la");
-		expect(collapsed).toContain("(3.4s)");
-		expect(collapsed).not.toContain("⎿");
+		expect(collapsed).toContain("Ran 1 shell command");
+		expect(collapsed).not.toContain("ls -la");
 		for (const width of [80, 20, 10, 4]) {
 			for (const line of row.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 		}
 
 		const expanded = stripTerminalSequences(h.render(h.entry(0), { expanded: true }, theme)!.render(80).join("\n"));
-		expect(expanded).toContain("Took 3.4s");
+		expect(expanded).toContain("└─ $ ls -la (3.4s)");
 
-		// Restored session preserves duration on collapsed header and expanded output.
-		const restored = harness();
+		// A restored session keeps the duration for the expanded view.
+		const restored = harness({ collapseToolOutput: () => true });
 		restored.emit("session_start", {}, { cwd: process.cwd(), sessionManager: { getBranch: () => [h.entry(0), h.entry(1)] } });
-		const restoredCollapsed = stripTerminalSequences(restored.render(h.entry(0), { expanded: false }, theme)!.render(80).join("\n"));
-		expect(restoredCollapsed).toContain("(3.4s)");
 		const restoredExpanded = stripTerminalSequences(restored.render(h.entry(0), { expanded: true }, theme)!.render(80).join("\n"));
-		expect(restoredExpanded).toContain("Took 3.4s");
+		expect(restoredExpanded).toContain("└─ $ ls -la (3.4s)");
 	});
 
-	it("groups consecutive read activities into Reading/Read N files with branch paths and seals across non-read boundaries", () => {
+	it("keeps column alignment of expanded shell output and shows no separate Took line", () => {
+		const h = harness();
+		h.receive({
+			...activity,
+			toolCall: { ...activity.toolCall, status: "completed", rawOutput: "\n       2 src/main.ts\r\n       3 src/math.ts\r\n       5 total\r\n" },
+		});
+		const lines = h.render(h.entry(0), { expanded: true }, theme)!.render(80).map((line) => stripTerminalSequences(line).trimEnd());
+		const first = lines.find((line) => line.includes("src/main.ts"))!;
+		const second = lines.find((line) => line.includes("src/math.ts"))!;
+		expect(first.indexOf("2 src/main.ts")).toBe(second.indexOf("3 src/math.ts"));
+		expect(lines.join("\n")).not.toContain("Took");
+	});
+
+	it("hides shell durations under 100ms, which measure ACP notifications rather than the command", () => {
+		const h = harness();
+		h.receive(activity);
+		h.receive(completed());
+		expect(h.entry(1).data.durationMs).toBeLessThan(100);
+		const text = stripTerminalSequences(h.render(h.entry(0), { expanded: false }, theme)!.render(80).join("\n"));
+		expect(text).toContain("└─ $ ls -la");
+		expect(text).not.toMatch(/ls -la \(/u);
+	});
+
+	it("groups consecutive read activities into Reading/Read N files with branch paths and seals across non-groupable boundaries", () => {
 		const h = harness();
 		h.receive({
 			...activity,
@@ -401,7 +446,7 @@ describe("tool activity entries", () => {
 		const groupComp = h.render(h.entry(0), { expanded: false }, theme)!;
 		expect(h.render(h.entry(1), { expanded: false }, theme)).toBeUndefined();
 		const running = stripTerminalSequences(groupComp.render(80).join("\n"));
-		expect(running).toContain("⏺ Reading 2 files...");
+		expect(running).toContain("Reading 2 files...");
 		expect(running).toContain("└─ src/a.ts:1-20");
 		expect(running).toContain("└─ src/b.ts");
 
@@ -419,7 +464,7 @@ describe("tool activity entries", () => {
 		expect(h.render(h.entry(3), { expanded: false }, theme)).toBeUndefined();
 
 		const finished = stripTerminalSequences(groupComp.render(80).join("\n"));
-		expect(finished).toContain("⏺ Read 2 files");
+		expect(finished).toContain("Read 2 files");
 		expect(finished).toContain("└─ src/a.ts:1-20");
 		expect(finished).toContain("└─ src/b.ts ENOENT: no such file");
 		expect(finished).not.toContain("const a = 1;");
@@ -442,8 +487,12 @@ describe("tool activity entries", () => {
 			for (const line of groupComp.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 		}
 
-		// Non-read tool seals the previous read group; a later read starts a new group.
-		h.receive(completed());
+		// A tool that is not a read or shell command seals the group; a later read starts a new group.
+		h.receive({
+			...activity,
+			update: { sessionUpdate: "tool_call", toolCallId: "e1", title: "Edit file", kind: "edit", status: "completed" },
+			toolCall: { toolCallId: "e1", title: "Edit file", kind: "edit", status: "completed", rawInput: { Path: "src/a.ts" } },
+		});
 		h.receive({
 			...activity,
 			update: { sessionUpdate: "tool_call", toolCallId: "r3", title: "Read file", kind: "read", status: "completed" },
@@ -452,7 +501,7 @@ describe("tool activity entries", () => {
 		const secondGroup = h.render(h.entry(5), { expanded: false }, theme)!;
 		expect(secondGroup).toBeDefined();
 		const secondText = stripTerminalSequences(secondGroup.render(80).join("\n"));
-		expect(secondText).toContain("⏺ Read 1 file");
+		expect(secondText).toContain("Read 1 file");
 		expect(secondText).toContain("└─ src/c.ts");
 
 		// Session restore reproduces the same two separate read groups.
@@ -465,18 +514,249 @@ describe("tool activity entries", () => {
 		});
 		expect(restored.render(h.entry(1), { expanded: false }, theme)).toBeUndefined();
 		const restoredFirst = stripTerminalSequences(restored.render(h.entry(0), { expanded: false }, theme)!.render(80).join("\n"));
-		expect(restoredFirst).toContain("⏺ Read 2 files");
+		expect(restoredFirst).toContain("Read 2 files");
 		expect(restoredFirst).toContain("└─ src/a.ts:1-20");
 		expect(restoredFirst).toContain("└─ src/b.ts ENOENT: no such file");
 		const restoredSecond = stripTerminalSequences(restored.render(h.entry(5), { expanded: false }, theme)!.render(80).join("\n"));
-		expect(restoredSecond).toContain("⏺ Read 1 file");
+		expect(restoredSecond).toContain("Read 1 file");
 		expect(restoredSecond).toContain("└─ src/c.ts");
+	});
+
+	it("groups consecutive native reads and shell commands into one Claude-style summary row", () => {
+		const h = harness({ collapseToolOutput: () => true });
+		const shell = (id: string, command: string, status: "in_progress" | "completed" | "failed", rawOutput?: string): AcpToolActivity => ({
+			...activity,
+			update: { sessionUpdate: status === "in_progress" ? "tool_call" : "tool_call_update", toolCallId: id, title: command, kind: "execute", status },
+			toolCall: { toolCallId: id, title: command, kind: "execute", status, rawInput: { CommandLine: command }, ...(rawOutput ? { rawOutput } : {}) },
+		});
+
+		// A lone shell command is already a one-command group.
+		h.receive(shell("s1", "git status", "completed", "clean"));
+		const owner = h.render(h.entry(0), { expanded: false }, theme)!;
+		const lone = stripTerminalSequences(owner.render(100).join("\n"));
+		expect(lone).toContain("Ran 1 shell command");
+		expect(lone).toContain("└─ $ git status");
+
+		h.receive({
+			...activity,
+			update: { sessionUpdate: "tool_call", toolCallId: "r1", title: "Read file", kind: "read", status: "completed" },
+			toolCall: { toolCallId: "r1", title: "Read file", kind: "read", status: "completed", rawInput: { Path: "src/a.ts" } },
+		});
+		h.receive(shell("s2", "npm test\n--run", "in_progress", "line 1\nline 2\nP5\nP6\nP7\nP8"));
+		expect(h.render(h.entry(1), { expanded: false }, theme)).toBeUndefined();
+		expect(h.render(h.entry(2), { expanded: false }, theme)).toBeUndefined();
+
+		const running = stripTerminalSequences(owner.render(100).join("\n"));
+		expect(running).toContain("Running 2 shell commands, read 1 file...");
+		// During the turn every call stays listed.
+		expect(running).toContain("└─ $ git status");
+		expect(running).toContain("└─ src/a.ts");
+		expect(running).toContain("└─ $ npm test …");
+		expect(running).toContain("P8");
+		expect(running).toContain("P5");
+		expect(running).not.toContain("line 2");
+
+		h.receive(shell("s2", "npm test\n--run", "failed", "FAILED_OUTPUT\nCommand exited with code 2."));
+		const failed = stripTerminalSequences(owner.render(100).join("\n"));
+		expect(failed).toContain("Ran 2 shell commands, read 1 file");
+		expect(failed).not.toContain("...");
+		// Finished within the test's few milliseconds, so no duration is shown.
+		expect(failed).toContain("└─ $ npm test … exit 2");
+
+		expect(failed).toContain("└─ $ git status");
+		expect(failed).toContain("FAILED_OUTPUT");
+
+		// agent_end folds successful calls and output tails; the failed command stays listed.
+		h.emit("agent_end", { type: "agent_end", messages: [] });
+		const collapsed = stripTerminalSequences(owner.render(100).join("\n"));
+		expect(collapsed).toContain("Ran 2 shell commands, read 1 file");
+		expect(collapsed).not.toContain("└─ $ git status");
+		expect(collapsed).not.toContain("└─ src/a.ts");
+		expect(collapsed).toMatch(/└─ \$ npm test … exit 2/u);
+		expect(collapsed).not.toContain("FAILED_OUTPUT");
+		expect(collapsed).not.toContain("clean");
+		const expanded = stripTerminalSequences(h.render(h.entry(0), { expanded: true }, theme)!.render(100).join("\n"));
+		expect(expanded).toContain("└─ $ git status");
+		expect(expanded).toContain("└─ src/a.ts");
+		expect(expanded).toContain("FAILED_OUTPUT");
+		expect(expanded).toContain("clean");
+		for (const width of [80, 24, 10, 4]) {
+			for (const line of owner.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+		}
+
+		const restored = harness();
+		restored.emit("session_start", {}, {
+			cwd: process.cwd(),
+			sessionManager: { getBranch: () => [h.entry(0), h.entry(1), h.entry(2), h.entry(3)] },
+		});
+		expect(restored.render(h.entry(2), { expanded: false }, theme)).toBeUndefined();
+		const restoredText = stripTerminalSequences(restored.render(h.entry(0), { expanded: false }, theme)!.render(100).join("\n"));
+		expect(restoredText).toContain("Ran 2 shell commands, read 1 file");
+		expect(restoredText).toContain("exit 2");
+	});
+
+	it("renders agy CRLF command output in a group's live tail without blank rows between lines", () => {
+		const h = harness({ collapseToolOutput: () => true });
+		h.receive({
+			...activity,
+			update: { sessionUpdate: "tool_call", toolCallId: "r1", title: "Read file", kind: "read", status: "completed" },
+			toolCall: { toolCallId: "r1", title: "Read file", kind: "read", status: "completed", rawInput: { Path: "src/a.ts" } },
+		});
+		h.receive({
+			...activity,
+			toolCall: { ...activity.toolCall, rawOutput: "drwxr-xr-x skills\r\ndrwxr-xr-x src\r\n-rw-r--r-- tsconfig.json\r\n" },
+		});
+		// Real themes wrap each line in ANSI color codes, which separates a trailing \r from its \n.
+		const ansiTheme = { ...theme, fg: (_color: string, text: string) => `\u001b[2m${text}\u001b[22m` } as Theme;
+		const lines = h.render(h.entry(0), { expanded: false }, ansiTheme)!.render(100).map((line) => stripTerminalSequences(line).trim());
+		const first = lines.findIndex((line) => line.includes("skills"));
+		expect(first).toBeGreaterThan(0);
+		expect(lines[first + 1]).toContain("src");
+		expect(lines[first + 2]).toContain("tsconfig.json");
+	});
+
+	it("aligns rows with assistant messages: dim group header in the text column, row bullets at the message bullet", () => {
+		const edit = (): AcpToolActivity => ({
+			...activity,
+			update: { sessionUpdate: "tool_call", toolCallId: "e1", title: "Edit file", kind: "edit", status: "completed" },
+			toolCall: {
+				toolCallId: "e1", title: "Edit file", kind: "edit", status: "completed",
+				content: [{ type: "diff", path: "src/a.ts", oldText: "old", newText: "new" }],
+			},
+		});
+		const h = harness();
+		h.receive({
+			...activity,
+			update: { sessionUpdate: "tool_call", toolCallId: "r1", title: "Read file", kind: "read", status: "completed" },
+			toolCall: { toolCallId: "r1", title: "Read file", kind: "read", status: "completed", rawInput: { Path: "src/a.ts" } },
+		});
+		h.receive(edit());
+		const tagged = {
+			fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
+			bg: (_color: string, text: string) => text,
+			bold: (text: string) => `<b>${text}</b>`,
+		} as Theme;
+		const groupLines = h.render(h.entry(0), { expanded: false }, theme)!.render(80);
+		// Assistant messages put their bullet at column outputPad (1) and text at column 3.
+		expect(groupLines[0]!.indexOf("Read 1 file")).toBe(3);
+		expect(groupLines.join("\n")).not.toContain("⏺");
+		expect(groupLines[1]!.indexOf("└─")).toBe(3);
+		const styled = h.render(h.entry(0), { expanded: false }, tagged)!.render(80)[0]!;
+		expect(styled).toContain("<dim>Read </dim><dim><b>1</b></dim><dim> file</dim>");
+		const rowLines = h.render(h.entry(1), { expanded: false }, theme)!.render(80);
+		expect(rowLines[0]!.indexOf("⏺")).toBe(1);
+		for (const width of [80, 6, 4, 1]) {
+			for (const line of h.render(h.entry(0), { expanded: false }, theme)!.render(width)) {
+				expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+			}
+		}
+		const flush = harness({ outputPad: () => 0 });
+		flush.receive(edit());
+		expect(flush.render(flush.entry(0), { expanded: false }, theme)!.render(80)[0]!.indexOf("⏺")).toBe(0);
+	});
+
+	it("expands and folds a group or row when clicked in full-screen mode, until Ctrl+O changes", () => {
+		const h = harness({ collapseToolOutput: () => true });
+		h.receive({
+			...activity,
+			update: { sessionUpdate: "tool_call", toolCallId: "r1", title: "Read file", kind: "read", status: "completed" },
+			toolCall: { toolCallId: "r1", title: "Read file", kind: "read", status: "completed", rawInput: { Path: "src/a.ts" }, rawOutput: "A_BODY" },
+		});
+		narrate(h);
+		h.receive(completed());
+		h.emit("agent_end", { type: "agent_end", messages: [] });
+		const click = (button: "left" | "right" = "left") => ({
+			type: "click" as const, button, x: 4, y: 0, screenX: 4, screenY: 0, width: 80, height: 3,
+			shift: false, alt: false, ctrl: false, clickCount: 1,
+		});
+
+		const group = h.render(h.entry(0), { expanded: false }, theme)!;
+		const text = () => stripTerminalSequences(group.render(80).join("\n"));
+		expect(text()).not.toContain("src/a.ts");
+		expect(group.handleMouse?.({ ...click(), type: "press" })).toBeUndefined();
+		expect(group.handleMouse?.(click("right"))).toBeUndefined();
+		expect(group.handleMouse?.(click())).toEqual({ handled: true });
+		expect(text()).toContain("└─ src/a.ts");
+		expect(text()).toContain("A_BODY");
+		group.handleMouse?.(click());
+		expect(text()).not.toContain("src/a.ts");
+
+		// The clicked state survives a rebuild of the entry component (resize, theme change).
+		group.handleMouse?.(click());
+		expect(stripTerminalSequences(h.render(h.entry(0), { expanded: false }, theme)!.render(80).join("\n"))).toContain("A_BODY");
+		// Under a different Ctrl+O state, the global state wins over an earlier click.
+		expect(stripTerminalSequences(h.render(h.entry(0), { expanded: true }, theme)!.render(80).join("\n"))).toContain("A_BODY");
+		group.handleMouse?.(click());
+		expect(stripTerminalSequences(h.render(h.entry(0), { expanded: true }, theme)!.render(80).join("\n"))).toContain("A_BODY");
+
+		const row = h.render(h.entry(1), { expanded: false }, theme)!;
+		expect(stripTerminalSequences(row.render(80).join("\n"))).not.toContain("sixth");
+		row.handleMouse?.(click());
+		expect(stripTerminalSequences(row.render(80).join("\n"))).toContain("sixth");
+	});
+
+	it("keeps finished calls listed under the group header when collapseToolOutput is off", () => {
+		const h = harness({ collapseToolOutput: () => false });
+		h.receive({
+			...activity,
+			update: { sessionUpdate: "tool_call", toolCallId: "r1", title: "Read file", kind: "read", status: "completed" },
+			toolCall: { toolCallId: "r1", title: "Read file", kind: "read", status: "completed", rawInput: { Path: "src/a.ts" } },
+		});
+		h.receive({
+			...activity,
+			update: { sessionUpdate: "tool_call", toolCallId: "s1", title: "ls -la", kind: "execute", status: "completed" },
+			toolCall: { ...activity.toolCall, toolCallId: "s1", status: "completed", rawOutput: "first\nsixth" },
+		});
+		const text = stripTerminalSequences(h.render(h.entry(0), { expanded: false }, theme)!.render(100).join("\n"));
+		expect(text).toContain("Read 1 file, ran 1 shell command");
+		expect(text).toContain("└─ src/a.ts");
+		expect(text).toContain("└─ $ ls -la");
+		expect(text).toContain("sixth");
+	});
+
+	it("starts a new read group when narration text streams between native reads, also after restore", () => {
+		const h = harness();
+		const read = (id: string, path: string): AcpToolActivity => ({
+			...activity,
+			update: { sessionUpdate: "tool_call", toolCallId: id, title: "Read file", kind: "read", status: "completed" },
+			toolCall: { toolCallId: id, title: "Read file", kind: "read", status: "completed", rawInput: { Path: path } },
+		});
+		const delta = (type: "text_delta" | "thinking_delta", text: string) =>
+			h.emit("message_update", { type: "message_update", message: {}, assistantMessageEvent: { type, contentIndex: 0, delta: text, partial: {} } });
+
+		h.receive(read("r1", "src/a.ts"));
+		// Whitespace and hidden thinking are not visible narration and keep the group open.
+		delta("text_delta", "\n ");
+		delta("thinking_delta", "let me look further");
+		h.receive(read("r2", "src/b.ts"));
+		delta("text_delta", "Found the parser. Next I'll check its tests.");
+		h.receive(read("r3", "src/c.test.ts"));
+
+		const first = stripTerminalSequences(h.render(h.entry(0), { expanded: false }, theme)!.render(80).join("\n"));
+		expect(first).toContain("Read 2 files");
+		expect(first).not.toContain("src/c.test.ts");
+		expect(h.render(h.entry(1), { expanded: false }, theme)).toBeUndefined();
+		const second = stripTerminalSequences(h.render(h.entry(2), { expanded: false }, theme)!.render(80).join("\n"));
+		expect(second).toContain("Read 1 file");
+		expect(second).toContain("└─ src/c.test.ts");
+		expect((h.entry(2).data as ToolActivityEntry).groupStart).toBe(true);
+		expect((h.entry(1).data as ToolActivityEntry).groupStart).toBeUndefined();
+
+		const restored = harness();
+		restored.emit("session_start", {}, {
+			cwd: process.cwd(),
+			sessionManager: { getBranch: () => [h.entry(0), h.entry(1), h.entry(2)] },
+		});
+		const restoredFirst = stripTerminalSequences(restored.render(h.entry(0), { expanded: false }, theme)!.render(80).join("\n"));
+		expect(restoredFirst).toContain("Read 2 files");
+		const restoredSecond = stripTerminalSequences(restored.render(h.entry(2), { expanded: false }, theme)!.render(80).join("\n"));
+		expect(restoredSecond).toContain("Read 1 file");
 	});
 
 	it("renders generic ACP tools (like manage_task) with rawInput args, head-first output preview, timing, and expanded details", () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(new Date("2026-11-24T10:34:39.000Z"));
-		const h = harness();
+		const h = harness({ collapseToolOutput: () => true });
 		h.receive({
 			...activity,
 			update: {
@@ -533,8 +813,10 @@ describe("tool activity entries", () => {
 		expect(expanded).toContain("TaskId: 1e5ca6bc-9a5a-4b3b-aeb2-3ddc374bbec2/task-2");
 		expect(expanded).toContain("Took 1.5s");
 
-		// Multi-line generic tool output previews from the first line (not bash tail) and omits empty string args when collapsed.
-		h.receive({
+		// Multi-line generic tool output previews from the first line (not bash tail) and omits empty string args.
+		// Finished results show this preview only with collapseToolOutput off.
+		const preview = harness();
+		preview.receive({
 			...activity,
 			update: {
 				sessionUpdate: "tool_call",
@@ -554,16 +836,16 @@ describe("tool activity entries", () => {
 				rawOutput: "line1\nline2\nline3\nline4\nline5\nline6\nline7",
 			},
 		});
-		const genericRow = h.render(h.entry(2), { expanded: false }, theme)!;
-		const preview = stripTerminalSequences(genericRow.render(100).join("\n"));
-		expect(preview).toContain('Run list_resources server="pi-bridge"');
-		expect(preview).not.toContain('cursor=""');
-		expect(preview).toContain("line1");
-		expect(preview).toContain("line5");
-		expect(preview).not.toContain("line6");
-		expect(preview).toContain("... (2 more lines, to expand)");
+		const genericRow = preview.render(preview.entry(0), { expanded: false }, theme)!;
+		const previewText = stripTerminalSequences(genericRow.render(100).join("\n"));
+		expect(previewText).toContain('Run list_resources server="pi-bridge"');
+		expect(previewText).not.toContain('cursor=""');
+		expect(previewText).toContain("line1");
+		expect(previewText).toContain("line5");
+		expect(previewText).not.toContain("line6");
+		expect(previewText).toContain("... (2 more lines, to expand)");
 
-		const genericExpanded = stripTerminalSequences(h.render(h.entry(2), { expanded: true }, theme)!.render(100).join("\n"));
+		const genericExpanded = stripTerminalSequences(preview.render(preview.entry(0), { expanded: true }, theme)!.render(100).join("\n"));
 		expect(genericExpanded).toContain("server: pi-bridge");
 		expect(genericExpanded).toContain("line1");
 		expect(genericExpanded).toContain("line7");
@@ -577,7 +859,7 @@ describe("tool activity entries", () => {
 	it("renders search_web as clean WebSearch(...) without duplicated query, escaped quotes, or 'on Web'", () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(new Date("2026-11-26T14:32:22.000Z"));
-		const h = harness();
+		const h = harness({ collapseToolOutput: () => true });
 		const quotedQuery = '"Rex" "Superlogical" iOS OR TestFlight OR mobile connect server ssh http tailscale';
 		const agyTitle = `${JSON.stringify(quotedQuery)} on Web`;
 
@@ -682,8 +964,10 @@ describe("tool activity entries", () => {
 		expect(titleOnlyText).not.toContain("on Web");
 
 		// Long query truncates to 2 visual lines with …) when collapsed and expands fully when expanded.
+		// The result preview shows only with collapseToolOutput off.
 		const longQuery = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega";
-		h.receive({
+		const preview = harness();
+		preview.receive({
 			...activity,
 			update: {
 				sessionUpdate: "tool_call",
@@ -703,7 +987,7 @@ describe("tool activity entries", () => {
 				rawOutput: "result-1\nresult-2\nresult-3\nresult-4\nresult-5\nresult-6",
 			},
 		});
-		const longRow = h.render(h.entry(4), { expanded: false }, theme)!;
+		const longRow = preview.render(preview.entry(0), { expanded: false }, theme)!;
 		const longCollapsedLines = longRow.render(60);
 		const longCollapsed = stripTerminalSequences(longCollapsedLines.join("\n"));
 		const headerLines = longCollapsed.split("\n").filter((line) => !line.includes("result-") && !line.includes("more line"));
@@ -713,7 +997,7 @@ describe("tool activity entries", () => {
 		expect(longCollapsed).toContain("result-5");
 		expect(longCollapsed).not.toContain("result-6");
 
-		const longExpanded = stripTerminalSequences(h.render(h.entry(4), { expanded: true }, theme)!.render(60).join("\n"));
+		const longExpanded = stripTerminalSequences(preview.render(preview.entry(0), { expanded: true }, theme)!.render(60).join("\n"));
 		expect(longExpanded).toContain("omega)");
 		expect(longExpanded).toContain("in docs.example.com");
 		expect(longExpanded).toContain("result-6");
@@ -771,7 +1055,7 @@ describe("tool activity entries", () => {
 		});
 		expect(h.appendEntry).toHaveBeenCalledTimes(2);
 		const grouped = stripTerminalSequences(h.render(h.entry(0), { expanded: false }, theme)!.render(80).join("\n"));
-		expect(grouped).toContain("⏺ Read 2 files");
+		expect(grouped).toContain("Read 2 files");
 		expect(grouped).toContain("└─ src/a.ts");
 		expect(grouped).toContain("└─ src/b.ts");
 		expect(h.render(h.entry(1), { expanded: false }, theme)).toBeUndefined();

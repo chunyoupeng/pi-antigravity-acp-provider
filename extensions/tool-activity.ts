@@ -13,13 +13,14 @@ import {
 	type ToolRenderers,
 	renderDiff,
 } from "@earendil-works/pi-coding-agent";
-import { type Component, Image, Text, stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, Image, Text, type TuiMouseEvent, stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { structuredPatch } from "diff";
 
 import type { AcpToolActivity } from "../src/acp/events.js";
 
 export const TOOL_ACTIVITY_ENTRY = "antigravity-acp-tool-activity";
-const NON_COLLAPSIBLE_KINDS = new Set<string>(["read", "edit"]);
+/** Edits keep their diff after the turn; reads fold into their group's header like shell commands. */
+const NON_COLLAPSIBLE_KINDS = new Set<string>(["edit"]);
 export interface CompactDiff {
 	path: string;
 	lines: string[];
@@ -35,12 +36,27 @@ export interface ToolActivityEntry extends AcpToolActivity {
 	diffs?: CompactDiff[];
 	/** Line count inferred for native read_file calls that omit file text in ACP updates. */
 	readLines?: number;
+	/**
+	 * Set when assistant text streamed between the previous row and this one. ACP turns stream as one
+	 * Pi message, so `message_end` cannot separate read groups; restore uses this flag instead.
+	 */
+	groupStart?: boolean;
+}
+
+/**
+ * A row's expanded state chosen by clicking it. It applies only while the global Ctrl+O state is still
+ * `global`, so toggling Ctrl+O afterwards takes over again, as it does for Pi's own tool rows.
+ */
+interface ClickExpansion {
+	expanded: boolean;
+	global: boolean;
 }
 
 interface ToolRow {
 	latest: ToolActivityEntry;
 	owner?: string;
 	previewCollapsed: boolean;
+	clicked?: ClickExpansion;
 }
 
 interface ReadGroup {
@@ -48,18 +64,48 @@ interface ReadGroup {
 	rows: ToolRow[];
 	version: number;
 	sealed: boolean;
+	clicked?: ClickExpansion;
+}
+
+/** Expanded state for one render: a click on the row wins until the global Ctrl+O state changes. */
+function effectiveExpanded(clicked: ClickExpansion | undefined, globalExpanded: boolean): boolean {
+	return clicked && clicked.global === globalExpanded ? clicked.expanded : globalExpanded;
+}
+
+/**
+ * Full-screen Pi forwards a plain left click to the row under the pointer. Toggle that row like Pi's own
+ * tool rows do; returning `handled` makes the TUI redraw.
+ */
+function toggleOnClick(
+	event: TuiMouseEvent,
+	target: { clicked?: ClickExpansion },
+	globalExpanded: boolean,
+): { handled: true } | undefined {
+	if (event.type !== "click" || event.button !== "left") return undefined;
+	target.clicked = { expanded: !effectiveExpanded(target.clicked, globalExpanded), global: globalExpanded };
+	return { handled: true };
 }
 
 export interface RegisterToolActivityOptions {
 	collapseToolOutput?: () => boolean;
+	/** Left/right padding of chat rows (Pi's `outputPad` setting); rows are indented by it to align with messages. */
+	outputPad?: () => number;
 }
 
 function isCollapsibleKind(kind: AcpToolActivity["toolCall"]["kind"]): boolean {
 	return !kind || !NON_COLLAPSIBLE_KINDS.has(kind);
 }
 
+/** Native reads and shell commands in a row share one summary row ("Read 2 files, ran 3 shell commands"). */
+const GROUPABLE_KINDS = new Set<string>(["read", "execute"]);
+
+function isGroupableKind(kind: AcpToolActivity["toolCall"]["kind"]): boolean {
+	return kind !== undefined && kind !== null && GROUPABLE_KINDS.has(kind);
+}
+
 interface CollapseSettingsReader {
 	getCollapseToolOutput?: () => boolean;
+	getOutputPad?: () => number;
 }
 
 function readCollapseToolOutput(cwd: string): boolean {
@@ -69,6 +115,27 @@ function readCollapseToolOutput(cwd: string): boolean {
 	} catch {
 		return true;
 	}
+}
+
+function readOutputPad(cwd: string): number {
+	try {
+		const settings = SettingsManager.create(cwd) as CollapseSettingsReader;
+		return settings.getOutputPad?.() ?? 1;
+	} catch {
+		return 1;
+	}
+}
+
+/**
+ * Custom entries render flush left, while Pi indents messages and its own tool rows by `outputPad`.
+ * Indent rows the same way so bullets and text line up; skip it when the terminal is too narrow.
+ */
+function padRows(render: (innerWidth: number) => string[], width: number, pad: number): string[] {
+	const usable = pad > 0 && width > pad * 2 + 2 ? pad : 0;
+	const lines = render(width - usable * 2);
+	if (usable === 0) return lines;
+	const left = " ".repeat(usable);
+	return lines.map((line) => `${left}${line}`);
 }
 
 /** Display-only session entries: never queued as model input or executable Pi calls. */
@@ -82,8 +149,19 @@ export function registerToolActivity(
 	const turnRows = new Set<ToolRow>();
 	let activeReadGroup: ReadGroup | undefined;
 	let activeSessionId: string | undefined;
+	/** Visible assistant text streamed since the last new row; the next row starts a new read group. */
+	let textSinceLastRow = false;
 	let cwd = process.cwd();
 	const shouldCollapse = () => (options?.collapseToolOutput ? options.collapseToolOutput() : readCollapseToolOutput(cwd));
+	/** `collapseToolOutput`, refreshed at session and agent boundaries so renders never read settings from disk. */
+	let collapseFinished = shouldCollapse();
+	const currentOutputPad = () => (options?.outputPad ? options.outputPad() : readOutputPad(cwd));
+	/** `outputPad`, refreshed with `collapseFinished`. */
+	let outputPad = currentOutputPad();
+	const refreshCollapse = () => {
+		collapseFinished = shouldCollapse();
+		outputPad = currentOutputPad();
+	};
 	const sealReadGroup = () => {
 		if (activeReadGroup) {
 			activeReadGroup.sealed = true;
@@ -141,9 +219,11 @@ export function registerToolActivity(
 		activeCalls.clear();
 		turnRows.clear();
 		activeReadGroup = undefined;
+		textSinceLastRow = false;
 		activeSessionId = ctx.sessionManager.getSessionId?.();
 		cwd = ctx.cwd;
-		const collapse = shouldCollapse();
+		refreshCollapse();
+		const collapse = collapseFinished;
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "message") {
 				const msg = (entry as { message?: { role?: string; content?: unknown } }).message;
@@ -183,7 +263,8 @@ export function registerToolActivity(
 			} else {
 				const nextRow: ToolRow = { latest: restored, owner: entry.id, previewCollapsed };
 				rows.set(data.rowId, nextRow);
-				if (restored.toolCall.kind === "read") {
+				if (restored.groupStart) sealReadGroup();
+				if (isGroupableKind(restored.toolCall.kind)) {
 					attachToReadGroup(data.rowId, nextRow, entry.id);
 				} else {
 					sealReadGroup();
@@ -198,6 +279,14 @@ export function registerToolActivity(
 	pi.on("message_start", (event) => {
 		if (event.message.role === "user") sealReadGroup();
 	});
+	// Narration between native tools arrives inside one streaming message; without this, a read after
+	// "Now I'll check X" would join the group rendered above that text.
+	pi.on("message_update", (event) => {
+		const update = event.assistantMessageEvent;
+		if (update.type !== "text_delta" || update.delta.trim().length === 0) return;
+		sealReadGroup();
+		textSinceLastRow = true;
+	});
 	pi.on("message_end", (event) => {
 		if (event.message.role !== "assistant") return;
 		const content = Array.isArray(event.message.content) ? event.message.content : [];
@@ -207,9 +296,11 @@ export function registerToolActivity(
 			sealReadGroup();
 		}
 	});
+	pi.on("agent_start", refreshCollapse);
 	pi.on("agent_end", () => {
 		sealReadGroup();
-		if (shouldCollapse()) {
+		refreshCollapse();
+		if (collapseFinished) {
 			for (const row of turnRows) {
 				if (isCollapsibleKind(row.latest.toolCall.kind)) {
 					row.previewCollapsed = true;
@@ -220,7 +311,7 @@ export function registerToolActivity(
 	});
 
 	pi.registerEntryRenderer<ToolActivityEntry>(TOOL_ACTIVITY_ENTRY, (entry, renderOptions, theme) => {
-		const { expanded } = renderOptions;
+		const { expanded: globalExpanded } = renderOptions;
 		const keyHints: KeybindingHints = {
 			keyText: renderOptions.keyText ?? (() => ""),
 			keyHint: renderOptions.keyHint ?? ((_key, description) => description),
@@ -232,7 +323,7 @@ export function registerToolActivity(
 		if (!row) {
 			row = { latest: data, owner: entry.id, previewCollapsed: false };
 			rows.set(rowId, row);
-			if (data.toolCall.kind === "read") {
+			if (isGroupableKind(data.toolCall.kind)) {
 				const standaloneGroup: ReadGroup = { owner: entry.id, rows: [row], version: 1, sealed: true };
 				readGroups.set(rowId, standaloneGroup);
 			}
@@ -247,7 +338,9 @@ export function registerToolActivity(
 					version: number;
 					width: number;
 					expanded: boolean;
-					previewCollapsed: boolean;
+					collapsedRows: number;
+					elapsedBucket: number | undefined;
+					outputPad: number;
 					lines: string[];
 				}
 				| undefined;
@@ -255,28 +348,34 @@ export function registerToolActivity(
 				invalidate() {
 					cachedGroup = undefined;
 				},
+				handleMouse(event: TuiMouseEvent) {
+					return toggleOnClick(event, currentGroup, globalExpanded);
+				},
 				render(width) {
-					const groupCollapsed = currentGroup.rows.every((item) => item.previewCollapsed);
+					const expanded = effectiveExpanded(currentGroup.clicked, globalExpanded);
+					const collapsedRows = currentGroup.rows.filter((item) => item.previewCollapsed).length;
+					const running = currentGroup.rows.some(
+						(item) => item.latest.toolCall.kind === "execute" && !isFinished(item.latest),
+					);
+					const elapsedBucket = running ? Math.floor(Date.now() / 1000) : undefined;
 					if (
 						cachedGroup &&
 						cachedGroup.version === currentGroup.version &&
 						cachedGroup.width === width &&
 						cachedGroup.expanded === expanded &&
-						cachedGroup.previewCollapsed === groupCollapsed
+						cachedGroup.collapsedRows === collapsedRows &&
+						cachedGroup.elapsedBucket === elapsedBucket &&
+						cachedGroup.outputPad === outputPad
 					) {
 						return cachedGroup.lines;
 					}
-					const lines = renderReadGroup(
-						currentGroup.rows.map((item) => item.latest),
-						read,
-						cwd,
-						expanded,
-						groupCollapsed,
-						keyHints,
-						theme,
+					// Even a lone shell command renders as a group ("Ran 1 shell command"), like Claude Code.
+					const lines = padRows(
+						(inner) => renderActivityGroup(currentGroup.rows, { read }, cwd, expanded, keyHints, theme, inner),
 						width,
+						outputPad,
 					);
-					cachedGroup = { version: currentGroup.version, width, expanded, previewCollapsed: groupCollapsed, lines };
+					cachedGroup = { version: currentGroup.version, width, expanded, collapsedRows, elapsedBucket, outputPad, lines };
 					return lines;
 				},
 			} satisfies Component;
@@ -291,6 +390,7 @@ export function registerToolActivity(
 				expanded: boolean;
 				previewCollapsed: boolean;
 				elapsedBucket: number | undefined;
+				outputPad: number;
 				lines: string[];
 			}
 			| undefined;
@@ -298,7 +398,11 @@ export function registerToolActivity(
 			invalidate() {
 				cached = undefined;
 			},
+			handleMouse(event: TuiMouseEvent) {
+				return toggleOnClick(event, currentRow, globalExpanded);
+			},
 			render(width) {
+				const expanded = effectiveExpanded(currentRow.clicked, globalExpanded);
 				const latest = currentRow.latest;
 				const isTimedKind = latest.toolCall.kind !== "read" && latest.toolCall.kind !== "edit";
 				const isRunningTimed =
@@ -315,21 +419,17 @@ export function registerToolActivity(
 					cached.width === width &&
 					cached.expanded === expanded &&
 					cached.previewCollapsed === currentRow.previewCollapsed &&
-					cached.elapsedBucket === elapsedBucket
+					cached.elapsedBucket === elapsedBucket &&
+					cached.outputPad === outputPad
 				) {
 					return cached.lines;
 				}
-				const lines = renderToolRow(
-					latest,
-					{ bash, read, edit },
-					cwd,
-					expanded,
-					currentRow.previewCollapsed,
-					keyHints,
-					theme,
+				const lines = padRows(
+					(inner) => renderToolRow(latest, { bash, read, edit }, cwd, expanded, currentRow.previewCollapsed, keyHints, theme, inner),
 					width,
+					outputPad,
 				);
-				cached = { latest, width, expanded, previewCollapsed: currentRow.previewCollapsed, elapsedBucket, lines };
+				cached = { latest, width, expanded, previewCollapsed: currentRow.previewCollapsed, elapsedBucket, outputPad, lines };
 				return lines;
 			},
 		} satisfies Component;
@@ -357,7 +457,12 @@ export function registerToolActivity(
 				durationMs = parseExecuteDurationMs(rawToolText(activity));
 			}
 		}
-		const data = compactActivityEntry(activity, rowId, observedAt, durationMs, cwd);
+		const startsGroup = row ? row.latest.groupStart === true : textSinceLastRow;
+		const data: ToolActivityEntry = {
+			...compactActivityEntry(activity, rowId, observedAt, durationMs, cwd),
+			...(startsGroup ? { groupStart: true } : {}),
+		};
+		if (!row) textSinceLastRow = false;
 		if (row) {
 			row.latest = data;
 			row.previewCollapsed = false;
@@ -366,7 +471,7 @@ export function registerToolActivity(
 		} else {
 			row = { latest: data, previewCollapsed: false };
 			rows.set(rowId, row);
-			if (activity.toolCall.kind === "read") {
+			if (isGroupableKind(activity.toolCall.kind)) {
 				attachToReadGroup(rowId, row);
 			} else {
 				sealReadGroup();
@@ -533,26 +638,114 @@ function formatReadRange(input: Record<string, unknown>): string {
 	return "";
 }
 
-function renderReadGroup(
-	entries: ToolActivityEntry[],
-	readRenderer: ToolRenderers,
+function isFinished(entry: ToolActivityEntry): boolean {
+	return entry.toolCall.status === "completed" || entry.toolCall.status === "failed";
+}
+
+/** Shell command text from Pi (`command`) or agy (`CommandLine`) rawInput, falling back to the ACP title. */
+function executeCommand(call: AcpToolActivity["toolCall"]): string {
+	const input = record(call.rawInput);
+	return displayText(String(input.command ?? input.CommandLine ?? input.command_line ?? call.title ?? call.toolCallId));
+}
+
+const ACTIVITY_LABELS = {
+	read: { done: "Read", running: "Reading", one: "file", many: "files" },
+	execute: { done: "Ran", running: "Running", one: "shell command", many: "shell commands" },
+} as const;
+
+/**
+ * `Read 2 files, ran 1 shell command` in dim text with bold counts, a quiet status line in the assistant
+ * text column. Kinds still running use the progressive verb, ending in `...`.
+ */
+function formatActivityHeader(entries: ToolActivityEntry[], theme: Theme): string {
+	const counts = new Map<"read" | "execute", { total: number; running: boolean }>();
+	for (const entry of entries) {
+		const kind = entry.toolCall.kind === "execute" ? "execute" : "read";
+		const count = counts.get(kind) ?? { total: 0, running: false };
+		count.total += 1;
+		if (!isFinished(entry)) count.running = true;
+		counts.set(kind, count);
+	}
+	const parts = [...counts].map(([kind, { total, running }], index) => {
+		const labels = ACTIVITY_LABELS[kind];
+		const verb = running ? labels.running : labels.done;
+		const shownVerb = index === 0 ? verb : verb.toLowerCase();
+		const noun = total === 1 ? labels.one : labels.many;
+		return `${theme.fg("dim", `${shownVerb} `)}${theme.fg("dim", theme.bold(String(total)))}${theme.fg("dim", ` ${noun}`)}`;
+	});
+	const suffix = entries.some((entry) => !isFinished(entry)) ? theme.fg("dim", "...") : "";
+	return `${parts.join(theme.fg("dim", ", "))}${suffix}`;
+}
+
+const SHELL_COMMAND_MAX_WIDTH = 100;
+/** Shortest command duration shown on a grouped shell line; shorter ones would read "(0.0s)". */
+const MIN_SHOWN_DURATION_MS = 100;
+/** Output lines shown under a grouped shell command while it runs or until its preview collapses. */
+const SHELL_PREVIEW_LINES = 4;
+
+/** One `└─ $ command` line plus a short output tail or, when expanded, the full native shell result. */
+function renderShellEntry(row: ToolRow, expanded: boolean, theme: Theme, width: number): string[] {
+	const entry = row.latest;
+	const call = entry.toolCall;
+	const isPartial = !isFinished(entry);
+	const isError = call.status === "failed";
+	const command = executeCommand(call).split("\n");
+	const shown = truncateToWidth(`$ ${command.length > 1 ? `${command[0]} …` : command[0]}`, SHELL_COMMAND_MAX_WIDTH, "…");
+	// Keep leading spaces (column output such as `wc -l`); drop only surrounding blank lines.
+	const output = displayText(toolOutput(entry).replace(/\t/gu, "   ")).replace(/^\n+/u, "").trimEnd();
+	let entryLine = theme.fg("muted", shown);
+	if (isError) {
+		const exitCode = /exit(?:ed with)?(?: status| code)?[:\s]+(\d+)/iu.exec(output)?.[1];
+		entryLine += ` ${theme.fg("error", exitCode !== undefined ? `exit ${exitCode}` : "failed")}`;
+	}
+	// ACP can report start and finish together, so a sub-100ms duration measures notifications, not the command.
+	if (!isPartial && entry.durationMs !== undefined && entry.durationMs >= MIN_SHOWN_DURATION_MS) {
+		entryLine += ` ${theme.fg("dim", `(${formatDuration(entry.durationMs)})`)}`;
+	} else if (isPartial && entry.observedAt !== undefined) {
+		entryLine += ` ${theme.fg("dim", `(${formatDuration(Date.now() - entry.observedAt)})`)}`;
+	}
+	const lines = gutter(new Text(entryLine, 0, 0), 5, `  ${theme.fg("dim", "└─")}`, width);
+	if (!output) return lines;
+	if (expanded) {
+		// The duration is already on the `└─` line; the full output follows it as plain text.
+		const color = isError ? "error" : "toolOutput";
+		const body = output.split("\n").map((line) => theme.fg(color, line)).join("\n");
+		lines.push(...gutter(new Text(body, 0, 0), 5, "     ", width));
+	} else if (isPartial || !row.previewCollapsed) {
+		const tail = output.split("\n").filter((line) => line.trim().length > 0).slice(-SHELL_PREVIEW_LINES);
+		if (tail.length > 0) {
+			const color = isError ? "error" : "dim";
+			lines.push(...gutter(new Text(tail.map((line) => theme.fg(color, line)).join("\n"), 0, 0), 5, "     ", width));
+		}
+	}
+	return lines;
+}
+
+function renderActivityGroup(
+	rows: ToolRow[],
+	renderers: { read: ToolRenderers },
 	cwd: string,
 	expanded: boolean,
-	previewCollapsed: boolean,
 	keyHints: KeybindingHints,
 	theme: Theme,
 	width: number,
 ): string[] {
-	if (entries.length === 0) return [];
-	const count = entries.length;
-	const noun = count === 1 ? "file" : "files";
-	const isInProgress = entries.some((entry) => entry.toolCall.status !== "completed" && entry.toolCall.status !== "failed");
-	const hasError = entries.some((entry) => entry.toolCall.status === "failed");
-	const label = isInProgress ? `Reading ${count} ${noun}...` : `Read ${count} ${noun}`;
-	const statusColor = isInProgress ? "border" : hasError ? "error" : "success";
-	const lines = gutter(new Text(theme.fg("toolTitle", theme.bold(label)), 0, 0), 2, theme.fg(statusColor, "⏺"), width);
+	if (rows.length === 0) return [];
+	const entries = rows.map((row) => row.latest);
+	// No status bullet: the header starts in the assistant text column; failures show on their `└─` line.
+	const lines = gutter(new Text(formatActivityHeader(entries, theme), 0, 0), 2, "", width);
 
-	for (const entry of entries) {
+	for (const row of rows) {
+		const entry = row.latest;
+		// During the turn every call is listed; once previews collapse at turn end, successful calls fold
+		// away so a finished group is just its header. Failed calls stay listed.
+		if (row.previewCollapsed && !expanded && entry.toolCall.status === "completed") continue;
+		if (entry.toolCall.kind === "execute") {
+			lines.push(...renderShellEntry(row, expanded, theme, width));
+			continue;
+		}
+		const readRenderer = renderers.read;
+		const previewCollapsed = row.previewCollapsed;
 		const call = entry.toolCall;
 		const input = record(call.rawInput);
 		const rawPath =
@@ -639,10 +832,8 @@ function renderToolRow(
 	const isError = call.status === "failed";
 	let args: Record<string, unknown> = input;
 	let renderer: ToolRenderers | undefined;
-	if (call.kind === "execute") {
-		renderer = renderers.bash;
-		args = { command: displayText(String(input.command ?? input.CommandLine ?? input.command_line ?? call.title ?? call.toolCallId)) };
-	} else if (call.kind === "read" && typeof filePath === "string") {
+	// Shell commands never reach this function: they always render in an activity group.
+	if (call.kind === "read" && typeof filePath === "string") {
 		renderer = renderers.read;
 		const start = input.StartLine ?? input.start_line;
 		const end = input.EndLine ?? input.end_line;
@@ -669,7 +860,7 @@ function renderToolRow(
 			: new Text(formatGenericToolCall(displayText(call.title ?? call.toolCallId), call.rawInput, theme, expanded), 0, 0));
 	const statusColor = isError ? "error" : isPartial ? "border" : "success";
 	const lines = gutter(header, 2, theme.fg(statusColor, "⏺"), width);
-	const showTiming = call.kind === "execute" || !renderer;
+	const showTiming = !renderer;
 	if (previewCollapsed && !expanded) {
 		if (showTiming && durationMs !== undefined && lines.length > 0) {
 			const suffix = ` ${theme.fg("muted", `(${formatDuration(durationMs)})`)}`;
@@ -703,12 +894,6 @@ function renderToolRow(
 	} else if (showTiming && isPartial && activity.observedAt !== undefined) {
 		const elapsed = new Text(theme.fg("muted", `Elapsed ${formatDuration(Date.now() - activity.observedAt)}`), 0, 0);
 		lines.push(...gutter(elapsed, 5, `  ${theme.fg("dim", "⎿")}`, width));
-	} else if (call.kind === "execute" && durationMs !== undefined) {
-		const component = renderers.bash.renderResult?.(
-			{ content: [], details: undefined },
-			{ expanded, isPartial }, theme, context,
-		);
-		if (component) lines.push(...gutter(component, 5, `  ${theme.fg("dim", "⎿")}`, width));
 	} else if (!renderer && durationMs !== undefined) {
 		const summary = new Text(theme.fg("muted", `Took ${formatDuration(durationMs)}`), 0, 0);
 		lines.push(...gutter(summary, 5, `  ${theme.fg("dim", "⎿")}`, width));
@@ -952,7 +1137,8 @@ function rawToolText(activity: AcpToolActivity): string {
 }
 
 function toolOutput(activity: AcpToolActivity): string {
-	const joined = rawToolText(activity);
+	// agy's run_command returns CRLF output; a stray \r renders as an extra blank terminal row.
+	const joined = rawToolText(activity).replace(/\r\n?/gu, "\n");
 	return activity.toolCall.kind === "execute" ? cleanExecuteOutput(joined) : joined;
 }
 
