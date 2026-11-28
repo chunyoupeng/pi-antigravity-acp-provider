@@ -1,4 +1,3 @@
-import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -34,8 +33,6 @@ export interface ToolActivityEntry extends AcpToolActivity {
 	durationMs?: number;
 	/** Pre-computed compact diff lines so full oldText/newText files are not persisted or re-diffed per frame. */
 	diffs?: CompactDiff[];
-	/** Line count inferred for native read_file calls that omit file text in ACP updates. */
-	readLines?: number;
 	/**
 	 * Set when assistant text streamed between the previous row and this one. ACP turns stream as one
 	 * Pi message, so `message_end` cannot separate read groups; restore uses this flag instead.
@@ -486,7 +483,6 @@ export function registerToolActivity(
 const images = new WeakMap<object, Image>();
 /** Lazy cache for legacy persisted entries that still contain raw oldText/newText diffs. */
 const legacyDiffCache = new WeakMap<object, CompactDiff[]>();
-const MAX_LOCAL_LINE_COUNT_BYTES = 512 * 1024;
 
 function computeDiffLines(filePath: string, oldText: string | null | undefined, newText: string): string[] {
 	const patch = structuredPatch(filePath, filePath, oldText ?? "", newText, undefined, undefined, { context: 3 });
@@ -517,46 +513,6 @@ function stripDiffContent<T extends { content?: AcpToolActivity["toolCall"]["con
 	};
 }
 
-function inferReadLines(activity: AcpToolActivity, cwd: string): number | undefined {
-	const call = activity.toolCall;
-	if (call.kind !== "read" || call.status !== "completed") return undefined;
-	if (toolOutput(activity)) return undefined;
-	const input = record(call.rawInput);
-	const start = input.StartLine ?? input.start_line ?? input.offset;
-	const end = input.EndLine ?? input.end_line;
-	const limit = input.limit;
-	if (typeof start === "number" && typeof end === "number" && end >= start) {
-		return end - start + 1;
-	}
-	if (typeof limit === "number" && limit > 0) {
-		return limit;
-	}
-	const rawPath =
-		input.path ?? input.Path ?? input.file_path ?? input.filePath ?? input.AbsolutePath ?? input.absolute_path ??
-		call.locations?.[0]?.path;
-	if (typeof rawPath !== "string" || !rawPath.trim()) return undefined;
-	try {
-		const resolved = path.isAbsolute(rawPath) ? rawPath : path.resolve(cwd, rawPath);
-		const stat = fs.statSync(resolved);
-		if (!stat.isFile() || stat.size > MAX_LOCAL_LINE_COUNT_BYTES) return undefined;
-		const buf = fs.readFileSync(resolved);
-		// Skip likely binary files (NUL byte in first 8 KiB).
-		const sampleEnd = Math.min(buf.length, 8192);
-		for (let i = 0; i < sampleEnd; i++) {
-			if (buf[i] === 0) return undefined;
-		}
-		if (buf.length === 0) return 0;
-		let lines = 1;
-		for (let i = 0; i < buf.length; i++) {
-			if (buf[i] === 0x0a) lines += 1;
-		}
-		if (buf[buf.length - 1] === 0x0a) lines -= 1;
-		return lines;
-	} catch {
-		return undefined;
-	}
-}
-
 function compactActivityEntry(
 	activity: AcpToolActivity,
 	rowId: string,
@@ -571,7 +527,6 @@ function compactActivityEntry(
 	const diffs = rawDiffs.length > 0
 		? rawDiffs.map((item) => ({ path: item.path, lines: computeDiffLines(item.path, item.oldText, item.newText) }))
 		: undefined;
-	const readLines = inferReadLines(activity, cwd);
 	const toolCall = diffs ? stripDiffContent(activity.toolCall) : activity.toolCall;
 	const update = diffs && "content" in activity.update ? stripDiffContent(activity.update) : activity.update;
 	return {
@@ -582,7 +537,6 @@ function compactActivityEntry(
 		observedAt,
 		...(durationMs !== undefined ? { durationMs } : {}),
 		...(diffs ? { diffs } : {}),
-		...(readLines !== undefined ? { readLines } : {}),
 	};
 }
 
@@ -790,10 +744,6 @@ function renderActivityGroup(
 					context,
 				);
 				if (component) lines.push(...gutter(component, 5, "     ", width));
-			} else if (call.status === "completed" && entry.readLines !== undefined) {
-				const lineCount = entry.readLines;
-				const summary = new Text(theme.fg("muted", `Read ${lineCount} ${lineCount === 1 ? "line" : "lines"}`), 0, 0);
-				lines.push(...gutter(summary, 5, "     ", width));
 			}
 		}
 
@@ -896,10 +846,6 @@ function renderToolRow(
 		lines.push(...gutter(elapsed, 5, `  ${theme.fg("dim", "⎿")}`, width));
 	} else if (!renderer && durationMs !== undefined) {
 		const summary = new Text(theme.fg("muted", `Took ${formatDuration(durationMs)}`), 0, 0);
-		lines.push(...gutter(summary, 5, `  ${theme.fg("dim", "⎿")}`, width));
-	} else if (call.kind === "read" && call.status === "completed" && activity.readLines !== undefined) {
-		const count = activity.readLines;
-		const summary = new Text(theme.fg("muted", `Read ${count} ${count === 1 ? "line" : "lines"}`), 0, 0);
 		lines.push(...gutter(summary, 5, `  ${theme.fg("dim", "⎿")}`, width));
 	}
 	for (const item of call.content ?? []) {

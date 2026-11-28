@@ -310,8 +310,10 @@ describe("tool activity entries", () => {
 		const readText = stripTerminalSequences(h.render(h.entry(3), { expanded: false }, theme)!.render(100).join("\n"));
 		expect(readText).toContain("Read 1 file");
 		expect(readText).toContain("└─ src/missing.ts:10-29");
+		// agy sends no file text; the expanded group lists the path without a redundant "Read N lines" line.
 		const readExpanded = stripTerminalSequences(h.render(h.entry(3), { expanded: true }, theme)!.render(100).join("\n"));
-		expect(readExpanded).toContain("Read 20 lines");
+		expect(readExpanded).toContain("└─ src/missing.ts:10-29");
+		expect(readExpanded).not.toMatch(/Read \d+ lines?/u);
 	});
 
 	it("keeps execute output and read lists visible during the turn and folds them on agent_end, keeping edit diffs", () => {
